@@ -8,9 +8,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{ai::ChatMessage, error::AppError, i18n};
+use crate::{ai::ChatMessage, error::AppError, i18n, mask::mask_sensitive};
 
 const SUMMARY_MAX_CHARS: usize = 4000;
+const AI_COMPRESSION_MARKER: &str = "[ai_summary_compression]";
+const CHAT_PROFILE_MARKER: &str = "[chat_profile_v1]";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +76,19 @@ pub struct SessionStore {
     max_limit: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct AiCompressionPlan {
+    pub candidate_messages: usize,
+    pub previous_summaries: Vec<String>,
+    pub transcript: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AiCompressionApplyResult {
+    pub removed_messages: usize,
+    pub total_messages: usize,
+}
+
 impl SessionStore {
     pub fn load_or_new(
         path: PathBuf,
@@ -133,6 +148,10 @@ impl SessionStore {
 
     pub fn add_tool_message(&mut self, content: String, group_id: Option<String>) {
         self.add_message("tool", MessageKind::Tool, content, group_id);
+    }
+
+    pub fn add_system_message(&mut self, content: String, group_id: Option<String>) {
+        self.add_message("system", MessageKind::System, content, group_id);
     }
 
     pub fn build_chat_history(&self) -> Vec<ChatMessage> {
@@ -275,6 +294,102 @@ impl SessionStore {
         self.persist_active_session_pointer()
     }
 
+    pub fn has_chat_profile(&self) -> bool {
+        self.state.messages.iter().any(|msg| {
+            msg.role == "system" && msg.content.trim_start().starts_with(CHAT_PROFILE_MARKER)
+        })
+    }
+
+    pub fn build_ai_compression_plan(&self) -> Option<AiCompressionPlan> {
+        if self.state.messages.len() <= self.recent_limit {
+            return None;
+        }
+        let overflow_end = self.state.messages.len().saturating_sub(self.recent_limit);
+        if overflow_end == 0 {
+            return None;
+        }
+        let start = compression_start_index(&self.state.messages, overflow_end);
+        if start >= overflow_end {
+            return None;
+        }
+        let previous_summaries = self.state.messages[..overflow_end]
+            .iter()
+            .filter(|msg| is_ai_compression_message(msg))
+            .map(|msg| strip_marker(msg.content.trim(), AI_COMPRESSION_MARKER))
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>();
+        let candidate = self.state.messages[start..overflow_end]
+            .iter()
+            .filter(|msg| !is_ai_compression_message(msg))
+            .cloned()
+            .collect::<Vec<_>>();
+        if candidate.is_empty() {
+            return None;
+        }
+        let transcript = candidate
+            .iter()
+            .map(|msg| {
+                format!(
+                    "role={}\nkind={:?}\ncontent={}",
+                    msg.role,
+                    msg.kind,
+                    mask_sensitive(&trim_chars(msg.content.trim(), 500))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+        Some(AiCompressionPlan {
+            candidate_messages: candidate.len(),
+            previous_summaries,
+            transcript,
+        })
+    }
+
+    pub fn apply_ai_compression_summary(
+        &mut self,
+        summary: &str,
+    ) -> Option<AiCompressionApplyResult> {
+        let normalized = summary.trim();
+        if normalized.is_empty() || self.state.messages.len() <= self.recent_limit {
+            return None;
+        }
+        let overflow_end = self.state.messages.len().saturating_sub(self.recent_limit);
+        if overflow_end == 0 {
+            return None;
+        }
+        let start = compression_start_index(&self.state.messages, overflow_end);
+        if start >= overflow_end {
+            return None;
+        }
+        let removed = overflow_end.saturating_sub(start);
+        if removed == 0 {
+            return None;
+        }
+        self.state.messages.drain(start..overflow_end);
+        self.state.messages.insert(
+            start,
+            SessionMessage {
+                role: "system".to_string(),
+                content: format!("{AI_COMPRESSION_MARKER}\n{normalized}"),
+                kind: MessageKind::System,
+                group_id: None,
+                created_at_epoch_ms: now_epoch_ms(),
+            },
+        );
+        self.state.compass.truncated_messages += removed;
+        self.state.compass.compression_rounds += 1;
+        self.state.compass.last_compaction_preview = trim_chars(normalized, 180);
+        self.state.compass.last_updated_epoch_ms = now_epoch_ms();
+        Some(AiCompressionApplyResult {
+            removed_messages: removed,
+            total_messages: self.state.messages.len(),
+        })
+    }
+
+    pub fn wrap_chat_profile(content: &str) -> String {
+        format!("{CHAT_PROFILE_MARKER}\n{}", content.trim())
+    }
+
     fn add_message(
         &mut self,
         role: &str,
@@ -359,8 +474,8 @@ impl SessionStore {
             self.state.compass.total_user_messages,
             self.state.compass.total_assistant_messages,
             self.state.compass.total_tool_messages,
-            last_action,
-            last_topic
+            mask_sensitive(&last_action),
+            mask_sensitive(&last_topic)
         )
     }
 
@@ -479,6 +594,28 @@ fn compress_messages_semantic(messages: &[SessionMessage]) -> String {
         tool_blocked,
         conclusion
     )
+}
+
+fn compression_start_index(messages: &[SessionMessage], overflow_end: usize) -> usize {
+    let mut last_marker = None;
+    for (idx, msg) in messages.iter().enumerate().take(overflow_end) {
+        if is_ai_compression_message(msg) {
+            last_marker = Some(idx);
+        }
+    }
+    last_marker.map(|v| v + 1).unwrap_or(0)
+}
+
+fn is_ai_compression_message(msg: &SessionMessage) -> bool {
+    msg.role == "system" && msg.content.trim_start().starts_with(AI_COMPRESSION_MARKER)
+}
+
+fn strip_marker(content: &str, marker: &str) -> String {
+    content
+        .strip_prefix(marker)
+        .unwrap_or(content)
+        .trim()
+        .to_string()
 }
 
 fn collect_keywords(content: &str, freq: &mut HashMap<String, usize>) {

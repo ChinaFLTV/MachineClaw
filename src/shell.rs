@@ -178,10 +178,8 @@ impl ShellExecutor {
         }
 
         let mut results = Vec::with_capacity(specs.len());
-        for item in ordered {
-            if let Some(result) = item {
-                results.push(result);
-            }
+        for result in ordered.into_iter().flatten() {
+            results.push(result);
         }
         Ok(results)
     }

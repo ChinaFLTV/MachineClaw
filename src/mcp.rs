@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{BufRead, BufReader, Read, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     time::Duration,
@@ -8,23 +8,40 @@ use std::{
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 
-use crate::{ai::ExternalToolDefinition, config::McpConfig, error::AppError, mask::mask_sensitive};
+use crate::{
+    ai::ExternalToolDefinition,
+    config::{McpConfig, McpServerConfig},
+    error::AppError,
+    mask::mask_sensitive,
+};
+
+#[derive(Debug, Clone)]
+struct NormalizedServerConfig {
+    name: String,
+    endpoint: Option<String>,
+    command: Option<String>,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    timeout: Duration,
+}
 
 pub fn validate_mcp_config(cfg: &McpConfig) -> Result<(), AppError> {
     if !cfg.enabled {
         return Ok(());
     }
-    if cfg
-        .endpoint
-        .as_deref()
-        .unwrap_or_default()
-        .trim()
-        .is_empty()
-        && cfg.command.as_deref().unwrap_or_default().trim().is_empty()
-    {
+    let servers = normalized_server_configs(cfg);
+    if servers.is_empty() {
         return Err(AppError::Config(
-            "mcp.enabled=true requires at least one of mcp.endpoint or mcp.command".to_string(),
+            "mcp.enabled=true requires at least one configured server".to_string(),
         ));
+    }
+    for server in servers {
+        if server.endpoint.is_none() && server.command.is_none() {
+            return Err(AppError::Config(format!(
+                "mcp server '{}' requires endpoint or command",
+                server.name
+            )));
+        }
     }
     Ok(())
 }
@@ -33,23 +50,31 @@ pub fn mcp_summary(cfg: &McpConfig) -> String {
     if !cfg.enabled {
         return "disabled".to_string();
     }
-    let endpoint = cfg
-        .endpoint
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(mask_sensitive);
-    let command = cfg
-        .command
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(mask_sensitive);
-    if let Some(value) = endpoint {
-        return format!("enabled, endpoint={value}");
+    let servers = normalized_server_configs(cfg);
+    if servers.is_empty() {
+        return "enabled, servers=0".to_string();
     }
-    if let Some(value) = command {
-        return format!("enabled, command={value}, args={}", cfg.args.len());
+    let mut previews = Vec::new();
+    for server in servers.iter().take(3) {
+        if let Some(endpoint) = server.endpoint.as_deref() {
+            previews.push(format!("{}:http={}", server.name, mask_sensitive(endpoint)));
+        } else if let Some(command) = server.command.as_deref() {
+            previews.push(format!(
+                "{}:stdio={} args={}",
+                server.name,
+                mask_sensitive(command),
+                server.args.len()
+            ));
+        }
     }
-    "enabled".to_string()
+    if previews.is_empty() {
+        return format!("enabled, servers={}", servers.len());
+    }
+    format!(
+        "enabled, servers={}, {}",
+        servers.len(),
+        previews.join("; ")
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -60,12 +85,23 @@ struct McpToolInfo {
     parameters: Value,
 }
 
+#[derive(Debug, Clone)]
+struct ToolBinding {
+    connection_idx: usize,
+    remote_name: String,
+}
+
+struct McpConnection {
+    name: String,
+    timeout: Duration,
+    transport: McpTransport,
+}
+
 pub struct McpManager {
     enabled: bool,
-    timeout: Duration,
     tools: Vec<McpToolInfo>,
-    tool_index: HashMap<String, usize>,
-    transport: Option<McpTransport>,
+    tool_index: HashMap<String, ToolBinding>,
+    connections: Vec<McpConnection>,
     summary: String,
 }
 
@@ -92,62 +128,100 @@ impl McpManager {
         if !cfg.enabled {
             return Ok(Self {
                 enabled: false,
-                timeout: Duration::from_secs(cfg.timeout_seconds.unwrap_or(10)),
                 tools: Vec::new(),
                 tool_index: HashMap::new(),
-                transport: None,
+                connections: Vec::new(),
                 summary: "disabled".to_string(),
             });
         }
 
-        let timeout = Duration::from_secs(cfg.timeout_seconds.unwrap_or(10));
-        let mut transport = if let Some(command) =
-            cfg.command.as_deref().filter(|v| !v.trim().is_empty())
-        {
-            McpTransport::Stdio(StdioMcpClient::start(command, &cfg.args, &cfg.env)?)
-        } else if let Some(endpoint) = cfg.endpoint.as_deref().filter(|v| !v.trim().is_empty()) {
-            McpTransport::Http(HttpMcpClient::new(endpoint, timeout)?)
-        } else {
+        let server_configs = normalized_server_configs(cfg);
+        if server_configs.is_empty() {
             return Err(AppError::Config(
-                "mcp.enabled=true requires mcp.command or mcp.endpoint".to_string(),
+                "mcp.enabled=true requires at least one configured server".to_string(),
             ));
-        };
-
-        let initialize_result = request_mcp(
-            &mut transport,
-            "initialize",
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "MachineClaw",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-            timeout,
-        )?;
-
-        notify_mcp(&mut transport, "notifications/initialized", json!({}))?;
-
-        let tools_result = request_mcp(&mut transport, "tools/list", json!({}), timeout)?;
-        let tools = extract_tools(&tools_result);
-        let mut tool_index = HashMap::new();
-        for (idx, item) in tools.iter().enumerate() {
-            tool_index.insert(item.ai_name.clone(), idx);
         }
 
-        let summary = format!(
-            "enabled, transport={}, tools={}, init={}",
-            transport_name(&transport),
-            tools.len(),
-            summarize_initialize(&initialize_result)
-        );
+        let total_servers = server_configs.len();
+        let mut connections = Vec::<McpConnection>::new();
+        let mut tools = Vec::<McpToolInfo>::new();
+        let mut tool_index = HashMap::<String, ToolBinding>::new();
+        let mut errors = Vec::<String>::new();
+
+        for server in server_configs {
+            let connect_outcome = connect_one_server(&server);
+            let (transport, initialize_result, tools_result) = match connect_outcome {
+                Ok(value) => value,
+                Err(err) => {
+                    errors.push(format!(
+                        "{}: {}",
+                        server.name,
+                        mask_sensitive(&err.to_string())
+                    ));
+                    continue;
+                }
+            };
+
+            let connection_idx = connections.len();
+            let server_tools = extract_tools(&server.name, &tools_result);
+            for tool in &server_tools {
+                tool_index.insert(
+                    tool.ai_name.clone(),
+                    ToolBinding {
+                        connection_idx,
+                        remote_name: tool.remote_name.clone(),
+                    },
+                );
+            }
+            tools.extend(server_tools);
+            connections.push(McpConnection {
+                name: server.name.clone(),
+                timeout: server.timeout,
+                transport,
+            });
+
+            let _ = initialize_result;
+        }
+
+        if connections.is_empty() {
+            let reason = if errors.is_empty() {
+                "no MCP server available".to_string()
+            } else {
+                format!("no MCP server available: {}", errors.join(" | "))
+            };
+            return Err(AppError::Runtime(reason));
+        }
+
+        let mut detail = connections
+            .iter()
+            .map(|conn| format!("{}:{}", conn.name, transport_name(&conn.transport)))
+            .collect::<Vec<_>>();
+        detail.sort();
+
+        let summary = if errors.is_empty() {
+            format!(
+                "enabled, servers={}/{}, tools={}, {}",
+                connections.len(),
+                total_servers,
+                tools.len(),
+                detail.join("; ")
+            )
+        } else {
+            format!(
+                "enabled, servers={}/{}, tools={}, {} (partial failures: {})",
+                connections.len(),
+                total_servers,
+                tools.len(),
+                detail.join("; "),
+                errors.join(" | ")
+            )
+        };
+
         Ok(Self {
             enabled: true,
-            timeout,
             tools,
             tool_index,
-            transport: Some(transport),
+            connections,
             summary,
         })
     }
@@ -175,13 +249,15 @@ impl McpManager {
         if !self.enabled {
             return Err(AppError::Runtime("mcp is disabled".to_string()));
         }
-        let tool_idx = self.tool_index.get(name).copied().ok_or_else(|| {
-            AppError::Runtime(format!("mcp tool not found: {}", mask_sensitive(name)))
-        })?;
-        let Some(transport) = self.transport.as_mut() else {
-            return Err(AppError::Runtime("mcp transport not connected".to_string()));
+        let Some(binding) = self.tool_index.get(name).cloned() else {
+            return Err(AppError::Runtime(format!(
+                "mcp tool not found: {}",
+                mask_sensitive(name)
+            )));
         };
-        let tool = &self.tools[tool_idx];
+        let Some(connection) = self.connections.get_mut(binding.connection_idx) else {
+            return Err(AppError::Runtime("mcp connection not found".to_string()));
+        };
         let args = if raw_arguments.trim().is_empty() {
             json!({})
         } else {
@@ -189,13 +265,13 @@ impl McpManager {
         };
 
         let result = request_mcp(
-            transport,
+            &mut connection.transport,
             "tools/call",
             json!({
-                "name": tool.remote_name,
+                "name": binding.remote_name,
                 "arguments": args
             }),
-            self.timeout,
+            connection.timeout,
         )?;
         Ok(extract_tool_call_text(&result))
     }
@@ -203,9 +279,11 @@ impl McpManager {
 
 impl Drop for McpManager {
     fn drop(&mut self) {
-        if let Some(McpTransport::Stdio(client)) = self.transport.as_mut() {
-            let _ = client.child.kill();
-            let _ = client.child.wait();
+        for connection in &mut self.connections {
+            if let McpTransport::Stdio(client) = &mut connection.transport {
+                let _ = client.child.kill();
+                let _ = client.child.wait();
+            }
         }
     }
 }
@@ -214,7 +292,7 @@ impl StdioMcpClient {
     fn start(
         command: &str,
         args: &[String],
-        env: &std::collections::BTreeMap<String, String>,
+        env: &BTreeMap<String, String>,
     ) -> Result<Self, AppError> {
         let mut cmd = Command::new(command);
         cmd.args(args)
@@ -259,6 +337,99 @@ impl HttpMcpClient {
             next_id: 1,
         })
     }
+}
+
+fn normalized_server_configs(cfg: &McpConfig) -> Vec<NormalizedServerConfig> {
+    if !cfg.servers.is_empty() {
+        let mut keys = cfg.servers.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        return keys
+            .into_iter()
+            .filter_map(|name| {
+                let item = cfg.servers.get(&name)?;
+                normalize_server(name, item, cfg.timeout_seconds)
+            })
+            .collect();
+    }
+
+    let legacy = McpServerConfig {
+        enabled: true,
+        endpoint: cfg.endpoint.clone(),
+        command: cfg.command.clone(),
+        args: cfg.args.clone(),
+        env: cfg.env.clone(),
+        timeout_seconds: cfg.timeout_seconds,
+    };
+    normalize_server("default".to_string(), &legacy, cfg.timeout_seconds)
+        .map(|item| vec![item])
+        .unwrap_or_default()
+}
+
+fn normalize_server(
+    name: String,
+    server: &McpServerConfig,
+    global_timeout: Option<u64>,
+) -> Option<NormalizedServerConfig> {
+    if !server.enabled {
+        return None;
+    }
+    let endpoint = server
+        .endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let command = server
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    if endpoint.is_none() && command.is_none() {
+        return None;
+    }
+    let timeout = server.timeout_seconds.or(global_timeout).unwrap_or(10);
+    Some(NormalizedServerConfig {
+        name,
+        endpoint,
+        command,
+        args: server.args.clone(),
+        env: server.env.clone(),
+        timeout: Duration::from_secs(timeout),
+    })
+}
+
+fn connect_one_server(
+    server: &NormalizedServerConfig,
+) -> Result<(McpTransport, Value, Value), AppError> {
+    let mut transport = if let Some(command) = server.command.as_deref() {
+        McpTransport::Stdio(StdioMcpClient::start(command, &server.args, &server.env)?)
+    } else if let Some(endpoint) = server.endpoint.as_deref() {
+        McpTransport::Http(HttpMcpClient::new(endpoint, server.timeout)?)
+    } else {
+        return Err(AppError::Config(format!(
+            "mcp server '{}' requires endpoint or command",
+            server.name
+        )));
+    };
+
+    let initialize_result = request_mcp(
+        &mut transport,
+        "initialize",
+        json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "MachineClaw",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }),
+        server.timeout,
+    )?;
+
+    notify_mcp(&mut transport, "notifications/initialized", json!({}))?;
+    let tools_result = request_mcp(&mut transport, "tools/list", json!({}), server.timeout)?;
+    Ok((transport, initialize_result, tools_result))
 }
 
 fn request_mcp(
@@ -359,7 +530,8 @@ fn http_request(
         .post(&client.endpoint)
         .json(&payload)
         .send()
-        .map_err(|err| AppError::Runtime(format!("MCP http request failed: {err}")))?;
+        .map_err(|err| AppError::Runtime(format!("MCP http request failed: {err}")));
+    let resp = resp?;
     let body: Value = resp
         .json()
         .map_err(|err| AppError::Runtime(format!("failed to parse MCP response: {err}")))?;
@@ -420,7 +592,7 @@ fn read_mcp_frame(reader: &mut BufReader<ChildStdout>) -> Result<Value, AppError
     Ok(value)
 }
 
-fn extract_tools(result: &Value) -> Vec<McpToolInfo> {
+fn extract_tools(server_name: &str, result: &Value) -> Vec<McpToolInfo> {
     let tools = result
         .get("tools")
         .and_then(|value| value.as_array())
@@ -448,28 +620,16 @@ fn extract_tools(result: &Value) -> Vec<McpToolInfo> {
                     "additionalProperties": true
                 })
             });
-        let sanitized = sanitize_tool_name(remote_name);
+        let sanitized_server = sanitize_tool_name(server_name);
+        let sanitized_tool = sanitize_tool_name(remote_name);
         output.push(McpToolInfo {
-            ai_name: format!("mcp__{sanitized}"),
+            ai_name: format!("mcp__{sanitized_server}__{sanitized_tool}"),
             remote_name: remote_name.to_string(),
-            description: format!("MCP tool {remote_name}: {description}"),
+            description: format!("MCP[{server_name}] tool {remote_name}: {description}"),
             parameters: params,
         });
     }
     output
-}
-
-fn summarize_initialize(result: &Value) -> String {
-    let protocol = result
-        .get("protocolVersion")
-        .and_then(|value| value.as_str())
-        .unwrap_or("unknown");
-    let server = result
-        .get("serverInfo")
-        .and_then(|value| value.get("name"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("unknown");
-    format!("{server}/{protocol}")
 }
 
 fn transport_name(transport: &McpTransport) -> &'static str {

@@ -12,7 +12,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    ai::{AiClient, ExternalToolDefinition, ToolCallRequest, ToolUsePolicy},
+    ai::{AiClient, ChatRoundEvent, ExternalToolDefinition, ToolCallRequest, ToolUsePolicy},
     cli::InspectTarget,
     config::AppConfig,
     context::SessionStore,
@@ -113,7 +113,7 @@ pub fn run_prepare(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
             risk_summary,
             ai_summary,
             command_summary,
-            elapsed: format!("{} ms", started.elapsed().as_millis()),
+            elapsed: i18n::human_duration_ms(started.elapsed().as_millis()),
         },
         services.cfg.console.colorful,
     )?;
@@ -195,7 +195,7 @@ pub fn run_inspect(
             risk_summary,
             ai_summary,
             command_summary,
-            elapsed: format!("{} ms", started.elapsed().as_millis()),
+            elapsed: i18n::human_duration_ms(started.elapsed().as_millis()),
         },
         services.cfg.console.colorful,
     )?;
@@ -218,7 +218,9 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         return Err(AppError::Command(i18n::chat_requires_interactive_terminal()));
     }
 
-    let system_prompt = render::load_prompt_template(services.assets_dir, "chat_system.md")?;
+    let base_system_prompt = render::load_prompt_template(services.assets_dir, "chat_system.md")?;
+    let system_prompt = build_chat_system_prompt(services, &base_system_prompt);
+    ensure_chat_environment_profile(services, &system_prompt)?;
     let initial_message_count = services.session.message_count();
     let mut chat_turns: usize = 0;
     let mut tool_stats = ChatToolStats::default();
@@ -227,36 +229,48 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
     let mut tool_call_cache = HashMap::<String, ToolCallCacheItem>::new();
     let command_cache_ttl_ms = services.cfg.ai.chat.command_cache_ttl_seconds as u128 * 1000;
     let external_mcp_tools: Vec<ExternalToolDefinition> = services.mcp.external_tool_definitions();
-    println!(
-        "{}",
-        render::render_chat_notice(
-            &i18n::chat_welcome(
-                services.session.session_id(),
-                services.session.file_path(),
-                services.session.message_count(),
-                services.session.summary_len(),
-                services.cfg.session.recent_messages,
-                services.cfg.session.max_messages,
-                services.os_name,
-                &services.cfg.ai.model,
-                services.skills.len(),
-                services.mcp_summary.as_str(),
-                &services.cfg.ai.chat
-            ),
-            services.cfg.console.colorful
-        )
-    );
-    println!(
-        "{}",
-        render::render_chat_notice(i18n::chat_hint(), services.cfg.console.colorful)
-    );
-    if let Some(warn_message) = services.session.context_pressure_warning(
-        services.cfg.ai.chat.context_warn_percent,
-        services.cfg.ai.chat.context_critical_percent,
-    ) {
+    if services.cfg.ai.chat.show_tips {
         println!(
             "{}",
-            render::render_chat_notice(&warn_message, services.cfg.console.colorful)
+            render::render_chat_notice(
+                &i18n::chat_welcome(
+                    services.session.session_id(),
+                    services.session.file_path(),
+                    services.session.message_count(),
+                    services.session.summary_len(),
+                    services.cfg.session.recent_messages,
+                    services.cfg.session.max_messages,
+                    services.os_name,
+                    &services.cfg.ai.model,
+                    services.skills.len(),
+                    services.mcp_summary.as_str(),
+                    &services.cfg.ai.chat
+                ),
+                services.cfg.console.colorful
+            )
+        );
+        println!(
+            "{}",
+            render::render_chat_notice(i18n::chat_hint(), services.cfg.console.colorful)
+        );
+        if let Some(warn_message) = services.session.context_pressure_warning(
+            services.cfg.ai.chat.context_warn_percent,
+            services.cfg.ai.chat.context_critical_percent,
+        ) {
+            println!(
+                "{}",
+                render::render_chat_notice(&warn_message, services.cfg.console.colorful)
+            );
+        }
+    }
+    if services.cfg.skills.enabled {
+        println!(
+            "{}",
+            render::render_chat_custom_tag_event(
+                i18n::chat_tag_skill(),
+                &i18n::chat_skill_enabled(services.skills.len()),
+                services.cfg.console.colorful
+            )
         );
     }
 
@@ -333,6 +347,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             services.session.start_new_session_with_new_file()?;
             pending_message = None;
             last_assistant_reply.clear();
+            ensure_chat_environment_profile(services, &system_prompt)?;
             println!(
                 "{}",
                 i18n::chat_session_switched(
@@ -354,15 +369,18 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         services
             .session
             .add_user_message(message.clone(), Some(group_id.clone()));
-        if let Some(warn_message) = services.session.context_pressure_warning(
-            services.cfg.ai.chat.context_warn_percent,
-            services.cfg.ai.chat.context_critical_percent,
-        ) {
+        if services.cfg.ai.chat.show_tips
+            && let Some(warn_message) = services.session.context_pressure_warning(
+                services.cfg.ai.chat.context_warn_percent,
+                services.cfg.ai.chat.context_critical_percent,
+            )
+        {
             println!(
                 "{}",
                 render::render_chat_notice(&warn_message, services.cfg.console.colorful)
             );
         }
+        maybe_run_ai_context_compression(services, &system_prompt)?;
         services.session.persist()?;
 
         logging::info("AI chat start");
@@ -372,13 +390,19 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         } else {
             ToolUsePolicy::Auto
         };
-        println!(
-            "{}",
-            render::render_chat_notice(
-                i18n::chat_progress_analyzing(),
-                services.cfg.console.colorful
-            )
-        );
+        if services.cfg.ai.chat.show_tips {
+            println!(
+                "{}",
+                render::render_chat_notice(
+                    i18n::chat_progress_analyzing(),
+                    services.cfg.console.colorful
+                )
+            );
+        }
+        let colorful = services.cfg.console.colorful;
+        let stream_output = services.cfg.ai.chat.stream_output;
+        let show_tips = services.cfg.ai.chat.show_tips;
+        let mut printed_round_thinking = false;
         let response = services.ai.chat_with_shell_tool(
             &history,
             &system_prompt,
@@ -395,10 +419,48 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                     command_cache_ttl_ms,
                 )
             },
+            |event: ChatRoundEvent| {
+                if !event.has_tool_calls {
+                    return;
+                }
+                if show_tips {
+                    println!(
+                        "{}",
+                        render::render_chat_notice(
+                            &i18n::chat_round_received(event.round, event.tool_call_count),
+                            colorful
+                        )
+                    );
+                }
+                if let Some(thinking) = event.thinking.as_deref()
+                    && !thinking.trim().is_empty()
+                {
+                    printed_round_thinking = true;
+                    println!(
+                        "{}",
+                        render::render_chat_thinking(
+                            i18n::chat_prompt_thinking(),
+                            thinking,
+                            colorful
+                        )
+                    );
+                }
+                if !event.content.trim().is_empty() {
+                    println!(
+                        "{}",
+                        render::render_chat_assistant_reply(
+                            i18n::chat_prompt_assistant(),
+                            event.content.trim(),
+                            colorful
+                        )
+                    );
+                }
+            },
         )?;
         logging::info("AI chat finished");
 
-        if let Some(thinking) = response.thinking.as_deref()
+        if !printed_round_thinking
+            && let Some(thinking) = response.thinking.as_deref()
             && !thinking.trim().is_empty()
         {
             println!(
@@ -410,15 +472,23 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                 )
             );
         }
-        println!(
-            "{}",
-            render::render_chat_assistant_reply(
+        if stream_output {
+            render::print_chat_assistant_reply_stream(
                 i18n::chat_prompt_assistant(),
                 response.content.trim(),
-                services.cfg.console.colorful
-            )
-        );
-        if services.cfg.ai.chat.show_round_metrics {
+                colorful,
+            )?;
+        } else {
+            println!(
+                "{}",
+                render::render_chat_assistant_reply(
+                    i18n::chat_prompt_assistant(),
+                    response.content.trim(),
+                    colorful
+                )
+            );
+        }
+        if services.cfg.ai.chat.show_round_metrics && services.cfg.ai.chat.show_tips {
             println!(
                 "{}",
                 render::render_chat_notice(
@@ -441,9 +511,11 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             .session
             .add_assistant_message(response.content.clone(), Some(group_id));
         services.session.persist()?;
-        if let Some(selected) =
-            maybe_pick_next_option(&response.content, services.cfg.console.colorful)?
-        {
+        if let Some(selected) = maybe_pick_next_option(
+            &response.content,
+            services.cfg.console.colorful,
+            services.cfg.ai.chat.show_tips,
+        )? {
             pending_message = Some(selected);
         }
     }
@@ -453,9 +525,9 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         "session_id={}\nchat_turns={}\nmessages_before={}\nmessages_after={}\nsummary_chars={}\ntool_calls={}\ntool_cache_hits={}\nmax_messages={}\nrecent_messages={}",
         services.session.session_id(),
         chat_turns,
-        initial_message_count,
-        final_message_count,
-        services.session.summary_len(),
+        i18n::human_count_u128(initial_message_count as u128),
+        i18n::human_count_u128(final_message_count as u128),
+        i18n::human_count_u128(services.session.summary_len() as u128),
         tool_stats.tool_calls,
         tool_stats.cache_hits,
         services.cfg.session.max_messages,
@@ -478,14 +550,14 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         last_assistant_reply
     };
     let command_summary = format!(
-        "tool_calls_total={}\nfailures={}\nblocked={}\ntimeouts={}\ninterrupted={}\ncache_hits={}\ntool_duration_ms={}",
+        "tool_calls_total={}\nfailures={}\nblocked={}\ntimeouts={}\ninterrupted={}\ncache_hits={}\ntool_duration={}",
         tool_stats.tool_calls,
         tool_stats.command_failures,
         tool_stats.blocked_count,
         tool_stats.timeout_count,
         tool_stats.interrupted_count,
         tool_stats.cache_hits,
-        tool_stats.tool_duration_ms
+        i18n::human_duration_ms(tool_stats.tool_duration_ms)
     );
     let rendered = render::render_action(
         services.assets_dir,
@@ -497,7 +569,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             risk_summary,
             ai_summary,
             command_summary,
-            elapsed: format!("{} ms", started.elapsed().as_millis()),
+            elapsed: i18n::human_duration_ms(started.elapsed().as_millis()),
         },
         services.cfg.console.colorful,
     )?;
@@ -628,7 +700,8 @@ fn execute_tool_call(
         println!(
             "{}",
             render::render_chat_tool_event(
-                &i18n::chat_tool_running(
+                &format_tool_running_output(
+                    services,
                     &spec.label,
                     mode_text,
                     &mask_sensitive(&trim_text(&spec.command, 180))
@@ -656,7 +729,7 @@ fn execute_tool_call(
                 println!(
                     "{}",
                     render::render_chat_tool_event(
-                        &i18n::chat_tool_cache_hit(&spec.label, age),
+                        &format_tool_cache_hit_output(services, &spec.label, age),
                         render::ChatToolEventKind::Running,
                         services.cfg.console.colorful
                     )
@@ -705,15 +778,7 @@ fn execute_tool_call(
                 println!(
                     "{}",
                     render::render_chat_tool_event(
-                        &i18n::chat_tool_finished(
-                            &result.label,
-                            result.success,
-                            result.exit_code,
-                            result.duration_ms,
-                            result.timed_out,
-                            result.interrupted,
-                            result.blocked
-                        ),
+                        &format_tool_finished_output(services, &result),
                         event_kind,
                         services.cfg.console.colorful
                     )
@@ -725,7 +790,7 @@ fn execute_tool_call(
                 println!(
                     "{}",
                     render::render_chat_tool_event(
-                        &i18n::chat_tool_output_preview(&mask_sensitive(&preview)),
+                        &format_tool_preview_output(services, &mask_sensitive(&preview)),
                         render::ChatToolEventKind::Running,
                         services.cfg.console.colorful
                     )
@@ -817,27 +882,54 @@ fn execute_mcp_tool_call(
     stats: &mut ChatToolStats,
 ) -> String {
     let started = Instant::now();
+    if services.cfg.ai.chat.show_tool {
+        let started_text = if services.cfg.ai.chat.output_multilines {
+            format!("type=mcp_tool_call\ntool={}", tool_call.name)
+        } else {
+            i18n::chat_mcp_call_started(&tool_call.name)
+        };
+        println!(
+            "{}",
+            render::render_chat_custom_tag_event(
+                i18n::chat_tag_mcp(),
+                &started_text,
+                services.cfg.console.colorful
+            )
+        );
+    }
     match services
         .mcp
         .call_ai_tool(&tool_call.name, &tool_call.arguments)
     {
         Ok(content) => {
+            let elapsed_ms = started.elapsed().as_millis();
             stats.tool_calls += 1;
-            stats.tool_duration_ms += started.elapsed().as_millis();
+            stats.tool_duration_ms += elapsed_ms;
             if services.cfg.ai.chat.show_tool_ok {
+                let ok_text = if services.cfg.ai.chat.output_multilines {
+                    format!(
+                        "type=mcp_tool_result\ntool={}\nstatus={}\nduration={}\nduration_ms={}",
+                        tool_call.name,
+                        i18n::status_success(),
+                        i18n::human_duration_ms(elapsed_ms),
+                        i18n::human_count_u128(elapsed_ms)
+                    )
+                } else {
+                    i18n::chat_tool_finished(
+                        &tool_call.name,
+                        true,
+                        Some(0),
+                        elapsed_ms,
+                        false,
+                        false,
+                        false,
+                    )
+                };
                 println!(
                     "{}",
-                    render::render_chat_tool_event(
-                        &i18n::chat_tool_finished(
-                            &tool_call.name,
-                            true,
-                            Some(0),
-                            started.elapsed().as_millis(),
-                            false,
-                            false,
-                            false
-                        ),
-                        render::ChatToolEventKind::Success,
+                    render::render_chat_custom_tag_event(
+                        i18n::chat_tag_mcp(),
+                        &ok_text,
                         services.cfg.console.colorful
                     )
                 );
@@ -862,15 +954,28 @@ fn execute_mcp_tool_call(
             payload
         }
         Err(err) => {
+            let elapsed_ms = started.elapsed().as_millis();
             stats.tool_calls += 1;
             stats.command_failures += 1;
-            stats.tool_duration_ms += started.elapsed().as_millis();
+            stats.tool_duration_ms += elapsed_ms;
             if services.cfg.ai.chat.show_tool_err {
+                let err_text = if services.cfg.ai.chat.output_multilines {
+                    format!(
+                        "type=mcp_tool_result\ntool={}\nstatus={}\nduration={}\nduration_ms={}\nerror={}",
+                        tool_call.name,
+                        i18n::status_failed(),
+                        i18n::human_duration_ms(elapsed_ms),
+                        i18n::human_count_u128(elapsed_ms),
+                        mask_sensitive(&err.to_string())
+                    )
+                } else {
+                    format!("mcp_error={}", mask_sensitive(&err.to_string()))
+                };
                 println!(
                     "{}",
-                    render::render_chat_tool_event(
-                        &format!("mcp_error={}", mask_sensitive(&err.to_string())),
-                        render::ChatToolEventKind::Error,
+                    render::render_chat_custom_tag_event(
+                        i18n::chat_tag_mcp(),
+                        &err_text,
                         services.cfg.console.colorful
                     )
                 );
@@ -905,6 +1010,83 @@ fn parse_mode(mode: Option<&str>) -> CommandMode {
     CommandMode::Read
 }
 
+fn format_tool_running_output(
+    services: &ActionServices<'_>,
+    label: &str,
+    mode_text: &str,
+    command: &str,
+) -> String {
+    if !services.cfg.ai.chat.output_multilines {
+        return i18n::chat_tool_running(label, mode_text, command);
+    }
+    format!(
+        "type={}\nlabel={}\nmode={}\ncommand={}",
+        i18n::chat_tool_type_shell_command(),
+        label,
+        mode_text,
+        command
+    )
+}
+
+fn format_tool_cache_hit_output(
+    services: &ActionServices<'_>,
+    label: &str,
+    age_ms: u128,
+) -> String {
+    if !services.cfg.ai.chat.output_multilines {
+        return i18n::chat_tool_cache_hit(label, age_ms);
+    }
+    format!(
+        "type={}\nlabel={}\nage={}\nage_ms={}",
+        "command_cache_hit",
+        label,
+        i18n::human_duration_ms(age_ms),
+        i18n::human_count_u128(age_ms)
+    )
+}
+
+fn format_tool_finished_output(services: &ActionServices<'_>, result: &CommandResult) -> String {
+    if !services.cfg.ai.chat.output_multilines {
+        return i18n::chat_tool_finished(
+            &result.label,
+            result.success,
+            result.exit_code,
+            result.duration_ms,
+            result.timed_out,
+            result.interrupted,
+            result.blocked,
+        );
+    }
+    let status = if result.success {
+        i18n::status_success()
+    } else {
+        i18n::status_failed()
+    };
+    format!(
+        "type={}\nlabel={}\nstatus={}\nexit={:?}\nduration={}\nduration_ms={}\ntimeout={}\ninterrupted={}\nblocked={}",
+        i18n::chat_tool_type_shell_result(),
+        result.label,
+        status,
+        result.exit_code,
+        i18n::human_duration_ms(result.duration_ms),
+        i18n::human_count_u128(result.duration_ms),
+        result.timed_out,
+        result.interrupted,
+        result.blocked
+    )
+}
+
+fn format_tool_preview_output(services: &ActionServices<'_>, preview: &str) -> String {
+    if !services.cfg.ai.chat.output_multilines {
+        return i18n::chat_tool_output_preview(preview);
+    }
+    format!(
+        "type={}\noutput={}",
+        i18n::chat_tool_type_output_preview(),
+        preview
+    )
+}
+
 fn clear_terminal() -> Result<(), AppError> {
     print!("\x1B[2J\x1B[H");
     io::stdout()
@@ -912,7 +1094,156 @@ fn clear_terminal() -> Result<(), AppError> {
         .map_err(|err| AppError::Command(format!("failed to clear terminal: {err}")))
 }
 
-fn maybe_pick_next_option(reply: &str, colorful: bool) -> Result<Option<String>, AppError> {
+fn build_chat_system_prompt(services: &ActionServices<'_>, base: &str) -> String {
+    let mut prompt = base.trim().to_string();
+    let skills_list = if services.skills.is_empty() {
+        "none".to_string()
+    } else {
+        services.skills.join(", ")
+    };
+    let skills_enabled = services.cfg.skills.enabled;
+    let skills_dir = services.cfg.skills.dir.trim();
+    prompt.push_str("\n\n[Skill Workflow]\n- Before complex tasks, scan available skills first.\n- If a matching skill exists, follow its SKILL.md workflow.\n- In responses, explicitly mention which skill is used.\n");
+    prompt.push_str(&format!(
+        "\n[Runtime Skill Context]\n- skills_enabled={skills_enabled}\n- skills_dir={skills_dir}\n- detected_skills={skills_list}\n"
+    ));
+    prompt
+}
+
+fn ensure_chat_environment_profile(
+    services: &mut ActionServices<'_>,
+    system_prompt: &str,
+) -> Result<(), AppError> {
+    if services.session.has_chat_profile() {
+        return Ok(());
+    }
+    println!(
+        "{}",
+        render::render_chat_custom_tag_event(
+            i18n::chat_tag_profile(),
+            i18n::chat_profile_started(),
+            services.cfg.console.colorful
+        )
+    );
+    let profile_commands = chat_profile_commands(services.os_type);
+    let profile_results = match services.shell.run_many(&profile_commands) {
+        Ok(results) => results,
+        Err(err) => {
+            println!(
+                "{}",
+                render::render_chat_custom_tag_event(
+                    i18n::chat_tag_profile(),
+                    &i18n::chat_profile_failed(&mask_sensitive(&err.to_string())),
+                    services.cfg.console.colorful
+                )
+            );
+            return Ok(());
+        }
+    };
+    let profile_details = format_command_details(&profile_results);
+    let profile_prompt = format!(
+        "请基于以下本机探测信息生成一份环境画像，要求包含：系统版本、硬件概况、资源概况、网络概况、开发工具概况、风险提示。\n\n输出要求：\n1. 先给结论\n2. 列表化关键事实\n3. 风险等级与原因\n4. 后续诊断建议（最多3条）\n\n# command_details\n{}",
+        trim_text(&profile_details, 8000)
+    );
+    match services.ai.chat(&[], system_prompt, &profile_prompt) {
+        Ok(summary) => {
+            services
+                .session
+                .add_system_message(SessionStore::wrap_chat_profile(&summary), None);
+            services.session.add_tool_message(
+                format!(
+                    "chat_profile_command_details:\n{}",
+                    trim_text(&profile_details, 3000)
+                ),
+                None,
+            );
+            services.session.persist()?;
+            println!(
+                "{}",
+                render::render_chat_custom_tag_event(
+                    i18n::chat_tag_profile(),
+                    i18n::chat_profile_completed(),
+                    services.cfg.console.colorful
+                )
+            );
+            Ok(())
+        }
+        Err(err) => {
+            println!(
+                "{}",
+                render::render_chat_custom_tag_event(
+                    i18n::chat_tag_profile(),
+                    &i18n::chat_profile_failed(&mask_sensitive(&err.to_string())),
+                    services.cfg.console.colorful
+                )
+            );
+            Ok(())
+        }
+    }
+}
+
+fn maybe_run_ai_context_compression(
+    services: &mut ActionServices<'_>,
+    system_prompt: &str,
+) -> Result<(), AppError> {
+    let Some(plan) = services.session.build_ai_compression_plan() else {
+        return Ok(());
+    };
+    println!(
+        "{}",
+        render::render_chat_custom_tag_event(
+            i18n::chat_tag_compress(),
+            &i18n::chat_compression_started(plan.candidate_messages),
+            services.cfg.console.colorful
+        )
+    );
+    let previous = if plan.previous_summaries.is_empty() {
+        "none".to_string()
+    } else {
+        plan.previous_summaries
+            .iter()
+            .map(|item| trim_text(item, 500))
+            .collect::<Vec<_>>()
+            .join("\n---\n")
+    };
+    let prompt = format!(
+        "你需要压缩历史对话片段，保持事实与结论可追溯。\n\n要求：\n1. 保留目标、关键证据、执行结果、风险、未完成事项。\n2. 删除寒暄与重复内容。\n3. 输出结构：目标 / 事实 / 结论 / 风险 / 待办。\n4. 内容应可直接作为后续上下文继续推理。\n\n# previous_compression_summaries\n{}\n\n# new_overflow_messages\n{}",
+        trim_text(&previous, 2500),
+        trim_text(&plan.transcript, 9000)
+    );
+    let summary = match services.ai.chat(&[], system_prompt, &prompt) {
+        Ok(content) => content,
+        Err(err) => {
+            println!(
+                "{}",
+                render::render_chat_custom_tag_event(
+                    i18n::chat_tag_compress(),
+                    &i18n::chat_compression_failed(&mask_sensitive(&err.to_string())),
+                    services.cfg.console.colorful
+                )
+            );
+            return Ok(());
+        }
+    };
+    if let Some(result) = services.session.apply_ai_compression_summary(&summary) {
+        services.session.persist()?;
+        println!(
+            "{}",
+            render::render_chat_custom_tag_event(
+                i18n::chat_tag_compress(),
+                &i18n::chat_compression_completed(result.removed_messages, result.total_messages),
+                services.cfg.console.colorful
+            )
+        );
+    }
+    Ok(())
+}
+
+fn maybe_pick_next_option(
+    reply: &str,
+    colorful: bool,
+    show_tips: bool,
+) -> Result<Option<String>, AppError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Ok(None);
     }
@@ -923,10 +1254,12 @@ fn maybe_pick_next_option(reply: &str, colorful: bool) -> Result<Option<String>,
     if options.len() < 2 || options.len() > 8 {
         return Ok(None);
     }
-    println!(
-        "{}",
-        render::render_chat_notice(i18n::chat_option_detected(), colorful)
-    );
+    if show_tips {
+        println!(
+            "{}",
+            render::render_chat_notice(i18n::chat_option_detected(), colorful)
+        );
+    }
     let selections = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt(i18n::chat_option_prompt())
         .items(&options)
@@ -935,10 +1268,12 @@ fn maybe_pick_next_option(reply: &str, colorful: bool) -> Result<Option<String>,
     if let Some(index) = selections.first()
         && let Some(option) = options.get(*index)
     {
-        println!(
-            "{}",
-            render::render_chat_notice(&i18n::chat_option_selected(option), colorful)
-        );
+        if show_tips {
+            println!(
+                "{}",
+                render::render_chat_notice(&i18n::chat_option_selected(option), colorful)
+            );
+        }
         return Ok(Some(option.clone()));
     }
     Ok(None)
@@ -1097,13 +1432,13 @@ fn format_inspect_metrics(
     let failed = total.saturating_sub(success);
     let duration_ms: u128 = results.iter().map(|item| item.duration_ms).sum();
     format!(
-        "os={}\ntarget={}\ncommands_total={}\ncommands_success={}\ncommands_failed={}\ncommands_total_duration_ms={}\nskills_count={}\nmcp={}",
+        "os={}\ntarget={}\ncommands_total={}\ncommands_success={}\ncommands_failed={}\ncommands_total_duration={}\nskills_count={}\nmcp={}",
         services.os_name,
         target.as_str(),
         total,
         success,
         failed,
-        duration_ms,
+        i18n::human_duration_ms(duration_ms),
         services.skills.len(),
         services.mcp_summary.as_str()
     )
@@ -1127,7 +1462,9 @@ fn build_risk_summary(results: &[CommandResult]) -> String {
         let stderr = trim_text(item.stderr.trim(), 120);
         items.push(format!(
             "{} failed, exit_code={:?}, stderr={}",
-            item.label, item.exit_code, stderr
+            item.label,
+            item.exit_code,
+            mask_sensitive(&stderr)
         ));
     }
 
@@ -1147,7 +1484,7 @@ fn format_prepare_risk_summary(results: &[CommandResult]) -> String {
         } else if item.interrupted {
             i18n::prepare_risk_interrupted().to_string()
         } else if !item.stderr.trim().is_empty() {
-            trim_text(item.stderr.trim(), 120)
+            mask_sensitive(&trim_text(item.stderr.trim(), 120))
         } else {
             format!("exit_code={:?}", item.exit_code)
         };
@@ -1163,7 +1500,7 @@ fn format_prepare_command_summary(results: &[CommandResult]) -> String {
     let mut lines = Vec::new();
     for (idx, item) in results.iter().enumerate() {
         let mut line = format!(
-            "{}. {} -> {}, {}ms",
+            "{}. {} -> {}, {}",
             idx + 1,
             item.label,
             if item.success {
@@ -1171,7 +1508,7 @@ fn format_prepare_command_summary(results: &[CommandResult]) -> String {
             } else {
                 i18n::status_failed()
             },
-            item.duration_ms
+            i18n::human_duration_ms(item.duration_ms)
         );
         if item.blocked {
             line.push_str(&format!(", blocked={}", item.block_reason));
@@ -1196,8 +1533,11 @@ fn format_command_summary(results: &[CommandResult]) -> String {
             i18n::status_fail_short()
         };
         let mut line = format!(
-            "[{marker}] {} mode={} exit={:?} duration={}ms",
-            item.label, item.mode, item.exit_code, item.duration_ms
+            "[{marker}] {} mode={} exit={:?} duration={}",
+            item.label,
+            item.mode,
+            item.exit_code,
+            i18n::human_duration_ms(item.duration_ms)
         );
         if item.blocked {
             line.push_str(&format!(" blocked_reason={}", item.block_reason));
@@ -1219,12 +1559,12 @@ fn format_command_details(results: &[CommandResult]) -> String {
         lines.push(format!(
             "label={}\ncommand={}\nmode={}\nexit={:?}\nduration_ms={}\nstdout={}\nstderr={}\n---",
             item.label,
-            item.command,
+            mask_sensitive(&item.command),
             item.mode,
             item.exit_code,
             item.duration_ms,
-            trim_text(item.stdout.trim(), 800),
-            trim_text(item.stderr.trim(), 400)
+            mask_sensitive(&trim_text(item.stdout.trim(), 800)),
+            mask_sensitive(&trim_text(item.stderr.trim(), 400))
         ));
     }
     trim_text(&lines.join("\n"), 10_000)
@@ -1275,6 +1615,64 @@ fn now_epoch_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn chat_profile_commands(os: OsType) -> Vec<CommandSpec> {
+    match os {
+        OsType::Windows => vec![
+            read_cmd("profile_identity", "whoami"),
+            read_cmd(
+                "profile_os",
+                "powershell -NoProfile -Command \"Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,LastBootUpTime | Format-List\"",
+            ),
+            read_cmd(
+                "profile_hardware",
+                "powershell -NoProfile -Command \"Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer,Model,TotalPhysicalMemory | Format-List\"",
+            ),
+            read_cmd(
+                "profile_disk",
+                "powershell -NoProfile -Command \"Get-PSDrive -PSProvider FileSystem | Select-Object Name,Used,Free | Format-Table -AutoSize\"",
+            ),
+            read_cmd(
+                "profile_network",
+                "powershell -NoProfile -Command \"Get-NetIPConfiguration | Select-Object InterfaceAlias,IPv4Address | Format-Table -AutoSize\"",
+            ),
+            read_cmd(
+                "profile_process_top_mem",
+                "powershell -NoProfile -Command \"Get-Process | Sort-Object WS -Descending | Select-Object -First 8 Name,Id,CPU,WS | Format-Table -AutoSize\"",
+            ),
+        ],
+        OsType::MacOS => vec![
+            read_cmd("profile_identity", "whoami"),
+            read_cmd("profile_os", "sw_vers && uname -a"),
+            read_cmd("profile_uptime", "uptime"),
+            read_cmd("profile_disk", "df -h"),
+            read_cmd("profile_memory", "vm_stat | head -20"),
+            read_cmd(
+                "profile_network",
+                "ifconfig | grep -E '^[a-z]|inet ' | head -80",
+            ),
+            read_cmd(
+                "profile_process_top_mem",
+                "ps aux | sort -nr -k 4 | head -8",
+            ),
+        ],
+        OsType::Linux | OsType::Other => vec![
+            read_cmd("profile_identity", "whoami"),
+            read_cmd("profile_os", "uname -a && cat /etc/os-release"),
+            read_cmd("profile_uptime", "uptime"),
+            read_cmd("profile_disk", "df -h"),
+            read_cmd("profile_memory", "free -h || cat /proc/meminfo | head -20"),
+            read_cmd(
+                "profile_network",
+                "ip -brief address || ifconfig -a | head -80",
+            ),
+            read_cmd(
+                "profile_process_top_mem",
+                "ps aux | sort -nr -k 4 | head -8",
+            ),
+        ],
+    }
 }
 
 fn prepare_commands(os: OsType) -> Vec<CommandSpec> {

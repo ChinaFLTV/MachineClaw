@@ -1,7 +1,9 @@
 use std::{
     fs,
-    io::IsTerminal,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
 use colored::Colorize;
@@ -13,7 +15,7 @@ use crate::{error::AppError, i18n};
 const DEFAULT_SYSTEM_PROMPT: &str = "你是 MachineClaw 的系统巡检分析助手。\n\n目标：基于用户给出的关键指标与命令结果，输出可执行、可追溯、风险导向的结论。\n\n输出要求：\n1. 先给结论，再给证据。\n2. 风险等级必须明确（低/中/高）并说明触发原因。\n3. 单独列出异常命令（失败/超时/中断/拦截）及影响。\n4. 给出最多 3 条下一步建议，按优先级排序。\n5. 严禁输出敏感信息（token、cookie、密码、私钥、密钥路径等）。\n6. 文本简洁，避免空话，默认中文输出。\n";
 const DEFAULT_PREPARE_PROMPT: &str = "请基于以下数据总结本次运行前检查结果。\n\n# action\n{{action}}\n\n# target\n{{target}}\n\n# key_metrics\n{{key_metrics}}\n\n# command_details\n{{command_details}}\n\n请按以下结构输出：\n1. 结论（是否可继续执行）\n2. 关键异常与风险等级\n3. 优先处理建议（最多 3 条）\n";
 const DEFAULT_INSPECT_PROMPT: &str = "请基于以下数据总结本次状态检查结果。\n\n# action\n{{action}}\n\n# target\n{{target}}\n\n# key_metrics\n{{key_metrics}}\n\n# command_details\n{{command_details}}\n\n请按以下结构输出：\n1. 当前状态结论\n2. 关键证据与异常项\n3. 风险等级与触发原因\n4. 下一步建议（最多 3 条）\n";
-const DEFAULT_CHAT_SYSTEM_PROMPT: &str = "你是 MachineClaw 的本机交互助手，负责系统巡检、诊断、风险分析与必要的本地命令执行。\n\n核心规则：\n1. 用户要求检查/排查/执行时，优先通过 function calling 调用工具获取事实，再回答。\n2. 工具可在本机执行：`run_shell_command`（以及可用 MCP 工具）。\n3. 读命令优先；写命令仅在必要时使用，并先说明影响与风险。\n4. 对危险或高风险操作，必须提示风险、确认前置条件与回滚建议。\n5. 不得伪造命令结果；信息不足时明确缺失项并继续收集。\n6. 允许连续多轮工具调用，但应避免无意义重复调用。\n7. 输出结构固定：结论 -> 关键证据 -> 风险评估 -> 下一步。\n8. 严禁泄露敏感信息（token、cookie、密码、私钥、密钥路径等）。\n\n风格要求：\n- 简洁、专业、直击要点。\n- 默认中文，与用户语言保持一致。\n";
+const DEFAULT_CHAT_SYSTEM_PROMPT: &str = "你是 MachineClaw 的本机交互助手，负责系统巡检、诊断、风险分析与必要的本地命令执行。\n\n核心规则：\n1. 用户要求检查/排查/执行时，优先通过 function calling 调用工具获取事实，再回答。\n2. 工具可在本机执行：`run_shell_command`（以及可用 MCP 工具）。\n3. 读命令优先；写命令仅在必要时使用，并先说明影响与风险。\n4. 对危险或高风险操作，必须提示风险、确认前置条件与回滚建议。\n5. 不得伪造命令结果；信息不足时明确缺失项并继续收集。\n6. 允许连续多轮工具调用，但应避免无意义重复调用。\n7. 输出结构固定：结论 -> 关键证据 -> 风险评估 -> 下一步。\n8. 严禁泄露敏感信息（token、cookie、密码、私钥、密钥路径等）。\n\n技能流程：\n1. 在处理复杂任务前，先查看可用 skills。\n2. 若匹配到 skill，则优先按对应 SKILL.md 的流程执行。\n3. 若使用了 skill，在回复中明确说明使用了哪个 skill。\n\n风格要求：\n- 简洁、专业、直击要点。\n- 默认中文，与用户语言保持一致。\n";
 const DEFAULT_PREPARE_OUTPUT_TEMPLATE: &str = "# Preparation Report\n\nAction: {{action}}\nStatus: {{status}}\n\n## Overview\nKeyMetrics:\n{{key_metrics}}\n\n## Risks\nRiskSummary:\n{{risk_summary}}\n\n## AI Interpretation\nAISummary:\n{{ai_summary}}\n\n## Command Execution\nCommandSummary:\n{{command_summary}}\n\n## Elapsed\nElapsed: {{elapsed}}\n";
 const DEFAULT_INSPECT_OUTPUT_TEMPLATE: &str = "Action: {{action}}\nStatus: {{status}}\nKeyMetrics:\n{{key_metrics}}\nRiskSummary:\n{{risk_summary}}\nAISummary:\n{{ai_summary}}\nCommandSummary:\n{{command_summary}}\nElapsed: {{elapsed}}\n";
 const DEFAULT_CHAT_OUTPUT_TEMPLATE: &str = "Action: {{action}}\nStatus: {{status}}\nKeyMetrics:\n{{key_metrics}}\nRiskSummary:\n{{risk_summary}}\nAISummary:\n{{ai_summary}}\nCommandSummary:\n{{command_summary}}\nElapsed: {{elapsed}}\n";
@@ -155,6 +157,20 @@ pub fn render_chat_notice(text: &str, colorful: bool) -> String {
     )
 }
 
+pub fn render_chat_custom_tag_event(tag: &str, text: &str, colorful: bool) -> String {
+    let multiline = text.contains('\n');
+    if !supports_color(colorful) {
+        if multiline {
+            return format!("{tag}\n{text}");
+        }
+        return format!("{tag} {text}");
+    }
+    if multiline {
+        return format!("{}\n{}", tag.bright_cyan().bold(), text.white());
+    }
+    format!("{} {}", tag.bright_cyan().bold(), text.white())
+}
+
 pub fn render_chat_user_prompt(prompt: &str, colorful: bool) -> String {
     if !supports_color(colorful) {
         return prompt.to_string();
@@ -163,6 +179,7 @@ pub fn render_chat_user_prompt(prompt: &str, colorful: bool) -> String {
 }
 
 pub fn render_chat_tool_event(text: &str, kind: ChatToolEventKind, colorful: bool) -> String {
+    let multiline = text.contains('\n');
     if !supports_color(colorful) {
         let tag = match kind {
             ChatToolEventKind::Running => i18n::chat_tag_tool(),
@@ -170,6 +187,9 @@ pub fn render_chat_tool_event(text: &str, kind: ChatToolEventKind, colorful: boo
             ChatToolEventKind::Error => i18n::chat_tag_tool_err(),
             ChatToolEventKind::Timeout => i18n::chat_tag_tool_timeout(),
         };
+        if multiline {
+            return format!("{tag}\n{text}");
+        }
         return format!("{tag} {text}");
     }
     let tag = match kind {
@@ -178,6 +198,9 @@ pub fn render_chat_tool_event(text: &str, kind: ChatToolEventKind, colorful: boo
         ChatToolEventKind::Error => i18n::chat_tag_tool_err().bright_red().bold(),
         ChatToolEventKind::Timeout => i18n::chat_tag_tool_timeout().bright_magenta().bold(),
     };
+    if multiline {
+        return format!("{tag}\n{}", text.white());
+    }
     format!("{tag} {}", text.white())
 }
 
@@ -191,6 +214,46 @@ pub fn render_chat_assistant_reply(prefix: &str, content: &str, colorful: bool) 
         prefix.bright_blue().bold(),
         indent_block(&body, "  ")
     )
+}
+
+pub fn print_chat_assistant_reply_stream(
+    prefix: &str,
+    content: &str,
+    colorful: bool,
+) -> Result<(), AppError> {
+    let mut stdout = std::io::stdout();
+    let body = render_markdown_for_terminal(content, false);
+    if supports_color(colorful) {
+        writeln!(stdout, "{}", prefix.bright_blue().bold())
+            .map_err(|err| AppError::Command(format!("failed to write chat prefix: {err}")))?;
+    } else {
+        writeln!(stdout, "{prefix}")
+            .map_err(|err| AppError::Command(format!("failed to write chat prefix: {err}")))?;
+    }
+    write!(stdout, "  ")
+        .map_err(|err| AppError::Command(format!("failed to write chat indent: {err}")))?;
+    stdout
+        .flush()
+        .map_err(|err| AppError::Command(format!("failed to flush chat output: {err}")))?;
+    for ch in body.chars() {
+        if ch == '\n' {
+            writeln!(stdout)
+                .map_err(|err| AppError::Command(format!("failed to stream chat output: {err}")))?;
+            write!(stdout, "  ").map_err(|err| {
+                AppError::Command(format!("failed to stream chat line indent: {err}"))
+            })?;
+        } else {
+            write!(stdout, "{ch}")
+                .map_err(|err| AppError::Command(format!("failed to stream chat output: {err}")))?;
+        }
+        stdout
+            .flush()
+            .map_err(|err| AppError::Command(format!("failed to flush stream output: {err}")))?;
+        thread::sleep(Duration::from_millis(6));
+    }
+    writeln!(stdout)
+        .map_err(|err| AppError::Command(format!("failed to finalize output: {err}")))?;
+    Ok(())
 }
 
 pub fn render_chat_thinking(prefix: &str, content: &str, colorful: bool) -> String {
@@ -595,7 +658,27 @@ fn colorize_output(text: &str) -> String {
 }
 
 fn supports_color(colorful: bool) -> bool {
-    colorful && std::io::stdout().is_terminal()
+    resolve_colorful_enabled(colorful)
+}
+
+pub fn resolve_colorful_enabled(colorful: bool) -> bool {
+    if !colorful {
+        return false;
+    }
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if let Ok(value) = std::env::var("TERM")
+        && value.trim().eq_ignore_ascii_case("dumb")
+    {
+        return false;
+    }
+    if let Ok(force) = std::env::var("CLICOLOR_FORCE")
+        && (force.trim() == "1" || force.trim().eq_ignore_ascii_case("true"))
+    {
+        return true;
+    }
+    std::io::stdout().is_terminal()
 }
 
 fn style_inline_markdown(line: &str) -> String {

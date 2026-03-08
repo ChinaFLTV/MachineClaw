@@ -89,6 +89,69 @@ pub fn language_code(language: Language) -> &'static str {
     }
 }
 
+pub fn human_count_u128(value: u128) -> String {
+    let text = value.to_string();
+    let mut out = String::with_capacity(text.len() + text.len() / 3);
+    let len = text.len();
+    for (idx, ch) in text.chars().enumerate() {
+        out.push(ch);
+        let left = len.saturating_sub(idx + 1);
+        if left > 0 && left % 3 == 0 {
+            out.push(',');
+        }
+    }
+    out
+}
+
+pub fn human_count_u64(value: u64) -> String {
+    human_count_u128(value as u128)
+}
+
+pub fn human_duration_ms(ms: u128) -> String {
+    if ms < 1_000 {
+        return format!("{ms}ms");
+    }
+    let total_seconds = ms / 1_000;
+    let remain_ms = ms % 1_000;
+    if total_seconds < 60 {
+        return format!("{total_seconds}.{remain_ms:03}s");
+    }
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    if total_minutes < 60 {
+        return format!("{total_minutes}m{seconds:02}s");
+    }
+    let minutes = total_minutes % 60;
+    let total_hours = total_minutes / 60;
+    if total_hours < 24 {
+        return format!("{total_hours}h{minutes:02}m{seconds:02}s");
+    }
+    let hours = total_hours % 24;
+    let days = total_hours / 24;
+    format!("{days}d{hours:02}h{minutes:02}m{seconds:02}s")
+}
+
+pub fn human_bytes(bytes: u128) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const TIB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    let value = bytes as f64;
+    if value < KIB {
+        return format!("{bytes} B");
+    }
+    if value < MIB {
+        return format!("{:.2} KiB", value / KIB);
+    }
+    if value < GIB {
+        return format!("{:.2} MiB", value / MIB);
+    }
+    if value < TIB {
+        return format!("{:.2} GiB", value / GIB);
+    }
+    format!("{:.2} TiB", value / TIB)
+}
+
 pub fn unsupported_language_notice(raw: &str) -> String {
     match current_language() {
         Language::ZhCn => format!(
@@ -530,6 +593,50 @@ pub fn chat_tag_tool_timeout() -> &'static str {
     }
 }
 
+pub fn chat_tag_mcp() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "[MCP]",
+        Language::ZhTw => "[MCP]",
+        Language::Fr => "[mcp]",
+        Language::De => "[mcp]",
+        Language::Ja => "[MCP]",
+        Language::En => "[mcp]",
+    }
+}
+
+pub fn chat_tag_skill() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "[技能]",
+        Language::ZhTw => "[技能]",
+        Language::Fr => "[skill]",
+        Language::De => "[skill]",
+        Language::Ja => "[skill]",
+        Language::En => "[skill]",
+    }
+}
+
+pub fn chat_tag_profile() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "[环境画像]",
+        Language::ZhTw => "[環境画像]",
+        Language::Fr => "[profil]",
+        Language::De => "[profil]",
+        Language::Ja => "[プロファイル]",
+        Language::En => "[profile]",
+    }
+}
+
+pub fn chat_tag_compress() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "[压缩]",
+        Language::ZhTw => "[壓縮]",
+        Language::Fr => "[compress]",
+        Language::De => "[compress]",
+        Language::Ja => "[圧縮]",
+        Language::En => "[compress]",
+    }
+}
+
 pub fn prompt_write_command_confirmation(command: &str) -> String {
     match current_language() {
         Language::ZhCn => format!("写命令需要确认: {}", command),
@@ -629,36 +736,44 @@ pub fn chat_welcome(
     mcp_summary: &str,
     chat_cfg: &AiChatConfig,
 ) -> String {
+    let message_count_fmt = human_count_u128(message_count as u128);
+    let summary_len_fmt = human_count_u128(summary_len as u128);
+    let recent_limit_fmt = human_count_u128(recent_limit as u128);
+    let max_limit_fmt = human_count_u128(max_limit as u128);
+    let skills_count_fmt = human_count_u128(skills_count as u128);
     let tool_flags = format!(
-        "tool={}, tool_ok={}, tool_err={}, tool_timeout={}",
+        "tool={}, tool_ok={}, tool_err={}, tool_timeout={}, tips={}, stream_output={}, output_multilines={}",
         chat_cfg.show_tool,
         chat_cfg.show_tool_ok,
         chat_cfg.show_tool_err,
-        chat_cfg.show_tool_timeout
+        chat_cfg.show_tool_timeout,
+        chat_cfg.show_tips,
+        chat_cfg.stream_output,
+        chat_cfg.output_multilines
     );
     match current_language() {
         Language::ZhCn => format!(
-            "chat 模式已启动\n会话: {session_id}\n会话文件: {}\n模型: {model}\n系统: {os_name}\n消息: {message_count} 条, 摘要 {summary_len} 字符\n上下文窗口: recent={recent_limit}, max={max_limit}\n能力: skills={skills_count}, mcp={mcp_summary}\n工具消息显示: {tool_flags}",
+            "chat 模式已启动\n会话: {session_id}\n会话文件: {}\n模型: {model}\n系统: {os_name}\n消息: {message_count_fmt} 条, 摘要 {summary_len_fmt} 字符\n上下文窗口: recent={recent_limit_fmt}, max={max_limit_fmt}\n能力: skills={skills_count_fmt}, mcp={mcp_summary}\n工具消息显示: {tool_flags}",
             session_file.display()
         ),
         Language::ZhTw => format!(
-            "chat 模式已啟動\n會話: {session_id}\n會話檔案: {}\n模型: {model}\n系統: {os_name}\n訊息: {message_count} 筆, 摘要 {summary_len} 字元\n上下文視窗: recent={recent_limit}, max={max_limit}\n能力: skills={skills_count}, mcp={mcp_summary}\n工具訊息顯示: {tool_flags}",
+            "chat 模式已啟動\n會話: {session_id}\n會話檔案: {}\n模型: {model}\n系統: {os_name}\n訊息: {message_count_fmt} 筆, 摘要 {summary_len_fmt} 字元\n上下文視窗: recent={recent_limit_fmt}, max={max_limit_fmt}\n能力: skills={skills_count_fmt}, mcp={mcp_summary}\n工具訊息顯示: {tool_flags}",
             session_file.display()
         ),
         Language::Fr => format!(
-            "Mode chat démarré\nSession: {session_id}\nFichier de session: {}\nModèle: {model}\nSystème: {os_name}\nMessages: {message_count}, résumé {summary_len} caractères\nFenêtre de contexte: recent={recent_limit}, max={max_limit}\nCapacités: skills={skills_count}, mcp={mcp_summary}\nAffichage outils: {tool_flags}",
+            "Mode chat démarré\nSession: {session_id}\nFichier de session: {}\nModèle: {model}\nSystème: {os_name}\nMessages: {message_count_fmt}, résumé {summary_len_fmt} caractères\nFenêtre de contexte: recent={recent_limit_fmt}, max={max_limit_fmt}\nCapacités: skills={skills_count_fmt}, mcp={mcp_summary}\nAffichage outils: {tool_flags}",
             session_file.display()
         ),
         Language::De => format!(
-            "Chat-Modus gestartet\nSitzung: {session_id}\nSitzungsdatei: {}\nModell: {model}\nSystem: {os_name}\nNachrichten: {message_count}, Zusammenfassung {summary_len} Zeichen\nKontextfenster: recent={recent_limit}, max={max_limit}\nFähigkeiten: skills={skills_count}, mcp={mcp_summary}\nTool-Anzeige: {tool_flags}",
+            "Chat-Modus gestartet\nSitzung: {session_id}\nSitzungsdatei: {}\nModell: {model}\nSystem: {os_name}\nNachrichten: {message_count_fmt}, Zusammenfassung {summary_len_fmt} Zeichen\nKontextfenster: recent={recent_limit_fmt}, max={max_limit_fmt}\nFähigkeiten: skills={skills_count_fmt}, mcp={mcp_summary}\nTool-Anzeige: {tool_flags}",
             session_file.display()
         ),
         Language::Ja => format!(
-            "chat モードを開始しました\nセッション: {session_id}\nセッションファイル: {}\nモデル: {model}\nシステム: {os_name}\nメッセージ: {message_count} 件, 要約 {summary_len} 文字\nコンテキスト枠: recent={recent_limit}, max={max_limit}\n機能: skills={skills_count}, mcp={mcp_summary}\nツール表示: {tool_flags}",
+            "chat モードを開始しました\nセッション: {session_id}\nセッションファイル: {}\nモデル: {model}\nシステム: {os_name}\nメッセージ: {message_count_fmt} 件, 要約 {summary_len_fmt} 文字\nコンテキスト枠: recent={recent_limit_fmt}, max={max_limit_fmt}\n機能: skills={skills_count_fmt}, mcp={mcp_summary}\nツール表示: {tool_flags}",
             session_file.display()
         ),
         Language::En => format!(
-            "chat mode started\nsession: {session_id}\nsession file: {}\nmodel: {model}\nos: {os_name}\nmessages: {message_count}, summary {summary_len} chars\ncontext window: recent={recent_limit}, max={max_limit}\ncapability: skills={skills_count}, mcp={mcp_summary}\ntool event visibility: {tool_flags}",
+            "chat mode started\nsession: {session_id}\nsession file: {}\nmodel: {model}\nos: {os_name}\nmessages: {message_count_fmt}, summary {summary_len_fmt} chars\ncontext window: recent={recent_limit_fmt}, max={max_limit_fmt}\ncapability: skills={skills_count_fmt}, mcp={mcp_summary}\ntool event visibility: {tool_flags}",
             session_file.display()
         ),
     }
@@ -715,34 +830,34 @@ pub fn chat_cleared() -> &'static str {
 
 pub fn chat_prompt_user() -> &'static str {
     match current_language() {
-        Language::ZhCn => "你> ",
-        Language::ZhTw => "你> ",
-        Language::Fr => "Vous> ",
-        Language::De => "Du> ",
-        Language::Ja => "あなた> ",
-        Language::En => "You> ",
+        Language::ZhCn => "[你] ",
+        Language::ZhTw => "[你] ",
+        Language::Fr => "[Vous] ",
+        Language::De => "[Du] ",
+        Language::Ja => "[あなた] ",
+        Language::En => "[You] ",
     }
 }
 
 pub fn chat_prompt_assistant() -> &'static str {
     match current_language() {
-        Language::ZhCn => "MachineClaw> ",
-        Language::ZhTw => "MachineClaw> ",
-        Language::Fr => "MachineClaw> ",
-        Language::De => "MachineClaw> ",
-        Language::Ja => "MachineClaw> ",
-        Language::En => "MachineClaw> ",
+        Language::ZhCn => "[MachineClaw] ",
+        Language::ZhTw => "[MachineClaw] ",
+        Language::Fr => "[MachineClaw] ",
+        Language::De => "[MachineClaw] ",
+        Language::Ja => "[MachineClaw] ",
+        Language::En => "[MachineClaw] ",
     }
 }
 
 pub fn chat_prompt_thinking() -> &'static str {
     match current_language() {
-        Language::ZhCn => "MachineClaw(思考)> ",
-        Language::ZhTw => "MachineClaw(思考)> ",
-        Language::Fr => "MachineClaw(thinking)> ",
-        Language::De => "MachineClaw(thinking)> ",
-        Language::Ja => "MachineClaw(thinking)> ",
-        Language::En => "MachineClaw(thinking)> ",
+        Language::ZhCn => "[MachineClaw-思考] ",
+        Language::ZhTw => "[MachineClaw-思考] ",
+        Language::Fr => "[MachineClaw-thinking] ",
+        Language::De => "[MachineClaw-thinking] ",
+        Language::Ja => "[MachineClaw-thinking] ",
+        Language::En => "[MachineClaw-thinking] ",
     }
 }
 
@@ -796,6 +911,39 @@ pub fn chat_tool_output_preview(preview: &str) -> String {
     }
 }
 
+pub fn chat_tool_type_shell_command() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "执行shell命令",
+        Language::ZhTw => "執行shell命令",
+        Language::Fr => "run_shell_command",
+        Language::De => "run_shell_command",
+        Language::Ja => "run_shell_command",
+        Language::En => "run_shell_command",
+    }
+}
+
+pub fn chat_tool_type_shell_result() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "命令执行结果",
+        Language::ZhTw => "命令執行結果",
+        Language::Fr => "shell_result",
+        Language::De => "shell_result",
+        Language::Ja => "shell_result",
+        Language::En => "shell_result",
+    }
+}
+
+pub fn chat_tool_type_output_preview() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "命令输出预览",
+        Language::ZhTw => "命令輸出預覽",
+        Language::Fr => "output_preview",
+        Language::De => "output_preview",
+        Language::Ja => "output_preview",
+        Language::En => "output_preview",
+    }
+}
+
 pub fn chat_session_switched(session_id: &str, session_file: &Path) -> String {
     match current_language() {
         Language::ZhCn => format!(
@@ -843,29 +991,39 @@ pub fn chat_stats(
     tool_count: usize,
     system_count: usize,
 ) -> String {
+    let message_count_fmt = human_count_u128(message_count as u128);
+    let summary_len_fmt = human_count_u128(summary_len as u128);
+    let recent_limit_fmt = human_count_u128(recent_limit as u128);
+    let max_limit_fmt = human_count_u128(max_limit as u128);
+    let chat_turns_fmt = human_count_u128(chat_turns as u128);
+    let skills_count_fmt = human_count_u128(skills_count as u128);
+    let user_count_fmt = human_count_u128(user_count as u128);
+    let assistant_count_fmt = human_count_u128(assistant_count as u128);
+    let tool_count_fmt = human_count_u128(tool_count as u128);
+    let system_count_fmt = human_count_u128(system_count as u128);
     match current_language() {
         Language::ZhCn => format!(
-            "会话统计\n会话: {session_id}\n会话文件: {}\n系统/模型: {os_name} / {model}\n消息总数: {message_count} (用户 {user_count}, 助手 {assistant_count}, 工具 {tool_count}, 系统 {system_count})\n摘要长度: {summary_len} 字符\n本次 chat 轮次: {chat_turns}\n上下文窗口: recent={recent_limit}, max={max_limit}\n能力状态: skills={skills_count}, mcp={mcp_summary}",
+            "会话统计\n会话: {session_id}\n会话文件: {}\n系统/模型: {os_name} / {model}\n消息总数: {message_count_fmt} (用户 {user_count_fmt}, 助手 {assistant_count_fmt}, 工具 {tool_count_fmt}, 系统 {system_count_fmt})\n摘要长度: {summary_len_fmt} 字符\n本次 chat 轮次: {chat_turns_fmt}\n上下文窗口: recent={recent_limit_fmt}, max={max_limit_fmt}\n能力状态: skills={skills_count_fmt}, mcp={mcp_summary}",
             session_file.display()
         ),
         Language::ZhTw => format!(
-            "會話統計\n會話: {session_id}\n會話檔案: {}\n系統/模型: {os_name} / {model}\n訊息總數: {message_count} (使用者 {user_count}, 助手 {assistant_count}, 工具 {tool_count}, 系統 {system_count})\n摘要長度: {summary_len} 字元\n本次 chat 輪次: {chat_turns}\n上下文視窗: recent={recent_limit}, max={max_limit}\n能力狀態: skills={skills_count}, mcp={mcp_summary}",
+            "會話統計\n會話: {session_id}\n會話檔案: {}\n系統/模型: {os_name} / {model}\n訊息總數: {message_count_fmt} (使用者 {user_count_fmt}, 助手 {assistant_count_fmt}, 工具 {tool_count_fmt}, 系統 {system_count_fmt})\n摘要長度: {summary_len_fmt} 字元\n本次 chat 輪次: {chat_turns_fmt}\n上下文視窗: recent={recent_limit_fmt}, max={max_limit_fmt}\n能力狀態: skills={skills_count_fmt}, mcp={mcp_summary}",
             session_file.display()
         ),
         Language::Fr => format!(
-            "Statistiques de session\nSession: {session_id}\nFichier: {}\nSystème/Modèle: {os_name} / {model}\nMessages: {message_count} (user {user_count}, assistant {assistant_count}, tool {tool_count}, system {system_count})\nLongueur du résumé: {summary_len}\nTours de chat: {chat_turns}\nFenêtre de contexte: recent={recent_limit}, max={max_limit}\nCapacités: skills={skills_count}, mcp={mcp_summary}",
+            "Statistiques de session\nSession: {session_id}\nFichier: {}\nSystème/Modèle: {os_name} / {model}\nMessages: {message_count_fmt} (user {user_count_fmt}, assistant {assistant_count_fmt}, tool {tool_count_fmt}, system {system_count_fmt})\nLongueur du résumé: {summary_len_fmt}\nTours de chat: {chat_turns_fmt}\nFenêtre de contexte: recent={recent_limit_fmt}, max={max_limit_fmt}\nCapacités: skills={skills_count_fmt}, mcp={mcp_summary}",
             session_file.display()
         ),
         Language::De => format!(
-            "Sitzungsstatistik\nSitzung: {session_id}\nDatei: {}\nSystem/Modell: {os_name} / {model}\nNachrichten: {message_count} (user {user_count}, assistant {assistant_count}, tool {tool_count}, system {system_count})\nZusammenfassungslänge: {summary_len}\nChat-Runden: {chat_turns}\nKontextfenster: recent={recent_limit}, max={max_limit}\nFähigkeiten: skills={skills_count}, mcp={mcp_summary}",
+            "Sitzungsstatistik\nSitzung: {session_id}\nDatei: {}\nSystem/Modell: {os_name} / {model}\nNachrichten: {message_count_fmt} (user {user_count_fmt}, assistant {assistant_count_fmt}, tool {tool_count_fmt}, system {system_count_fmt})\nZusammenfassungslänge: {summary_len_fmt}\nChat-Runden: {chat_turns_fmt}\nKontextfenster: recent={recent_limit_fmt}, max={max_limit_fmt}\nFähigkeiten: skills={skills_count_fmt}, mcp={mcp_summary}",
             session_file.display()
         ),
         Language::Ja => format!(
-            "セッション統計\nセッション: {session_id}\nファイル: {}\nシステム/モデル: {os_name} / {model}\nメッセージ総数: {message_count} (user {user_count}, assistant {assistant_count}, tool {tool_count}, system {system_count})\n要約文字数: {summary_len}\nchat ターン数: {chat_turns}\nコンテキスト枠: recent={recent_limit}, max={max_limit}\n機能: skills={skills_count}, mcp={mcp_summary}",
+            "セッション統計\nセッション: {session_id}\nファイル: {}\nシステム/モデル: {os_name} / {model}\nメッセージ総数: {message_count_fmt} (user {user_count_fmt}, assistant {assistant_count_fmt}, tool {tool_count_fmt}, system {system_count_fmt})\n要約文字数: {summary_len_fmt}\nchat ターン数: {chat_turns_fmt}\nコンテキスト枠: recent={recent_limit_fmt}, max={max_limit_fmt}\n機能: skills={skills_count_fmt}, mcp={mcp_summary}",
             session_file.display()
         ),
         Language::En => format!(
-            "session stats\nsession: {session_id}\nfile: {}\nos/model: {os_name} / {model}\nmessages: {message_count} (user {user_count}, assistant {assistant_count}, tool {tool_count}, system {system_count})\nsummary chars: {summary_len}\nchat turns: {chat_turns}\ncontext window: recent={recent_limit}, max={max_limit}\ncapability: skills={skills_count}, mcp={mcp_summary}",
+            "session stats\nsession: {session_id}\nfile: {}\nos/model: {os_name} / {model}\nmessages: {message_count_fmt} (user {user_count_fmt}, assistant {assistant_count_fmt}, tool {tool_count_fmt}, system {system_count_fmt})\nsummary chars: {summary_len_fmt}\nchat turns: {chat_turns_fmt}\ncontext window: recent={recent_limit_fmt}, max={max_limit_fmt}\ncapability: skills={skills_count_fmt}, mcp={mcp_summary}",
             session_file.display()
         ),
     }
@@ -882,6 +1040,155 @@ pub fn chat_progress_analyzing() -> &'static str {
     }
 }
 
+pub fn chat_profile_started() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "正在建立当前机器环境画像...",
+        Language::ZhTw => "正在建立目前機器環境畫像...",
+        Language::Fr => "Construction du profil de l'environnement local...",
+        Language::De => "Erstelle Umgebungsprofil der aktuellen Maschine...",
+        Language::Ja => "現在のマシン環境プロファイルを構築中...",
+        Language::En => "Building environment profile for current machine...",
+    }
+}
+
+pub fn chat_profile_completed() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "环境画像已更新并注入会话上下文。",
+        Language::ZhTw => "環境畫像已更新並注入會話上下文。",
+        Language::Fr => "Le profil d'environnement a été mis à jour et injecté dans le contexte.",
+        Language::De => "Umgebungsprofil wurde aktualisiert und in den Kontext übernommen.",
+        Language::Ja => "環境プロファイルを更新し、会話コンテキストに注入しました。",
+        Language::En => "Environment profile updated and injected into chat context.",
+    }
+}
+
+pub fn chat_profile_failed(err: &str) -> String {
+    match current_language() {
+        Language::ZhCn => format!("环境画像构建失败: {err}"),
+        Language::ZhTw => format!("環境畫像建立失敗: {err}"),
+        Language::Fr => format!("Échec de création du profil d'environnement: {err}"),
+        Language::De => format!("Erstellung des Umgebungsprofils fehlgeschlagen: {err}"),
+        Language::Ja => format!("環境プロファイルの作成に失敗しました: {err}"),
+        Language::En => format!("Failed to build environment profile: {err}"),
+    }
+}
+
+pub fn chat_compression_started(target_messages: usize) -> String {
+    let target_messages_fmt = human_count_u128(target_messages as u128);
+    match current_language() {
+        Language::ZhCn => {
+            format!("上下文消息超过阈值，开始执行 AI 压缩（候选消息 {target_messages_fmt} 条）...")
+        }
+        Language::ZhTw => {
+            format!("上下文訊息超過閾值，開始執行 AI 壓縮（候選訊息 {target_messages_fmt} 筆）...")
+        }
+        Language::Fr => format!(
+            "Le contexte dépasse le seuil, compression IA en cours (messages candidats: {target_messages_fmt})..."
+        ),
+        Language::De => format!(
+            "Kontext über Schwellwert, starte KI-Kompression (Kandidaten: {target_messages_fmt})..."
+        ),
+        Language::Ja => format!(
+            "コンテキストが閾値を超えたため、AI 圧縮を開始します（候補 {target_messages_fmt} 件）..."
+        ),
+        Language::En => format!(
+            "Context exceeds threshold, starting AI compression (candidate messages: {target_messages_fmt})..."
+        ),
+    }
+}
+
+pub fn chat_compression_completed(removed: usize, total: usize) -> String {
+    let removed_fmt = human_count_u128(removed as u128);
+    let total_fmt = human_count_u128(total as u128);
+    match current_language() {
+        Language::ZhCn => {
+            format!("AI 压缩完成，已折叠 {removed_fmt} 条旧消息，当前总消息 {total_fmt} 条。")
+        }
+        Language::ZhTw => {
+            format!("AI 壓縮完成，已折疊 {removed_fmt} 筆舊訊息，目前總訊息 {total_fmt} 筆。")
+        }
+        Language::Fr => format!(
+            "Compression IA terminée: {removed_fmt} anciens messages condensés, total actuel {total_fmt}."
+        ),
+        Language::De => format!(
+            "KI-Kompression abgeschlossen: {removed_fmt} alte Nachrichten verdichtet, aktuell {total_fmt} gesamt."
+        ),
+        Language::Ja => format!(
+            "AI 圧縮が完了しました。{removed_fmt} 件の旧メッセージを圧縮し、現在 {total_fmt} 件です。"
+        ),
+        Language::En => format!(
+            "AI compression completed: collapsed {removed_fmt} old messages, current total {total_fmt}."
+        ),
+    }
+}
+
+pub fn chat_compression_failed(err: &str) -> String {
+    match current_language() {
+        Language::ZhCn => format!("AI 压缩失败，已跳过本轮压缩: {err}"),
+        Language::ZhTw => format!("AI 壓縮失敗，已跳過本輪壓縮: {err}"),
+        Language::Fr => format!("Échec de compression IA, compression ignorée pour ce tour: {err}"),
+        Language::De => {
+            format!("KI-Kompression fehlgeschlagen, in dieser Runde übersprungen: {err}")
+        }
+        Language::Ja => format!("AI 圧縮に失敗したため、このラウンドはスキップしました: {err}"),
+        Language::En => format!("AI compression failed; skipped this round: {err}"),
+    }
+}
+
+pub fn chat_skill_enabled(count: usize) -> String {
+    let count_fmt = human_count_u128(count as u128);
+    match current_language() {
+        Language::ZhCn => format!("已启用 Skills 自动扫描，可用技能目录项 {count_fmt} 个。"),
+        Language::ZhTw => format!("已啟用 Skills 自動掃描，可用技能目錄項 {count_fmt} 個。"),
+        Language::Fr => {
+            format!("Scan automatique des skills activé, entrées disponibles: {count_fmt}.")
+        }
+        Language::De => {
+            format!("Automatischer Skill-Scan aktiviert, verfügbare Einträge: {count_fmt}.")
+        }
+        Language::Ja => {
+            format!("Skills 自動スキャンを有効化しました。利用可能な項目: {count_fmt}。")
+        }
+        Language::En => format!("Skill auto-scan enabled, available entries: {count_fmt}."),
+    }
+}
+
+pub fn chat_mcp_call_started(name: &str) -> String {
+    match current_language() {
+        Language::ZhCn => format!("调用 MCP 工具: {name}"),
+        Language::ZhTw => format!("呼叫 MCP 工具: {name}"),
+        Language::Fr => format!("Appel de l'outil MCP: {name}"),
+        Language::De => format!("MCP-Tool-Aufruf: {name}"),
+        Language::Ja => format!("MCP ツール呼び出し: {name}"),
+        Language::En => format!("Calling MCP tool: {name}"),
+    }
+}
+
+pub fn chat_round_received(round: usize, tool_calls: usize) -> String {
+    let round_fmt = human_count_u128(round as u128);
+    let tool_calls_fmt = human_count_u128(tool_calls as u128);
+    match current_language() {
+        Language::ZhCn => {
+            format!("已收到第 {round_fmt} 轮 AI 响应，准备执行 {tool_calls_fmt} 个工具调用...")
+        }
+        Language::ZhTw => {
+            format!("已收到第 {round_fmt} 輪 AI 回應，準備執行 {tool_calls_fmt} 個工具呼叫...")
+        }
+        Language::Fr => format!(
+            "Réponse IA du tour {round_fmt} reçue, préparation de {tool_calls_fmt} appel(s) d'outil..."
+        ),
+        Language::De => format!(
+            "KI-Antwort Runde {round_fmt} empfangen, {tool_calls_fmt} Tool-Aufruf(e) werden vorbereitet..."
+        ),
+        Language::Ja => format!(
+            "第 {round_fmt} ラウンドの AI 応答を受信しました。{tool_calls_fmt} 件のツール呼び出しを実行します..."
+        ),
+        Language::En => {
+            format!("AI round {round_fmt} received, preparing {tool_calls_fmt} tool call(s)...")
+        }
+    }
+}
+
 pub fn chat_context_pressure_warning(
     usage_percent: u8,
     message_count: usize,
@@ -890,65 +1197,69 @@ pub fn chat_context_pressure_warning(
     summary_chars: usize,
     critical: bool,
 ) -> String {
+    let message_count_fmt = human_count_u128(message_count as u128);
+    let max_limit_fmt = human_count_u128(max_limit as u128);
+    let recent_limit_fmt = human_count_u128(recent_limit as u128);
+    let summary_chars_fmt = human_count_u128(summary_chars as u128);
     match current_language() {
         Language::ZhCn => {
             if critical {
                 return format!(
-                    "上下文容量已接近上限({usage_percent}%)：messages={message_count}/{max_limit}, recent={recent_limit}, summary_chars={summary_chars}。建议尽快结束当前话题或切换 /new 以降低压缩损耗。"
+                    "上下文容量已接近上限({usage_percent}%)：messages={message_count_fmt}/{max_limit_fmt}, recent={recent_limit_fmt}, summary_chars={summary_chars_fmt}。建议尽快结束当前话题或切换 /new 以降低压缩损耗。"
                 );
             }
             format!(
-                "上下文容量预警({usage_percent}%)：messages={message_count}/{max_limit}, recent={recent_limit}, summary_chars={summary_chars}。后续消息可能触发更激进压缩。"
+                "上下文容量预警({usage_percent}%)：messages={message_count_fmt}/{max_limit_fmt}, recent={recent_limit_fmt}, summary_chars={summary_chars_fmt}。后续消息可能触发更激进压缩。"
             )
         }
         Language::ZhTw => {
             if critical {
                 return format!(
-                    "上下文容量接近上限({usage_percent}%)：messages={message_count}/{max_limit}, recent={recent_limit}, summary_chars={summary_chars}。建議盡快結束目前話題或切換 /new 降低壓縮損耗。"
+                    "上下文容量接近上限({usage_percent}%)：messages={message_count_fmt}/{max_limit_fmt}, recent={recent_limit_fmt}, summary_chars={summary_chars_fmt}。建議盡快結束目前話題或切換 /new 降低壓縮損耗。"
                 );
             }
             format!(
-                "上下文容量預警({usage_percent}%)：messages={message_count}/{max_limit}, recent={recent_limit}, summary_chars={summary_chars}。後續訊息可能觸發更激進壓縮。"
+                "上下文容量預警({usage_percent}%)：messages={message_count_fmt}/{max_limit_fmt}, recent={recent_limit_fmt}, summary_chars={summary_chars_fmt}。後續訊息可能觸發更激進壓縮。"
             )
         }
         Language::Fr => {
             if critical {
                 return format!(
-                    "Contexte presque saturé ({usage_percent}%): messages={message_count}/{max_limit}, recent={recent_limit}, summary_chars={summary_chars}. Terminez le sujet ou utilisez /new pour réduire la perte due à la compression."
+                    "Contexte presque saturé ({usage_percent}%): messages={message_count_fmt}/{max_limit_fmt}, recent={recent_limit_fmt}, summary_chars={summary_chars_fmt}. Terminez le sujet ou utilisez /new pour réduire la perte due à la compression."
                 );
             }
             format!(
-                "Alerte contexte ({usage_percent}%): messages={message_count}/{max_limit}, recent={recent_limit}, summary_chars={summary_chars}. Une compression plus agressive peut être appliquée."
+                "Alerte contexte ({usage_percent}%): messages={message_count_fmt}/{max_limit_fmt}, recent={recent_limit_fmt}, summary_chars={summary_chars_fmt}. Une compression plus agressive peut être appliquée."
             )
         }
         Language::De => {
             if critical {
                 return format!(
-                    "Kontext fast ausgelastet ({usage_percent}%): messages={message_count}/{max_limit}, recent={recent_limit}, summary_chars={summary_chars}. Thema abschließen oder /new verwenden, um Kompressionsverlust zu verringern."
+                    "Kontext fast ausgelastet ({usage_percent}%): messages={message_count_fmt}/{max_limit_fmt}, recent={recent_limit_fmt}, summary_chars={summary_chars_fmt}. Thema abschließen oder /new verwenden, um Kompressionsverlust zu verringern."
                 );
             }
             format!(
-                "Kontext-Warnung ({usage_percent}%): messages={message_count}/{max_limit}, recent={recent_limit}, summary_chars={summary_chars}. Weitere Nachrichten können stärkere Kompression auslösen."
+                "Kontext-Warnung ({usage_percent}%): messages={message_count_fmt}/{max_limit_fmt}, recent={recent_limit_fmt}, summary_chars={summary_chars_fmt}. Weitere Nachrichten können stärkere Kompression auslösen."
             )
         }
         Language::Ja => {
             if critical {
                 return format!(
-                    "コンテキスト容量が上限に近づいています ({usage_percent}%): messages={message_count}/{max_limit}, recent={recent_limit}, summary_chars={summary_chars}。圧縮劣化を抑えるため、話題を区切るか /new を使用してください。"
+                    "コンテキスト容量が上限に近づいています ({usage_percent}%): messages={message_count_fmt}/{max_limit_fmt}, recent={recent_limit_fmt}, summary_chars={summary_chars_fmt}。圧縮劣化を抑えるため、話題を区切るか /new を使用してください。"
                 );
             }
             format!(
-                "コンテキスト容量の警告 ({usage_percent}%): messages={message_count}/{max_limit}, recent={recent_limit}, summary_chars={summary_chars}。以降のメッセージで圧縮が強くなる可能性があります。"
+                "コンテキスト容量の警告 ({usage_percent}%): messages={message_count_fmt}/{max_limit_fmt}, recent={recent_limit_fmt}, summary_chars={summary_chars_fmt}。以降のメッセージで圧縮が強くなる可能性があります。"
             )
         }
         Language::En => {
             if critical {
                 return format!(
-                    "Context is near capacity ({usage_percent}%): messages={message_count}/{max_limit}, recent={recent_limit}, summary_chars={summary_chars}. Consider ending the topic or switching to /new to reduce compression loss."
+                    "Context is near capacity ({usage_percent}%): messages={message_count_fmt}/{max_limit_fmt}, recent={recent_limit_fmt}, summary_chars={summary_chars_fmt}. Consider ending the topic or switching to /new to reduce compression loss."
                 );
             }
             format!(
-                "Context pressure warning ({usage_percent}%): messages={message_count}/{max_limit}, recent={recent_limit}, summary_chars={summary_chars}. Further messages may trigger stronger compression."
+                "Context pressure warning ({usage_percent}%): messages={message_count_fmt}/{max_limit_fmt}, recent={recent_limit_fmt}, summary_chars={summary_chars_fmt}. Further messages may trigger stronger compression."
             )
         }
     }
@@ -970,13 +1281,21 @@ pub fn chat_tool_running(label: &str, mode: &str, command: &str) -> String {
 }
 
 pub fn chat_tool_cache_hit(label: &str, age_ms: u128) -> String {
+    let age = human_duration_ms(age_ms);
+    let age_ms_fmt = human_count_u128(age_ms);
     match current_language() {
-        Language::ZhCn => format!("命中命令缓存: label={label}, age_ms={age_ms}"),
-        Language::ZhTw => format!("命中命令快取: label={label}, age_ms={age_ms}"),
-        Language::Fr => format!("Cache de commande utilisé: label={label}, age_ms={age_ms}"),
-        Language::De => format!("Befehls-Cache-Treffer: label={label}, age_ms={age_ms}"),
-        Language::Ja => format!("コマンドキャッシュを使用: label={label}, age_ms={age_ms}"),
-        Language::En => format!("Command cache hit: label={label}, age_ms={age_ms}"),
+        Language::ZhCn => format!("命中命令缓存: label={label}, age={age} ({age_ms_fmt} ms)"),
+        Language::ZhTw => format!("命中命令快取: label={label}, age={age} ({age_ms_fmt} ms)"),
+        Language::Fr => {
+            format!("Cache de commande utilisé: label={label}, age={age} ({age_ms_fmt} ms)")
+        }
+        Language::De => {
+            format!("Befehls-Cache-Treffer: label={label}, age={age} ({age_ms_fmt} ms)")
+        }
+        Language::Ja => {
+            format!("コマンドキャッシュを使用: label={label}, age={age} ({age_ms_fmt} ms)")
+        }
+        Language::En => format!("Command cache hit: label={label}, age={age} ({age_ms_fmt} ms)"),
     }
 }
 
@@ -989,65 +1308,71 @@ pub fn chat_round_metrics(
     estimated_cost_usd: f64,
     show_cost: bool,
 ) -> String {
+    let duration = human_duration_ms(api_duration_ms);
+    let api_duration_ms_fmt = human_count_u128(api_duration_ms);
+    let api_rounds_fmt = human_count_u128(api_rounds as u128);
+    let prompt_tokens_fmt = human_count_u64(prompt_tokens);
+    let completion_tokens_fmt = human_count_u64(completion_tokens);
+    let total_tokens_fmt = human_count_u64(total_tokens);
     match current_language() {
         Language::ZhCn => {
             if show_cost {
                 return format!(
-                    "本轮指标：请求轮次 {api_rounds}，接口耗时 {api_duration_ms} ms，Token（输入/输出/总计）{prompt_tokens}/{completion_tokens}/{total_tokens}，预估费用 {estimated_cost_usd:.6} USD"
+                    "本轮指标：请求轮次 {api_rounds_fmt}，接口耗时 {duration}（{api_duration_ms_fmt} ms），Token（输入/输出/总计）{prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}，预估费用 {estimated_cost_usd:.6} USD"
                 );
             }
             format!(
-                "本轮指标：请求轮次 {api_rounds}，接口耗时 {api_duration_ms} ms，Token（输入/输出/总计）{prompt_tokens}/{completion_tokens}/{total_tokens}"
+                "本轮指标：请求轮次 {api_rounds_fmt}，接口耗时 {duration}（{api_duration_ms_fmt} ms），Token（输入/输出/总计）{prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}"
             )
         }
         Language::ZhTw => {
             if show_cost {
                 return format!(
-                    "本輪指標：請求輪次 {api_rounds}，介面耗時 {api_duration_ms} ms，Token（輸入/輸出/總計）{prompt_tokens}/{completion_tokens}/{total_tokens}，預估費用 {estimated_cost_usd:.6} USD"
+                    "本輪指標：請求輪次 {api_rounds_fmt}，介面耗時 {duration}（{api_duration_ms_fmt} ms），Token（輸入/輸出/總計）{prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}，預估費用 {estimated_cost_usd:.6} USD"
                 );
             }
             format!(
-                "本輪指標：請求輪次 {api_rounds}，介面耗時 {api_duration_ms} ms，Token（輸入/輸出/總計）{prompt_tokens}/{completion_tokens}/{total_tokens}"
+                "本輪指標：請求輪次 {api_rounds_fmt}，介面耗時 {duration}（{api_duration_ms_fmt} ms），Token（輸入/輸出/總計）{prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}"
             )
         }
         Language::Fr => {
             if show_cost {
                 return format!(
-                    "Métriques du tour: cycles {api_rounds}, durée API {api_duration_ms} ms, tokens (entrée/sortie/total) {prompt_tokens}/{completion_tokens}/{total_tokens}, coût estimé {estimated_cost_usd:.6} USD"
+                    "Métriques du tour: cycles {api_rounds_fmt}, durée API {duration} ({api_duration_ms_fmt} ms), tokens (entrée/sortie/total) {prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}, coût estimé {estimated_cost_usd:.6} USD"
                 );
             }
             format!(
-                "Métriques du tour: cycles {api_rounds}, durée API {api_duration_ms} ms, tokens (entrée/sortie/total) {prompt_tokens}/{completion_tokens}/{total_tokens}"
+                "Métriques du tour: cycles {api_rounds_fmt}, durée API {duration} ({api_duration_ms_fmt} ms), tokens (entrée/sortie/total) {prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}"
             )
         }
         Language::De => {
             if show_cost {
                 return format!(
-                    "Rundenmetriken: Durchläufe {api_rounds}, API-Dauer {api_duration_ms} ms, Tokens (Eingabe/Ausgabe/Gesamt) {prompt_tokens}/{completion_tokens}/{total_tokens}, geschätzte Kosten {estimated_cost_usd:.6} USD"
+                    "Rundenmetriken: Durchläufe {api_rounds_fmt}, API-Dauer {duration} ({api_duration_ms_fmt} ms), Tokens (Eingabe/Ausgabe/Gesamt) {prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}, geschätzte Kosten {estimated_cost_usd:.6} USD"
                 );
             }
             format!(
-                "Rundenmetriken: Durchläufe {api_rounds}, API-Dauer {api_duration_ms} ms, Tokens (Eingabe/Ausgabe/Gesamt) {prompt_tokens}/{completion_tokens}/{total_tokens}"
+                "Rundenmetriken: Durchläufe {api_rounds_fmt}, API-Dauer {duration} ({api_duration_ms_fmt} ms), Tokens (Eingabe/Ausgabe/Gesamt) {prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}"
             )
         }
         Language::Ja => {
             if show_cost {
                 return format!(
-                    "ラウンド指標: リクエスト回数 {api_rounds}、API時間 {api_duration_ms} ms、Token（入力/出力/合計）{prompt_tokens}/{completion_tokens}/{total_tokens}、推定コスト {estimated_cost_usd:.6} USD"
+                    "ラウンド指標: リクエスト回数 {api_rounds_fmt}、API時間 {duration}（{api_duration_ms_fmt} ms）、Token（入力/出力/合計）{prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}、推定コスト {estimated_cost_usd:.6} USD"
                 );
             }
             format!(
-                "ラウンド指標: リクエスト回数 {api_rounds}、API時間 {api_duration_ms} ms、Token（入力/出力/合計）{prompt_tokens}/{completion_tokens}/{total_tokens}"
+                "ラウンド指標: リクエスト回数 {api_rounds_fmt}、API時間 {duration}（{api_duration_ms_fmt} ms）、Token（入力/出力/合計）{prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}"
             )
         }
         Language::En => {
             if show_cost {
                 return format!(
-                    "Round metrics: rounds {api_rounds}, API duration {api_duration_ms} ms, tokens (prompt/completion/total) {prompt_tokens}/{completion_tokens}/{total_tokens}, estimated cost {estimated_cost_usd:.6} USD"
+                    "Round metrics: rounds {api_rounds_fmt}, API duration {duration} ({api_duration_ms_fmt} ms), tokens (prompt/completion/total) {prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}, estimated cost {estimated_cost_usd:.6} USD"
                 );
             }
             format!(
-                "Round metrics: rounds {api_rounds}, API duration {api_duration_ms} ms, tokens (prompt/completion/total) {prompt_tokens}/{completion_tokens}/{total_tokens}"
+                "Round metrics: rounds {api_rounds_fmt}, API duration {duration} ({api_duration_ms_fmt} ms), tokens (prompt/completion/total) {prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}"
             )
         }
     }
@@ -1081,24 +1406,26 @@ pub fn chat_tool_finished(
             Language::En => "failed",
         }
     };
+    let duration = human_duration_ms(duration_ms);
+    let duration_ms_fmt = human_count_u128(duration_ms);
     match current_language() {
         Language::ZhCn => format!(
-            "命令完成: label={label}, status={status}, exit={exit_code:?}, duration_ms={duration_ms}, timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
+            "命令完成: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
         ),
         Language::ZhTw => format!(
-            "命令完成: label={label}, status={status}, exit={exit_code:?}, duration_ms={duration_ms}, timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
+            "命令完成: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
         ),
         Language::Fr => format!(
-            "Commande terminée: label={label}, status={status}, exit={exit_code:?}, duration_ms={duration_ms}, timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
+            "Commande terminée: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
         ),
         Language::De => format!(
-            "Befehl abgeschlossen: label={label}, status={status}, exit={exit_code:?}, duration_ms={duration_ms}, timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
+            "Befehl abgeschlossen: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
         ),
         Language::Ja => format!(
-            "コマンド完了: label={label}, status={status}, exit={exit_code:?}, duration_ms={duration_ms}, timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
+            "コマンド完了: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
         ),
         Language::En => format!(
-            "Command finished: label={label}, status={status}, exit={exit_code:?}, duration_ms={duration_ms}, timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
+            "Command finished: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
         ),
     }
 }
@@ -1370,6 +1697,42 @@ fn localize_detail(detail: &str) -> String {
             }
             Language::En => detail.to_string(),
         },
+        "mcp.enabled=true requires at least one configured server" => match current_language() {
+            Language::ZhCn => "mcp.enabled=true 时至少需要配置一个 MCP 服务".to_string(),
+            Language::ZhTw => "mcp.enabled=true 時至少需要設定一個 MCP 服務".to_string(),
+            Language::Fr => {
+                "Quand mcp.enabled=true, au moins un serveur MCP doit être configuré".to_string()
+            }
+            Language::De => {
+                "Bei mcp.enabled=true muss mindestens ein MCP-Server konfiguriert sein".to_string()
+            }
+            Language::Ja => {
+                "mcp.enabled=true の場合、少なくとも 1 つの MCP サーバー設定が必要です"
+                    .to_string()
+            }
+            Language::En => detail.to_string(),
+        },
+        _ if detail.starts_with("mcp server '")
+            && detail.ends_with("' requires endpoint or command") =>
+        {
+            match current_language() {
+                Language::ZhCn => format!("MCP 服务配置缺失 endpoint 或 command: {}", detail),
+                Language::ZhTw => format!("MCP 服務設定缺少 endpoint 或 command: {}", detail),
+                Language::Fr => format!(
+                    "Configuration MCP incomplète (endpoint ou command manquant): {}",
+                    detail
+                ),
+                Language::De => format!(
+                    "Unvollständige MCP-Konfiguration (endpoint oder command fehlt): {}",
+                    detail
+                ),
+                Language::Ja => format!(
+                    "MCP 設定が不完全です（endpoint または command が不足）: {}",
+                    detail
+                ),
+                Language::En => detail.to_string(),
+            }
+        }
         "administrator privileges are required on Windows" => match current_language() {
             Language::ZhCn => "Windows 需要管理员权限".to_string(),
             Language::ZhTw => "Windows 需要管理員權限".to_string(),

@@ -15,6 +15,7 @@ const DEFAULT_WRITE_CMD_RUN_CONFIRM: bool = true;
 const DEFAULT_WRITE_CMD_CONFIRM_MODE: &str = "allow-once";
 const DEFAULT_COMMAND_OUTPUT_MAX_BYTES: usize = 262_144;
 const DEFAULT_SKILLS_DIR: &str = "~/.skills";
+const DEFAULT_SKILLS_ENABLED: bool = false;
 const DEFAULT_CONSOLE_COLORFUL: bool = true;
 const DEFAULT_AI_MAX_RETRIES: u32 = 2;
 const DEFAULT_AI_BACKOFF_MILLIS: u64 = 1500;
@@ -24,11 +25,14 @@ const DEFAULT_CHAT_SHOW_TOOL: bool = false;
 const DEFAULT_CHAT_SHOW_TOOL_OK: bool = false;
 const DEFAULT_CHAT_SHOW_TOOL_ERR: bool = false;
 const DEFAULT_CHAT_SHOW_TOOL_TIMEOUT: bool = false;
+const DEFAULT_CHAT_SHOW_TIPS: bool = false;
 const DEFAULT_CHAT_COMMAND_CACHE_TTL_SECONDS: u64 = 30;
 const DEFAULT_CHAT_SHOW_ROUND_METRICS: bool = true;
 const DEFAULT_CHAT_SHOW_TOKEN_COST: bool = true;
 const DEFAULT_CHAT_CONTEXT_WARN_PERCENT: u8 = 80;
 const DEFAULT_CHAT_CONTEXT_CRITICAL_PERCENT: u8 = 95;
+const DEFAULT_CHAT_STREAM_OUTPUT: bool = false;
+const DEFAULT_CHAT_OUTPUT_MULTILINES: bool = false;
 const DEFAULT_CONTEXT_RECENT_MESSAGES: usize = 40;
 const MAX_CONTEXT_MESSAGES: usize = 80;
 
@@ -90,6 +94,8 @@ pub struct AiChatConfig {
         default = "default_chat_show_tool_timeout"
     )]
     pub show_tool_timeout: bool,
+    #[serde(rename = "show-tips", default = "default_chat_show_tips")]
+    pub show_tips: bool,
     #[serde(
         rename = "command-cache-ttl-seconds",
         default = "default_chat_command_cache_ttl_seconds"
@@ -112,6 +118,13 @@ pub struct AiChatConfig {
         default = "default_chat_context_critical_percent"
     )]
     pub context_critical_percent: u8,
+    #[serde(rename = "stream-output", default = "default_chat_stream_output")]
+    pub stream_output: bool,
+    #[serde(
+        rename = "output-multilines",
+        default = "default_chat_output_multilines"
+    )]
+    pub output_multilines: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -157,6 +170,8 @@ pub struct CmdConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SkillsConfig {
+    #[serde(default = "default_skills_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_skills_dir")]
     pub dir: String,
 }
@@ -174,6 +189,26 @@ pub struct McpConfig {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
+    #[serde(rename = "timeout-seconds")]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct McpServerConfig {
+    #[serde(default = "default_mcp_server_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    #[serde(rename = "timeout-seconds")]
     pub timeout_seconds: Option<u64>,
 }
 
@@ -207,11 +242,14 @@ impl Default for AiChatConfig {
             show_tool_ok: default_chat_show_tool_ok(),
             show_tool_err: default_chat_show_tool_err(),
             show_tool_timeout: default_chat_show_tool_timeout(),
+            show_tips: default_chat_show_tips(),
             command_cache_ttl_seconds: default_chat_command_cache_ttl_seconds(),
             show_round_metrics: default_chat_show_round_metrics(),
             show_token_cost: default_chat_show_token_cost(),
             context_warn_percent: default_chat_context_warn_percent(),
             context_critical_percent: default_chat_context_critical_percent(),
+            stream_output: default_chat_stream_output(),
+            output_multilines: default_chat_output_multilines(),
         }
     }
 }
@@ -233,6 +271,7 @@ impl Default for CmdConfig {
 impl Default for SkillsConfig {
     fn default() -> Self {
         Self {
+            enabled: default_skills_enabled(),
             dir: default_skills_dir(),
         }
     }
@@ -311,11 +350,14 @@ show-tool = false # optional
 show-tool-ok = false # optional
 show-tool-err = false # optional
 show-tool-timeout = false # optional
+show-tips = false # optional
 command-cache-ttl-seconds = 30 # optional
 show-round-metrics = true # optional
 show-token-cost = true # optional
 context-warn-percent = 80 # optional
 context-critical-percent = 95 # optional
+stream-output = false # optional, default false
+output-multilines = false # optional, default false
 
 [cmd]
 write-cmd-run-confirm = true # optional, default true
@@ -327,15 +369,19 @@ command-timeout-kill-after-seconds = 5 # optional, default 5
 command-output-max-bytes = 262144 # optional, default 262144
 
 [skills]
+enabled = false # optional, default false
 dir = "~/.skills" # optional
 
 [mcp]
 enabled = false # optional
+
+[mcp.servers.local]
+enabled = true # optional, default true
 # endpoint = "http://127.0.0.1:8080/mcp" # optional
 # command = "python3" # optional
 args = [] # optional
 # timeout-seconds = 10 # optional
-[mcp.env]
+[mcp.servers.local.env]
 # KEY = "VALUE"
 
 [console]
@@ -431,7 +477,7 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
 
 pub fn resolve_config_path(conf: Option<PathBuf>) -> Result<PathBuf, AppError> {
     if let Some(path) = conf {
-        return Ok(resolve_path(path)?);
+        return resolve_path(path);
     }
     let exe = std::env::current_exe()
         .map_err(|err| AppError::Runtime(format!("cannot locate current executable: {err}")))?;
@@ -537,8 +583,16 @@ fn default_skills_dir() -> String {
     DEFAULT_SKILLS_DIR.to_string()
 }
 
+fn default_skills_enabled() -> bool {
+    DEFAULT_SKILLS_ENABLED
+}
+
 fn default_mcp_enabled() -> bool {
     false
+}
+
+fn default_mcp_server_enabled() -> bool {
+    true
 }
 
 fn default_console_colorful() -> bool {
@@ -577,6 +631,10 @@ fn default_chat_show_tool_timeout() -> bool {
     DEFAULT_CHAT_SHOW_TOOL_TIMEOUT
 }
 
+fn default_chat_show_tips() -> bool {
+    DEFAULT_CHAT_SHOW_TIPS
+}
+
 fn default_chat_command_cache_ttl_seconds() -> u64 {
     DEFAULT_CHAT_COMMAND_CACHE_TTL_SECONDS
 }
@@ -595,6 +653,14 @@ fn default_chat_context_warn_percent() -> u8 {
 
 fn default_chat_context_critical_percent() -> u8 {
     DEFAULT_CHAT_CONTEXT_CRITICAL_PERCENT
+}
+
+fn default_chat_stream_output() -> bool {
+    DEFAULT_CHAT_STREAM_OUTPUT
+}
+
+fn default_chat_output_multilines() -> bool {
+    DEFAULT_CHAT_OUTPUT_MULTILINES
 }
 
 fn default_context_recent_messages() -> usize {

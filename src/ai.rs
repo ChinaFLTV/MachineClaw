@@ -4,6 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use once_cell::sync::Lazy;
+use regex::Regex;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -34,6 +36,15 @@ pub struct ChatToolResponse {
     pub content: String,
     pub thinking: Option<String>,
     pub metrics: ChatMetrics,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatRoundEvent {
+    pub round: usize,
+    pub content: String,
+    pub thinking: Option<String>,
+    pub has_tool_calls: bool,
+    pub tool_call_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -209,6 +220,7 @@ impl AiClient {
         policy: ToolUsePolicy,
         extra_tools: &[ExternalToolDefinition],
         mut execute_tool: F,
+        mut on_round_event: impl FnMut(ChatRoundEvent),
     ) -> Result<ChatToolResponse, AppError>
     where
         F: FnMut(&ToolCallRequest) -> String,
@@ -251,13 +263,40 @@ impl AiClient {
             metrics.completion_tokens += call.usage.completion_tokens;
             metrics.total_tokens += call.usage.total_tokens;
             let assistant = call.assistant;
-
-            append_unique_thinking_chunk(
-                &mut thinking_chunks,
-                assistant_reasoning_text(&assistant),
-            );
-            let assistant_content = assistant_content_text(&assistant);
-            let tool_calls = assistant.tool_calls;
+            let round_thinking = assistant_reasoning_text(&assistant);
+            append_unique_thinking_chunk(&mut thinking_chunks, round_thinking.clone());
+            let assistant_content = sanitize_assistant_content(&assistant_content_text(&assistant));
+            let mut tool_calls = assistant.tool_calls.clone();
+            if tool_calls.is_empty() {
+                tool_calls =
+                    parse_dsml_tool_calls(&assistant_content_text(&assistant), metrics.api_rounds)
+                        .into_iter()
+                        .map(|item| ApiToolCall {
+                            id: item.id,
+                            r#type: "function".to_string(),
+                            function: ApiToolFunction {
+                                name: item.name,
+                                arguments: item.arguments,
+                            },
+                        })
+                        .collect();
+            }
+            if !assistant_content.trim().is_empty()
+                || !round_thinking.trim().is_empty()
+                || !tool_calls.is_empty()
+            {
+                on_round_event(ChatRoundEvent {
+                    round: metrics.api_rounds,
+                    content: assistant_content.clone(),
+                    thinking: if round_thinking.trim().is_empty() {
+                        None
+                    } else {
+                        Some(round_thinking)
+                    },
+                    has_tool_calls: !tool_calls.is_empty(),
+                    tool_call_count: tool_calls.len(),
+                });
+            }
             if !tool_calls.is_empty() {
                 messages.push(ApiMessage {
                     role: "assistant".to_string(),
@@ -456,6 +495,23 @@ impl AiClient {
         })
     }
 }
+
+static DSML_FUNCTION_CALLS_BLOCK_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<[|｜]dsml[|｜]function_calls>.*?</[|｜]dsml[|｜]function_calls>"#)
+        .expect("valid dsml function call block regex")
+});
+static DSML_INVOKE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?is)<[|｜]dsml[|｜]invoke\s+name=\"([^\"]+)\"[^>]*>(.*?)</[|｜]dsml[|｜]invoke>"#,
+    )
+    .expect("valid dsml invoke regex")
+});
+static DSML_PARAMETER_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?is)<[|｜]dsml[|｜]parameter\s+name=\"([^\"]+)\"[^>]*>(.*?)</[|｜]dsml[|｜]parameter>"#,
+    )
+    .expect("valid dsml parameter regex")
+});
 
 #[derive(Debug)]
 struct ApiChatCallResult {
@@ -742,6 +798,67 @@ fn optional_content(content: String) -> Option<String> {
         return None;
     }
     Some(content)
+}
+
+fn sanitize_assistant_content(raw: &str) -> String {
+    let cleaned = DSML_FUNCTION_CALLS_BLOCK_RE.replace_all(raw, "");
+    cleaned.trim().to_string()
+}
+
+fn parse_dsml_tool_calls(raw: &str, round: usize) -> Vec<ToolCallRequest> {
+    if !raw.to_ascii_lowercase().contains("dsml") {
+        return Vec::new();
+    }
+    let mut output = Vec::new();
+    for (idx, invoke_caps) in DSML_INVOKE_RE.captures_iter(raw).enumerate() {
+        let function_name_raw = invoke_caps
+            .get(1)
+            .map(|m| m.as_str().trim())
+            .unwrap_or_default();
+        let invoke_body = invoke_caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let mut params = serde_json::Map::new();
+        for param_caps in DSML_PARAMETER_RE.captures_iter(invoke_body) {
+            let key = param_caps
+                .get(1)
+                .map(|m| m.as_str().trim())
+                .unwrap_or_default();
+            let value = param_caps
+                .get(2)
+                .map(|m| decode_dsml_text(m.as_str()))
+                .unwrap_or_default();
+            if !key.is_empty() {
+                params.insert(key.to_string(), serde_json::Value::String(value));
+            }
+        }
+        let normalized_name = normalize_dsml_tool_name(function_name_raw);
+        if normalized_name == "run_shell_command" && !params.contains_key("command") {
+            continue;
+        }
+        output.push(ToolCallRequest {
+            id: format!("dsml_round_{}_{}", round, idx + 1),
+            name: normalized_name,
+            arguments: serde_json::Value::Object(params).to_string(),
+        });
+    }
+    output
+}
+
+fn normalize_dsml_tool_name(name: &str) -> String {
+    let normalized = name.trim().to_ascii_lowercase().replace('_', "");
+    if normalized == "runshellcommand" || normalized == "run_shell_command" {
+        return "run_shell_command".to_string();
+    }
+    name.trim().to_string()
+}
+
+fn decode_dsml_text(raw: &str) -> String {
+    raw.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .trim()
+        .to_string()
 }
 
 fn build_chat_url(base_url: &str) -> String {

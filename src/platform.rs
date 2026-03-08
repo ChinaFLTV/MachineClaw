@@ -56,7 +56,7 @@ fn check_unix_root() -> Result<bool, AppError> {
             .output()
             .map_err(|err| AppError::Permission(format!("failed to run id -u: {err}")))?;
         let uid = String::from_utf8_lossy(&output.stdout);
-        return Ok(uid.trim() == "0");
+        Ok(uid.trim() == "0")
     }
 
     #[cfg(not(unix))]

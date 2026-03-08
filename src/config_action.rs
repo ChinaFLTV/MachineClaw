@@ -56,8 +56,9 @@ fn run_get(config_path: &Path, key: &str) -> Result<ConfigActionOutcome, AppErro
         (unset_text(), ValueSource::OptionalUnset)
     };
 
+    let display_value = format_value_for_display(key, &value);
     Ok(ConfigActionOutcome {
-        rendered: render_get_output(key, &value, source, config_path),
+        rendered: render_get_output(key, &display_value, source, config_path),
         exit_code: ExitCode::Success,
     })
 }
@@ -76,10 +77,11 @@ fn run_set(
 
     write_document(config_path, &doc)?;
 
+    let display_value = format_value_for_display(key, &display_item(&value_item));
     Ok(ConfigActionOutcome {
         rendered: render_set_output(
             key,
-            &display_item(&value_item),
+            &display_value,
             config_path,
             !file_exists,
             existed_before,
@@ -241,7 +243,10 @@ fn validate_known_key(key: &str) -> Result<(), AppError> {
 }
 
 fn is_known_key(key: &str) -> bool {
-    known_keys().contains(&key)
+    if known_keys().contains(&key) {
+        return true;
+    }
+    parse_dynamic_mcp_server_key(key).is_some()
 }
 
 fn is_required_key(key: &str) -> bool {
@@ -256,11 +261,14 @@ fn default_value_literal(key: &str) -> Option<&'static str> {
         "ai.chat.show-tool-ok" => Some("false"),
         "ai.chat.show-tool-err" => Some("false"),
         "ai.chat.show-tool-timeout" => Some("false"),
+        "ai.chat.show-tips" => Some("false"),
         "ai.chat.command-cache-ttl-seconds" => Some("30"),
         "ai.chat.show-round-metrics" => Some("true"),
         "ai.chat.show-token-cost" => Some("true"),
         "ai.chat.context-warn-percent" => Some("80"),
         "ai.chat.context-critical-percent" => Some("95"),
+        "ai.chat.stream-output" => Some("false"),
+        "ai.chat.output-multilines" => Some("false"),
         "ai.input-price-per-million" => Some("0"),
         "ai.output-price-per-million" => Some("0"),
         "cmd.write-cmd-run-confirm" => Some("true"),
@@ -270,6 +278,7 @@ fn default_value_literal(key: &str) -> Option<&'static str> {
         "cmd.write-cmd-allow-patterns" => Some("[]"),
         "cmd.write-cmd-deny-patterns" => Some("[]"),
         "cmd.command-output-max-bytes" => Some("262144"),
+        "skills.enabled" => Some("false"),
         "skills.dir" => Some("\"~/.skills\""),
         "mcp.enabled" => Some("false"),
         "mcp.args" => Some("[]"),
@@ -293,11 +302,14 @@ fn known_keys() -> &'static [&'static str] {
         "ai.chat.show-tool-ok",
         "ai.chat.show-tool-err",
         "ai.chat.show-tool-timeout",
+        "ai.chat.show-tips",
         "ai.chat.command-cache-ttl-seconds",
         "ai.chat.show-round-metrics",
         "ai.chat.show-token-cost",
         "ai.chat.context-warn-percent",
         "ai.chat.context-critical-percent",
+        "ai.chat.stream-output",
+        "ai.chat.output-multilines",
         "ai.input-price-per-million",
         "ai.output-price-per-million",
         "cmd.write-cmd-run-confirm",
@@ -307,6 +319,7 @@ fn known_keys() -> &'static [&'static str] {
         "cmd.write-cmd-allow-patterns",
         "cmd.write-cmd-deny-patterns",
         "cmd.command-output-max-bytes",
+        "skills.enabled",
         "skills.dir",
         "mcp.enabled",
         "mcp.endpoint",
@@ -314,10 +327,38 @@ fn known_keys() -> &'static [&'static str] {
         "mcp.args",
         "mcp.env",
         "mcp.timeout-seconds",
+        "mcp.servers.<name>.enabled",
+        "mcp.servers.<name>.endpoint",
+        "mcp.servers.<name>.command",
+        "mcp.servers.<name>.args",
+        "mcp.servers.<name>.env",
+        "mcp.servers.<name>.timeout-seconds",
         "console.colorful",
         "session.recent_messages",
         "session.max_messages",
     ]
+}
+
+fn parse_dynamic_mcp_server_key(key: &str) -> Option<&'static str> {
+    let segments = split_key_path(key);
+    if segments.len() < 4 {
+        return None;
+    }
+    if segments[0] != "mcp" || segments[1] != "servers" {
+        return None;
+    }
+    if segments[2].trim().is_empty() {
+        return None;
+    }
+    match segments[3] {
+        "enabled" if segments.len() == 4 => Some("enabled"),
+        "endpoint" if segments.len() == 4 => Some("endpoint"),
+        "command" if segments.len() == 4 => Some("command"),
+        "args" if segments.len() == 4 => Some("args"),
+        "timeout-seconds" if segments.len() == 4 => Some("timeout-seconds"),
+        "env" if segments.len() >= 4 => Some("env"),
+        _ => None,
+    }
 }
 
 fn render_get_output(key: &str, value: &str, source: ValueSource, path: &Path) -> String {
@@ -435,4 +476,32 @@ fn localized_unknown_key(key: &str, samples: &str) -> String {
         }
         _ => format!("config key not found: {key}. Please check spelling. Sample keys: {samples}"),
     }
+}
+
+fn format_value_for_display(key: &str, value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return value.to_string();
+    }
+    let Some(parsed) = trimmed.parse::<u128>().ok() else {
+        return value.to_string();
+    };
+    let grouped = i18n::human_count_u128(parsed);
+
+    if key.ends_with("-millis") {
+        return format!(
+            "{grouped} ({} / {grouped} ms)",
+            i18n::human_duration_ms(parsed)
+        );
+    }
+    if key.ends_with("-seconds") {
+        return format!(
+            "{grouped} ({} / {grouped} s)",
+            i18n::human_duration_ms(parsed.saturating_mul(1_000))
+        );
+    }
+    if key.ends_with("-bytes") {
+        return format!("{grouped} ({})", i18n::human_bytes(parsed));
+    }
+    grouped
 }

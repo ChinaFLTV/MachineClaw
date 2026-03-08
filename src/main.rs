@@ -68,7 +68,10 @@ fn run() -> Result<ExitCode, AppError> {
     if cli.show_config_template {
         println!(
             "{}",
-            render::render_markdown_for_terminal(config_template_example(), true)
+            render::render_markdown_for_terminal(
+                config_template_example(),
+                render::resolve_colorful_enabled(true),
+            )
         );
         return Ok(ExitCode::Success);
     }
@@ -86,9 +89,10 @@ fn run() -> Result<ExitCode, AppError> {
         return Ok(outcome.exit_code);
     }
 
-    let cfg = load_config(&config_path)?;
+    let mut cfg = load_config(&config_path)?;
     let selected_language = resolve_language(cfg.app.language.as_deref());
     set_language(selected_language);
+    cfg.console.colorful = render::resolve_colorful_enabled(cfg.console.colorful);
     validate_config(&cfg)?;
     validate_mcp_config(&cfg.mcp)?;
     let language_warning = cfg.app.language.as_deref().and_then(|raw| {
@@ -130,9 +134,14 @@ fn run() -> Result<ExitCode, AppError> {
     run_preflight_checks(&cfg, &ai_client)?;
 
     let skills_dir = expand_tilde(&cfg.skills.dir);
-    let skill_list = detect_skills(&skills_dir)?;
+    let skill_list = if cfg.skills.enabled {
+        detect_skills(&skills_dir)?
+    } else {
+        Vec::new()
+    };
     logging::info(&format!(
-        "skills directory={}, skills_count={}",
+        "skills enabled={}, directory={}, skills_count={}",
+        cfg.skills.enabled,
         skills_dir.display(),
         skill_list.len()
     ));
