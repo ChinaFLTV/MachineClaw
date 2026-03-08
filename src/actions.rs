@@ -2,7 +2,12 @@ use std::{
     collections::HashMap,
     io::{self, BufRead, IsTerminal, Write},
     path::Path,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dialoguer::{MultiSelect, theme::ColorfulTheme};
@@ -220,7 +225,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
 
     let base_system_prompt = render::load_prompt_template(services.assets_dir, "chat_system.md")?;
     let system_prompt = build_chat_system_prompt(services, &base_system_prompt);
-    ensure_chat_environment_profile(services, &system_prompt)?;
+    maybe_ensure_chat_environment_profile(services, &system_prompt)?;
     let initial_message_count = services.session.message_count();
     let mut chat_turns: usize = 0;
     let mut tool_stats = ChatToolStats::default();
@@ -347,7 +352,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             services.session.start_new_session_with_new_file()?;
             pending_message = None;
             last_assistant_reply.clear();
-            ensure_chat_environment_profile(services, &system_prompt)?;
+            maybe_ensure_chat_environment_profile(services, &system_prompt)?;
             println!(
                 "{}",
                 i18n::chat_session_switched(
@@ -382,6 +387,16 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         }
         maybe_run_ai_context_compression(services, &system_prompt)?;
         services.session.persist()?;
+        if services.cfg.skills.enabled && !services.skills.is_empty() {
+            println!(
+                "{}",
+                render::render_chat_custom_tag_event(
+                    i18n::chat_tag_skill(),
+                    &i18n::chat_skill_prepare_started(services.skills.len()),
+                    services.cfg.console.colorful
+                )
+            );
+        }
 
         logging::info("AI chat start");
         let history = services.session.build_chat_history();
@@ -390,19 +405,15 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         } else {
             ToolUsePolicy::Auto
         };
-        if services.cfg.ai.chat.show_tips {
-            println!(
-                "{}",
-                render::render_chat_notice(
-                    i18n::chat_progress_analyzing(),
-                    services.cfg.console.colorful
-                )
-            );
-        }
         let colorful = services.cfg.console.colorful;
         let stream_output = services.cfg.ai.chat.stream_output;
         let show_tips = services.cfg.ai.chat.show_tips;
         let mut printed_round_thinking = false;
+        let mut ai_wait_spinner =
+            ActivitySpinner::start(i18n::chat_progress_analyzing().to_string(), colorful);
+        let spinner_stop = ai_wait_spinner.stop_signal();
+        let spinner_first_output = Arc::new(AtomicBool::new(false));
+        let spinner_first_output_cloned = spinner_first_output.clone();
         let response = services.ai.chat_with_shell_tool(
             &history,
             &system_prompt,
@@ -420,6 +431,10 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                 )
             },
             |event: ChatRoundEvent| {
+                if !spinner_first_output_cloned.swap(true, Ordering::SeqCst) {
+                    spinner_stop.store(true, Ordering::SeqCst);
+                    clear_spinner_line();
+                }
                 if !event.has_tool_calls {
                     return;
                 }
@@ -457,6 +472,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                 }
             },
         )?;
+        ai_wait_spinner.stop();
         logging::info("AI chat finished");
 
         if !printed_round_thinking
@@ -601,8 +617,13 @@ fn generate_ai_summary(
     logging::info(&format!(
         "AI summarize start: action={action}, target={target}"
     ));
+    let mut spinner = ActivitySpinner::start(
+        i18n::progress_ai_summarizing(action, target),
+        services.cfg.console.colorful,
+    );
     let history = services.session.build_chat_history();
     let summary = services.ai.chat(&history, &system_prompt, &user_prompt)?;
+    spinner.stop();
     logging::info(&format!(
         "AI summarize finished: action={action}, target={target}"
     ));
@@ -751,7 +772,8 @@ fn execute_tool_call(
 
     ShellExecutor::clear_interrupt_flag();
     let call_started = Instant::now();
-    match services.shell.run(&spec) {
+    let run_timeout = Duration::from_secs(services.cfg.ai.chat.cmd_run_timout);
+    match services.shell.run_with_timeout(&spec, run_timeout) {
         Ok(result) => {
             stats.tool_calls += 1;
             stats.tool_duration_ms += call_started.elapsed().as_millis();
@@ -806,10 +828,25 @@ fn execute_tool_call(
                 "interrupted": result.interrupted,
                 "blocked": result.blocked,
                 "block_reason": mask_sensitive(&result.block_reason),
+                "timeout_hint": result_timeout_hint(&spec.command, &result.stdout, &result.stderr),
                 "stdout": mask_sensitive(&trim_text(result.stdout.trim(), 3000)),
                 "stderr": mask_sensitive(&trim_text(result.stderr.trim(), 2000))
             });
             let text = tool_result.to_string();
+            if result.timed_out
+                && services.cfg.ai.chat.show_tool_timeout
+                && let Some(hint) =
+                    result_timeout_hint(&spec.command, &result.stdout, &result.stderr)
+            {
+                println!(
+                    "{}",
+                    render::render_chat_tool_event(
+                        &hint,
+                        render::ChatToolEventKind::Timeout,
+                        services.cfg.console.colorful
+                    )
+                );
+            }
             if spec.mode == CommandMode::Read && result.success && cache_ttl_ms > 0 {
                 cache.insert(
                     cache_key,
@@ -882,21 +919,19 @@ fn execute_mcp_tool_call(
     stats: &mut ChatToolStats,
 ) -> String {
     let started = Instant::now();
-    if services.cfg.ai.chat.show_tool {
-        let started_text = if services.cfg.ai.chat.output_multilines {
-            format!("type=mcp_tool_call\ntool={}", tool_call.name)
-        } else {
-            i18n::chat_mcp_call_started(&tool_call.name)
-        };
-        println!(
-            "{}",
-            render::render_chat_custom_tag_event(
-                i18n::chat_tag_mcp(),
-                &started_text,
-                services.cfg.console.colorful
-            )
-        );
-    }
+    let started_text = if services.cfg.ai.chat.output_multilines {
+        format!("type=mcp_tool_call\ntool={}", tool_call.name)
+    } else {
+        i18n::chat_mcp_call_started(&tool_call.name)
+    };
+    println!(
+        "{}",
+        render::render_chat_custom_tag_event(
+            i18n::chat_tag_mcp(),
+            &started_text,
+            services.cfg.console.colorful
+        )
+    );
     match services
         .mcp
         .call_ai_tool(&tool_call.name, &tool_call.arguments)
@@ -1087,6 +1122,44 @@ fn format_tool_preview_output(services: &ActionServices<'_>, preview: &str) -> S
     )
 }
 
+fn result_timeout_hint(command: &str, stdout: &str, stderr: &str) -> Option<String> {
+    let command_lower = command.to_ascii_lowercase();
+    let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    let has_install_prompt = combined.contains("need to install the following packages")
+        || combined.contains("ok to proceed")
+        || combined.contains("proceed?")
+        || combined.contains("y/n");
+    if command_lower.contains("npx") && !command_lower.contains("--yes") && has_install_prompt {
+        return Some(match i18n::current_language() {
+            i18n::Language::ZhCn => {
+                "检测到 npx 安装确认交互导致超时，建议改用 `npx --yes ...` 或先手动安装依赖。"
+                    .to_string()
+            }
+            i18n::Language::ZhTw => {
+                "偵測到 npx 安裝確認互動導致逾時，建議改用 `npx --yes ...` 或先手動安裝依賴。"
+                    .to_string()
+            }
+            i18n::Language::Fr => {
+                "Un prompt d'installation npx a provoqué le timeout; utilisez `npx --yes ...` ou installez la dépendance avant."
+                    .to_string()
+            }
+            i18n::Language::De => {
+                "Ein interaktiver npx-Installationsprompt hat das Timeout ausgelöst; verwenden Sie `npx --yes ...` oder installieren Sie Abhängigkeiten vorab."
+                    .to_string()
+            }
+            i18n::Language::Ja => {
+                "npx のインストール確認プロンプトでタイムアウトしました。`npx --yes ...` を使うか、依存関係を先に手動インストールしてください。"
+                    .to_string()
+            }
+            i18n::Language::En => {
+                "An interactive npx install prompt caused timeout; use `npx --yes ...` or preinstall dependencies."
+                    .to_string()
+            }
+        });
+    }
+    None
+}
+
 fn clear_terminal() -> Result<(), AppError> {
     print!("\x1B[2J\x1B[H");
     io::stdout()
@@ -1126,9 +1199,14 @@ fn ensure_chat_environment_profile(
         )
     );
     let profile_commands = chat_profile_commands(services.os_type);
+    let mut shell_spinner = ActivitySpinner::start(
+        i18n::chat_profile_collecting().to_string(),
+        services.cfg.console.colorful,
+    );
     let profile_results = match services.shell.run_many(&profile_commands) {
         Ok(results) => results,
         Err(err) => {
+            shell_spinner.stop();
             println!(
                 "{}",
                 render::render_chat_custom_tag_event(
@@ -1140,12 +1218,19 @@ fn ensure_chat_environment_profile(
             return Ok(());
         }
     };
+    shell_spinner.stop();
     let profile_details = format_command_details(&profile_results);
     let profile_prompt = format!(
         "请基于以下本机探测信息生成一份环境画像，要求包含：系统版本、硬件概况、资源概况、网络概况、开发工具概况、风险提示。\n\n输出要求：\n1. 先给结论\n2. 列表化关键事实\n3. 风险等级与原因\n4. 后续诊断建议（最多3条）\n\n# command_details\n{}",
         trim_text(&profile_details, 8000)
     );
-    match services.ai.chat(&[], system_prompt, &profile_prompt) {
+    let mut ai_spinner = ActivitySpinner::start(
+        i18n::chat_profile_analyzing().to_string(),
+        services.cfg.console.colorful,
+    );
+    let profile_summary_result = services.ai.chat(&[], system_prompt, &profile_prompt);
+    ai_spinner.stop();
+    match profile_summary_result {
         Ok(summary) => {
             services
                 .session
@@ -1182,6 +1267,16 @@ fn ensure_chat_environment_profile(
     }
 }
 
+fn maybe_ensure_chat_environment_profile(
+    services: &mut ActionServices<'_>,
+    system_prompt: &str,
+) -> Result<(), AppError> {
+    if services.cfg.ai.chat.skip_env_profile {
+        return Ok(());
+    }
+    ensure_chat_environment_profile(services, system_prompt)
+}
+
 fn maybe_run_ai_context_compression(
     services: &mut ActionServices<'_>,
     system_prompt: &str,
@@ -1206,12 +1301,20 @@ fn maybe_run_ai_context_compression(
             .collect::<Vec<_>>()
             .join("\n---\n")
     };
+    let keep_recent =
+        compression_keep_recent_messages(services.cfg.ai.chat.compression.max_history_messages);
     let prompt = format!(
-        "你需要压缩历史对话片段，保持事实与结论可追溯。\n\n要求：\n1. 保留目标、关键证据、执行结果、风险、未完成事项。\n2. 删除寒暄与重复内容。\n3. 输出结构：目标 / 事实 / 结论 / 风险 / 待办。\n4. 内容应可直接作为后续上下文继续推理。\n\n# previous_compression_summaries\n{}\n\n# new_overflow_messages\n{}",
+        "你需要压缩历史对话片段，保持事实与结论可追溯。\n\n要求：\n1. 保留目标、关键证据、执行结果、风险、未完成事项。\n2. 删除寒暄与重复内容。\n3. 输出结构：目标 / 事实 / 结论 / 风险 / 待办。\n4. 内容应可直接作为后续上下文继续推理。\n5. 最近 {keep_recent} 条消息会被保留，不在压缩范围内。\n\n# previous_compression_summaries\n{}\n\n# new_candidate_messages\n{}",
         trim_text(&previous, 2500),
         trim_text(&plan.transcript, 9000)
     );
-    let summary = match services.ai.chat(&[], system_prompt, &prompt) {
+    let mut ai_spinner = ActivitySpinner::start(
+        i18n::chat_compression_running().to_string(),
+        services.cfg.console.colorful,
+    );
+    let summary_result = services.ai.chat(&[], system_prompt, &prompt);
+    ai_spinner.stop();
+    let summary = match summary_result {
         Ok(content) => content,
         Err(err) => {
             println!(
@@ -1394,6 +1497,70 @@ fn should_show_tool_event(services: &ActionServices<'_>, kind: render::ChatToolE
         render::ChatToolEventKind::Error => services.cfg.ai.chat.show_tool_err,
         render::ChatToolEventKind::Timeout => services.cfg.ai.chat.show_tool_timeout,
     }
+}
+
+struct ActivitySpinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ActivitySpinner {
+    fn start(message: String, colorful: bool) -> Self {
+        if !io::stdout().is_terminal() {
+            return Self {
+                stop: Arc::new(AtomicBool::new(true)),
+                handle: None,
+            };
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_cloned = stop.clone();
+        let handle = thread::spawn(move || {
+            let frames = ["|", "/", "-", "\\"];
+            let mut idx = 0usize;
+            while !stop_cloned.load(Ordering::SeqCst) {
+                let text = format!("{message} {}", frames[idx % frames.len()]);
+                print!("\r{}", render::render_chat_notice(&text, colorful));
+                let _ = io::stdout().flush();
+                idx = idx.wrapping_add(1);
+                thread::sleep(Duration::from_millis(120));
+            }
+            clear_spinner_line();
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop_signal(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ActivitySpinner {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn clear_spinner_line() {
+    if !io::stdout().is_terminal() {
+        return;
+    }
+    print!("\r{: <160}\r", "");
+    let _ = io::stdout().flush();
+}
+
+fn compression_keep_recent_messages(max_history_messages: usize) -> usize {
+    let compress_recent = max_history_messages / 2;
+    max_history_messages.saturating_sub(compress_recent).max(1)
 }
 
 fn is_noise_message(message: &str) -> bool {

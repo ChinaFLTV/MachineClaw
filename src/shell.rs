@@ -189,6 +189,22 @@ impl ShellExecutor {
     }
 
     pub fn run(&self, spec: &CommandSpec) -> Result<CommandResult, AppError> {
+        self.run_with_effective_timeout(spec, self.timeout)
+    }
+
+    pub fn run_with_timeout(
+        &self,
+        spec: &CommandSpec,
+        timeout: Duration,
+    ) -> Result<CommandResult, AppError> {
+        self.run_with_effective_timeout(spec, timeout)
+    }
+
+    fn run_with_effective_timeout(
+        &self,
+        spec: &CommandSpec,
+        effective_timeout: Duration,
+    ) -> Result<CommandResult, AppError> {
         let command = spec.command.trim();
         if command.is_empty() {
             return Err(AppError::Command(i18n::command_empty()));
@@ -341,9 +357,9 @@ impl ShellExecutor {
                     block_reason: i18n::command_blocked_by_deny_pattern(pattern),
                 });
             }
-            return self.run_inner(spec, &effective_command, effective_mode);
+            return self.run_inner(spec, &effective_command, effective_mode, effective_timeout);
         }
-        self.run_inner(spec, command, effective_mode)
+        self.run_inner(spec, command, effective_mode, effective_timeout)
     }
 
     fn run_inner(
@@ -351,6 +367,7 @@ impl ShellExecutor {
         spec: &CommandSpec,
         command: &str,
         effective_mode: CommandMode,
+        effective_timeout: Duration,
     ) -> Result<CommandResult, AppError> {
         logging::info(&format!(
             "command start: label={}, cmd={}",
@@ -392,13 +409,13 @@ impl ShellExecutor {
             }
 
             let elapsed = started.elapsed();
-            if elapsed >= self.timeout {
+            if elapsed >= effective_timeout {
                 timed_out = true;
                 let _ = child.kill();
                 break;
             }
 
-            let wait_slice = std::cmp::min(self.timeout - elapsed, Duration::from_millis(200));
+            let wait_slice = std::cmp::min(effective_timeout - elapsed, Duration::from_millis(200));
             let status = child.wait_timeout(wait_slice).map_err(|err| {
                 AppError::Command(format!("failed to wait command [{}]: {err}", spec.label))
             })?;

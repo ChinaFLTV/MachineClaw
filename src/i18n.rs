@@ -742,14 +742,15 @@ pub fn chat_welcome(
     let max_limit_fmt = human_count_u128(max_limit as u128);
     let skills_count_fmt = human_count_u128(skills_count as u128);
     let tool_flags = format!(
-        "tool={}, tool_ok={}, tool_err={}, tool_timeout={}, tips={}, stream_output={}, output_multilines={}",
+        "tool={}, tool_ok={}, tool_err={}, tool_timeout={}, tips={}, stream_output={}, output_multilines={}, cmd_run_timout={}s",
         chat_cfg.show_tool,
         chat_cfg.show_tool_ok,
         chat_cfg.show_tool_err,
         chat_cfg.show_tool_timeout,
         chat_cfg.show_tips,
         chat_cfg.stream_output,
-        chat_cfg.output_multilines
+        chat_cfg.output_multilines,
+        chat_cfg.cmd_run_timout
     );
     match current_language() {
         Language::ZhCn => format!(
@@ -1040,6 +1041,19 @@ pub fn chat_progress_analyzing() -> &'static str {
     }
 }
 
+pub fn progress_ai_summarizing(action: &str, target: &str) -> String {
+    match current_language() {
+        Language::ZhCn => format!("正在生成 AI 总结: action={action}, target={target}"),
+        Language::ZhTw => format!("正在產生 AI 摘要: action={action}, target={target}"),
+        Language::Fr => format!("Génération du résumé IA: action={action}, target={target}"),
+        Language::De => {
+            format!("KI-Zusammenfassung wird erstellt: action={action}, target={target}")
+        }
+        Language::Ja => format!("AI 要約を生成中: action={action}, target={target}"),
+        Language::En => format!("Generating AI summary: action={action}, target={target}"),
+    }
+}
+
 pub fn chat_profile_started() -> &'static str {
     match current_language() {
         Language::ZhCn => "正在建立当前机器环境画像...",
@@ -1048,6 +1062,28 @@ pub fn chat_profile_started() -> &'static str {
         Language::De => "Erstelle Umgebungsprofil der aktuellen Maschine...",
         Language::Ja => "現在のマシン環境プロファイルを構築中...",
         Language::En => "Building environment profile for current machine...",
+    }
+}
+
+pub fn chat_profile_collecting() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "正在采集环境画像所需数据...",
+        Language::ZhTw => "正在蒐集環境畫像所需資料...",
+        Language::Fr => "Collecte des données du profil d'environnement...",
+        Language::De => "Erfasse Daten für das Umgebungsprofil...",
+        Language::Ja => "環境プロファイル用データを収集中...",
+        Language::En => "Collecting data for environment profile...",
+    }
+}
+
+pub fn chat_profile_analyzing() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "正在分析环境画像并生成摘要...",
+        Language::ZhTw => "正在分析環境畫像並產生摘要...",
+        Language::Fr => "Analyse du profil d'environnement et génération du résumé...",
+        Language::De => "Umgebungsprofil wird analysiert und zusammengefasst...",
+        Language::Ja => "環境プロファイルを分析して要約を生成中...",
+        Language::En => "Analyzing environment profile and generating summary...",
     }
 }
 
@@ -1135,6 +1171,17 @@ pub fn chat_compression_failed(err: &str) -> String {
     }
 }
 
+pub fn chat_compression_running() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "正在执行 AI 历史压缩...",
+        Language::ZhTw => "正在執行 AI 歷史壓縮...",
+        Language::Fr => "Compression IA de l'historique en cours...",
+        Language::De => "KI-Verlaufs-Kompression wird ausgeführt...",
+        Language::Ja => "AI 履歴圧縮を実行中...",
+        Language::En => "Running AI history compression...",
+    }
+}
+
 pub fn chat_skill_enabled(count: usize) -> String {
     let count_fmt = human_count_u128(count as u128);
     match current_language() {
@@ -1150,6 +1197,26 @@ pub fn chat_skill_enabled(count: usize) -> String {
             format!("Skills 自動スキャンを有効化しました。利用可能な項目: {count_fmt}。")
         }
         Language::En => format!("Skill auto-scan enabled, available entries: {count_fmt}."),
+    }
+}
+
+pub fn chat_skill_prepare_started(count: usize) -> String {
+    let count_fmt = human_count_u128(count as u128);
+    match current_language() {
+        Language::ZhCn => format!("本轮将加载 Skills 上下文，可用项 {count_fmt} 个。"),
+        Language::ZhTw => format!("本輪將載入 Skills 上下文，可用項 {count_fmt} 個。"),
+        Language::Fr => {
+            format!("Ce tour chargera le contexte skills, entrées disponibles: {count_fmt}.")
+        }
+        Language::De => format!(
+            "In dieser Runde wird der Skill-Kontext geladen, verfügbare Einträge: {count_fmt}."
+        ),
+        Language::Ja => {
+            format!("このラウンドで Skills コンテキストを読み込みます。利用可能項目: {count_fmt}。")
+        }
+        Language::En => {
+            format!("This round will load skill context, available entries: {count_fmt}.")
+        }
     }
 }
 
@@ -1666,6 +1733,34 @@ fn localize_detail(detail: &str) -> String {
                 Language::En => detail.to_string(),
             }
         }
+        "ai.chat.compression.max-history-messages must be greater than 0" => {
+            match current_language() {
+                Language::ZhCn => "ai.chat.compression.max-history-messages 必须大于 0".to_string(),
+                Language::ZhTw => "ai.chat.compression.max-history-messages 必須大於 0".to_string(),
+                Language::Fr => "ai.chat.compression.max-history-messages doit être supérieur à 0".to_string(),
+                Language::De => "ai.chat.compression.max-history-messages muss größer als 0 sein".to_string(),
+                Language::Ja => "ai.chat.compression.max-history-messages は 0 より大きい必要があります".to_string(),
+                Language::En => detail.to_string(),
+            }
+        }
+        "ai.chat.compression.max-chars-count must be greater than 0" => {
+            match current_language() {
+                Language::ZhCn => "ai.chat.compression.max-chars-count 必须大于 0".to_string(),
+                Language::ZhTw => "ai.chat.compression.max-chars-count 必須大於 0".to_string(),
+                Language::Fr => "ai.chat.compression.max-chars-count doit être supérieur à 0".to_string(),
+                Language::De => "ai.chat.compression.max-chars-count muss größer als 0 sein".to_string(),
+                Language::Ja => "ai.chat.compression.max-chars-count は 0 より大きい必要があります".to_string(),
+                Language::En => detail.to_string(),
+            }
+        }
+        "ai.chat.cmd-run-timout must be greater than 0" => match current_language() {
+            Language::ZhCn => "ai.chat.cmd-run-timout 必须大于 0".to_string(),
+            Language::ZhTw => "ai.chat.cmd-run-timout 必須大於 0".to_string(),
+            Language::Fr => "ai.chat.cmd-run-timout doit être supérieur à 0".to_string(),
+            Language::De => "ai.chat.cmd-run-timout muss größer als 0 sein".to_string(),
+            Language::Ja => "ai.chat.cmd-run-timout は 0 より大きい必要があります".to_string(),
+            Language::En => detail.to_string(),
+        },
         "session.recent_messages must be greater than 0" => match current_language() {
             Language::ZhCn => "session.recent_messages 必须大于 0".to_string(),
             Language::ZhTw => "session.recent_messages 必須大於 0".to_string(),
@@ -1695,6 +1790,74 @@ fn localize_detail(detail: &str) -> String {
                 "session.recent_messages は session.max_messages を超えることはできません"
                     .to_string()
             }
+            Language::En => detail.to_string(),
+        },
+        "log.log-file-name must include a file extension" => match current_language() {
+            Language::ZhCn => "log.log-file-name 必须包含文件后缀名".to_string(),
+            Language::ZhTw => "log.log-file-name 必須包含副檔名".to_string(),
+            Language::Fr => "log.log-file-name doit contenir une extension".to_string(),
+            Language::De => "log.log-file-name muss eine Dateiendung enthalten".to_string(),
+            Language::Ja => "log.log-file-name には拡張子が必要です".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "log.log-file-name must not contain path separators" => match current_language() {
+            Language::ZhCn => "log.log-file-name 不能包含路径分隔符".to_string(),
+            Language::ZhTw => "log.log-file-name 不能包含路徑分隔符".to_string(),
+            Language::Fr => {
+                "log.log-file-name ne doit pas contenir de séparateur de chemin".to_string()
+            }
+            Language::De => {
+                "log.log-file-name darf keine Pfad-Trennzeichen enthalten".to_string()
+            }
+            Language::Ja => "log.log-file-name にパス区切り文字は使用できません".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "log.max-file-size must not be empty" => match current_language() {
+            Language::ZhCn => "log.max-file-size 不能为空".to_string(),
+            Language::ZhTw => "log.max-file-size 不能為空".to_string(),
+            Language::Fr => "log.max-file-size ne peut pas être vide".to_string(),
+            Language::De => "log.max-file-size darf nicht leer sein".to_string(),
+            Language::Ja => "log.max-file-size は空にできません".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "log.max-save-time must not be empty" => match current_language() {
+            Language::ZhCn => "log.max-save-time 不能为空".to_string(),
+            Language::ZhTw => "log.max-save-time 不能為空".to_string(),
+            Language::Fr => "log.max-save-time ne peut pas être vide".to_string(),
+            Language::De => "log.max-save-time darf nicht leer sein".to_string(),
+            Language::Ja => "log.max-save-time は空にできません".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "log.max-file-size is invalid" => match current_language() {
+            Language::ZhCn => "log.max-file-size 格式无效".to_string(),
+            Language::ZhTw => "log.max-file-size 格式無效".to_string(),
+            Language::Fr => "format de log.max-file-size invalide".to_string(),
+            Language::De => "ungültiges Format für log.max-file-size".to_string(),
+            Language::Ja => "log.max-file-size の形式が不正です".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "log.max-save-time is invalid" => match current_language() {
+            Language::ZhCn => "log.max-save-time 格式无效".to_string(),
+            Language::ZhTw => "log.max-save-time 格式無效".to_string(),
+            Language::Fr => "format de log.max-save-time invalide".to_string(),
+            Language::De => "ungültiges Format für log.max-save-time".to_string(),
+            Language::Ja => "log.max-save-time の形式が不正です".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "log.max-file-size must be greater than 0" => match current_language() {
+            Language::ZhCn => "log.max-file-size 必须大于 0".to_string(),
+            Language::ZhTw => "log.max-file-size 必須大於 0".to_string(),
+            Language::Fr => "log.max-file-size doit être supérieur à 0".to_string(),
+            Language::De => "log.max-file-size muss größer als 0 sein".to_string(),
+            Language::Ja => "log.max-file-size は 0 より大きい必要があります".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "log.max-save-time must be greater than 0" => match current_language() {
+            Language::ZhCn => "log.max-save-time 必须大于 0".to_string(),
+            Language::ZhTw => "log.max-save-time 必須大於 0".to_string(),
+            Language::Fr => "log.max-save-time doit être supérieur à 0".to_string(),
+            Language::De => "log.max-save-time muss größer als 0 sein".to_string(),
+            Language::Ja => "log.max-save-time は 0 より大きい必要があります".to_string(),
             Language::En => detail.to_string(),
         },
         "mcp.enabled=true requires at least one configured server" => match current_language() {

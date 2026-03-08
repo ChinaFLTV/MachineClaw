@@ -43,7 +43,7 @@ fn run_get(config_path: &Path, key: &str) -> Result<ConfigActionOutcome, AppErro
             i18n::language_code(i18n::resolve_language(None)).to_string(),
             ValueSource::AutoDetected,
         )
-    } else if let Some(default_literal) = default_value_literal(key) {
+    } else if let Some(default_literal) = default_config_value_literal(key) {
         (
             parse_literal_to_item(default_literal)
                 .map(|item| display_item(&item))
@@ -230,10 +230,10 @@ fn split_key_path(key: &str) -> Vec<&str> {
 }
 
 fn validate_known_key(key: &str) -> Result<(), AppError> {
-    if is_known_key(key) {
+    if is_known_config_key(key) {
         return Ok(());
     }
-    let samples = known_keys()
+    let samples = known_config_keys()
         .iter()
         .copied()
         .take(10)
@@ -242,18 +242,18 @@ fn validate_known_key(key: &str) -> Result<(), AppError> {
     Err(AppError::Config(localized_unknown_key(key, &samples)))
 }
 
-fn is_known_key(key: &str) -> bool {
-    if known_keys().contains(&key) {
+pub(crate) fn is_known_config_key(key: &str) -> bool {
+    if known_config_keys().contains(&key) {
         return true;
     }
-    parse_dynamic_mcp_server_key(key).is_some()
+    parse_dynamic_mcp_server_key(key).is_some() || parse_dynamic_mcp_env_key(key)
 }
 
 fn is_required_key(key: &str) -> bool {
     matches!(key, "ai.base-url" | "ai.token" | "ai.model")
 }
 
-fn default_value_literal(key: &str) -> Option<&'static str> {
+pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
     match key {
         "ai.retry.max-retries" => Some("2"),
         "ai.retry.backoff-millis" => Some("1500"),
@@ -269,6 +269,11 @@ fn default_value_literal(key: &str) -> Option<&'static str> {
         "ai.chat.context-critical-percent" => Some("95"),
         "ai.chat.stream-output" => Some("false"),
         "ai.chat.output-multilines" => Some("false"),
+        "ai.chat.skip-env-profile" => Some("true"),
+        "ai.chat.cmd-run-timout" => Some("30"),
+        "ai.chat.cmd-run-timeout" => Some("30"),
+        "ai.chat.compression.max-history-messages" => Some("40"),
+        "ai.chat.compression.max-chars-count" => Some("80000"),
         "ai.input-price-per-million" => Some("0"),
         "ai.output-price-per-million" => Some("0"),
         "cmd.write-cmd-run-confirm" => Some("true"),
@@ -284,13 +289,17 @@ fn default_value_literal(key: &str) -> Option<&'static str> {
         "mcp.args" => Some("[]"),
         "mcp.env" => Some("{}"),
         "console.colorful" => Some("true"),
+        "log.dir" => Some("\"logs\""),
+        "log.log-file-name" => Some("\"session-{session-id}.log\""),
+        "log.max-file-size" => Some("\"50mb\""),
+        "log.max-save-time" => Some("\"7d\""),
         "session.recent_messages" => Some("40"),
         "session.max_messages" => Some("80"),
         _ => None,
     }
 }
 
-fn known_keys() -> &'static [&'static str] {
+pub(crate) fn known_config_keys() -> &'static [&'static str] {
     &[
         "app.language",
         "ai.base-url",
@@ -310,6 +319,11 @@ fn known_keys() -> &'static [&'static str] {
         "ai.chat.context-critical-percent",
         "ai.chat.stream-output",
         "ai.chat.output-multilines",
+        "ai.chat.skip-env-profile",
+        "ai.chat.cmd-run-timout",
+        "ai.chat.cmd-run-timeout",
+        "ai.chat.compression.max-history-messages",
+        "ai.chat.compression.max-chars-count",
         "ai.input-price-per-million",
         "ai.output-price-per-million",
         "cmd.write-cmd-run-confirm",
@@ -334,6 +348,10 @@ fn known_keys() -> &'static [&'static str] {
         "mcp.servers.<name>.env",
         "mcp.servers.<name>.timeout-seconds",
         "console.colorful",
+        "log.dir",
+        "log.log-file-name",
+        "log.max-file-size",
+        "log.max-save-time",
         "session.recent_messages",
         "session.max_messages",
     ]
@@ -359,6 +377,14 @@ fn parse_dynamic_mcp_server_key(key: &str) -> Option<&'static str> {
         "env" if segments.len() >= 4 => Some("env"),
         _ => None,
     }
+}
+
+fn parse_dynamic_mcp_env_key(key: &str) -> bool {
+    let segments = split_key_path(key);
+    if segments.len() < 3 {
+        return false;
+    }
+    segments[0] == "mcp" && segments[1] == "env" && !segments[2].trim().is_empty()
 }
 
 fn render_get_output(key: &str, value: &str, source: ValueSource, path: &Path) -> String {
@@ -495,6 +521,12 @@ fn format_value_for_display(key: &str, value: &str) -> String {
         );
     }
     if key.ends_with("-seconds") {
+        return format!(
+            "{grouped} ({} / {grouped} s)",
+            i18n::human_duration_ms(parsed.saturating_mul(1_000))
+        );
+    }
+    if key == "ai.chat.cmd-run-timout" || key == "ai.chat.cmd-run-timeout" {
         return format!(
             "{grouped} ({} / {grouped} s)",
             i18n::human_duration_ms(parsed.saturating_mul(1_000))

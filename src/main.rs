@@ -13,6 +13,7 @@ mod platform;
 mod render;
 mod shell;
 mod skills;
+mod test_action;
 
 use std::path::Path;
 
@@ -34,6 +35,7 @@ use crate::{
     platform::{current_os, os_name, require_elevated_permissions},
     shell::ShellExecutor,
     skills::detect_skills,
+    test_action::run_test_command,
 };
 
 fn main() {
@@ -88,6 +90,15 @@ fn run() -> Result<ExitCode, AppError> {
         println!("{}", outcome.rendered);
         return Ok(outcome.exit_code);
     }
+    if let Commands::Test { target } = &command {
+        let assets_setup = render::locate_or_init_assets_dir()?;
+        for notice in assets_setup.notices {
+            println!("{}: {notice}", i18n::prefix_info());
+        }
+        let outcome = run_test_command(&config_path, *target, &assets_setup.path)?;
+        println!("{}", outcome.rendered);
+        return Ok(outcome.exit_code);
+    }
 
     let mut cfg = load_config(&config_path)?;
     let selected_language = resolve_language(cfg.app.language.as_deref());
@@ -105,7 +116,22 @@ fn run() -> Result<ExitCode, AppError> {
 
     let run_dir = std::env::current_dir()
         .map_err(|err| AppError::Runtime(format!("failed to resolve runtime directory: {err}")))?;
-    let log_file = logging::init(&run_dir.join("logs"))?;
+    let session_path = SessionStore::session_file(Path::new(&run_dir));
+    let mut session = SessionStore::load_or_new(
+        session_path,
+        cfg.session.recent_messages,
+        cfg.session.max_messages,
+        cfg.ai.chat.compression.max_history_messages,
+        cfg.ai.chat.compression.max_chars_count,
+    )?;
+    if matches!(&command, Commands::Chat) {
+        session.start_new_session_with_new_file()?;
+    }
+    let executable_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.to_path_buf()))
+        .unwrap_or_else(|| run_dir.clone());
+    let log_file = logging::init(&cfg.log, &executable_dir, session.session_id())?;
     logging::info(&format!(
         "MachineClaw start, config={}, log_file={}",
         config_path.display(),
@@ -147,12 +173,6 @@ fn run() -> Result<ExitCode, AppError> {
     ));
 
     let shell = ShellExecutor::new(&cfg.cmd);
-    let session_path = SessionStore::session_file(Path::new(&run_dir));
-    let mut session = SessionStore::load_or_new(
-        session_path,
-        cfg.session.recent_messages,
-        cfg.session.max_messages,
-    )?;
     let mut mcp_manager = mcp::McpManager::connect(&cfg.mcp)?;
 
     let os_type = current_os();
@@ -179,6 +199,11 @@ fn run() -> Result<ExitCode, AppError> {
     let outcome = match command {
         Commands::Prepare => actions::run_prepare(&mut services)?,
         Commands::Inspect { target } => actions::run_inspect(&mut services, target)?,
+        Commands::Test { .. } => {
+            return Err(AppError::Runtime(
+                "test command should be handled before runtime actions".to_string(),
+            ));
+        }
         Commands::Chat => actions::run_chat(&mut services)?,
         Commands::Config { .. } => {
             return Err(AppError::Runtime(

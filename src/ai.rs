@@ -228,6 +228,8 @@ impl AiClient {
         const MAX_TOOL_ROUNDS: usize = 8;
         const MAX_TOTAL_TOOL_CALLS: usize = 20;
         const MAX_REPEAT_SAME_TOOL: usize = 3;
+        const MAX_TIMEOUT_TOOL_CALLS_TOTAL: usize = 2;
+        const MAX_TIMEOUT_SAME_TOOL_CALL: usize = 1;
 
         let mut messages = build_base_messages(history, system_prompt, user_prompt);
         let mut tools = vec![shell_tool_definition()];
@@ -236,6 +238,8 @@ impl AiClient {
         let mut total_tool_calls: usize = 0;
         let mut tool_result_cache: HashMap<String, String> = HashMap::new();
         let mut same_tool_counter: HashMap<String, usize> = HashMap::new();
+        let mut timeout_tool_counter: HashMap<String, usize> = HashMap::new();
+        let mut timeout_total: usize = 0;
         let mut thinking_chunks: Vec<String> = Vec::new();
         let mut metrics = ChatMetrics::default();
 
@@ -330,9 +334,31 @@ impl AiClient {
                             finalize_reason = Some("repeated_same_tool_call");
                             build_guard_tool_result("repeated_same_tool_call")
                         } else if let Some(cached) = tool_result_cache.get(&signature) {
+                            if tool_result_timed_out(cached) {
+                                timeout_total += 1;
+                                let timeout_count =
+                                    timeout_tool_counter.entry(signature.clone()).or_insert(0);
+                                *timeout_count += 1;
+                                if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
+                                    finalize_reason = Some("repeated_tool_timeout");
+                                } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
+                                    finalize_reason = Some("too_many_tool_timeouts");
+                                }
+                            }
                             cached.clone()
                         } else {
                             let result = execute_tool(&request);
+                            if tool_result_timed_out(&result) {
+                                timeout_total += 1;
+                                let timeout_count =
+                                    timeout_tool_counter.entry(signature.clone()).or_insert(0);
+                                *timeout_count += 1;
+                                if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
+                                    finalize_reason = Some("repeated_tool_timeout");
+                                } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
+                                    finalize_reason = Some("too_many_tool_timeouts");
+                                }
+                            }
                             tool_result_cache.insert(signature, result.clone());
                             result
                         }
@@ -693,6 +719,13 @@ fn normalize_tool_signature(name: &str, arguments: &str) -> String {
         return format!("{name}::{normalized_mode}::{command}");
     }
     format!("{name}::{}", arguments.trim())
+}
+
+fn tool_result_timed_out(payload: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| value.get("timed_out").and_then(|item| item.as_bool()))
+        .unwrap_or(false)
 }
 
 fn build_base_messages(

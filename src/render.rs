@@ -19,6 +19,7 @@ const DEFAULT_CHAT_SYSTEM_PROMPT: &str = "你是 MachineClaw 的本机交互助�
 const DEFAULT_PREPARE_OUTPUT_TEMPLATE: &str = "# Preparation Report\n\nAction: {{action}}\nStatus: {{status}}\n\n## Overview\nKeyMetrics:\n{{key_metrics}}\n\n## Risks\nRiskSummary:\n{{risk_summary}}\n\n## AI Interpretation\nAISummary:\n{{ai_summary}}\n\n## Command Execution\nCommandSummary:\n{{command_summary}}\n\n## Elapsed\nElapsed: {{elapsed}}\n";
 const DEFAULT_INSPECT_OUTPUT_TEMPLATE: &str = "Action: {{action}}\nStatus: {{status}}\nKeyMetrics:\n{{key_metrics}}\nRiskSummary:\n{{risk_summary}}\nAISummary:\n{{ai_summary}}\nCommandSummary:\n{{command_summary}}\nElapsed: {{elapsed}}\n";
 const DEFAULT_CHAT_OUTPUT_TEMPLATE: &str = "Action: {{action}}\nStatus: {{status}}\nKeyMetrics:\n{{key_metrics}}\nRiskSummary:\n{{risk_summary}}\nAISummary:\n{{ai_summary}}\nCommandSummary:\n{{command_summary}}\nElapsed: {{elapsed}}\n";
+const DEFAULT_TEST_OUTPUT_TEMPLATE: &str = "# Configuration Test Report\n\nAction: {{action}}\nStatus: {{status}}\n\n## Overview\nKeyMetrics:\n{{key_metrics}}\n\n## Findings\nRiskSummary:\n{{risk_summary}}\n\n## Assessment\nAISummary:\n{{ai_summary}}\n\n## Checks\nCommandSummary:\n{{command_summary}}\n\n## Elapsed\nElapsed: {{elapsed}}\n";
 
 #[derive(Debug, Clone)]
 pub struct ActionRenderData {
@@ -577,6 +578,11 @@ fn ensure_default_assets(dir: &Path) -> Result<Vec<String>, AppError> {
     ensure_file(
         &output_templates_dir.join("chat.md"),
         DEFAULT_CHAT_OUTPUT_TEMPLATE,
+        &mut notices,
+    )?;
+    ensure_file(
+        &output_templates_dir.join("test.md"),
+        DEFAULT_TEST_OUTPUT_TEMPLATE,
         &mut notices,
     )?;
 

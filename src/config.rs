@@ -33,6 +33,14 @@ const DEFAULT_CHAT_CONTEXT_WARN_PERCENT: u8 = 80;
 const DEFAULT_CHAT_CONTEXT_CRITICAL_PERCENT: u8 = 95;
 const DEFAULT_CHAT_STREAM_OUTPUT: bool = false;
 const DEFAULT_CHAT_OUTPUT_MULTILINES: bool = false;
+const DEFAULT_CHAT_SKIP_ENV_PROFILE: bool = true;
+const DEFAULT_CHAT_CMD_RUN_TIMOUT_SECONDS: u64 = 30;
+const DEFAULT_CHAT_COMPRESSION_MAX_HISTORY_MESSAGES: usize = 40;
+const DEFAULT_CHAT_COMPRESSION_MAX_CHARS_COUNT: usize = 80_000;
+const DEFAULT_LOG_DIR: &str = "logs";
+const DEFAULT_LOG_FILE_NAME: &str = "session-{session-id}.log";
+const DEFAULT_LOG_MAX_FILE_SIZE: &str = "50mb";
+const DEFAULT_LOG_MAX_SAVE_TIME: &str = "7d";
 const DEFAULT_CONTEXT_RECENT_MESSAGES: usize = 40;
 const MAX_CONTEXT_MESSAGES: usize = 80;
 
@@ -49,6 +57,8 @@ pub struct AppConfig {
     pub mcp: McpConfig,
     #[serde(default)]
     pub console: ConsoleConfig,
+    #[serde(default)]
+    pub log: LogConfig,
     #[serde(default)]
     pub session: SessionConfig,
 }
@@ -125,6 +135,39 @@ pub struct AiChatConfig {
         default = "default_chat_output_multilines"
     )]
     pub output_multilines: bool,
+    #[serde(rename = "skip-env-profile", default = "default_chat_skip_env_profile")]
+    pub skip_env_profile: bool,
+    #[serde(
+        rename = "cmd-run-timout",
+        alias = "cmd-run-timeout",
+        default = "default_chat_cmd_run_timout_seconds"
+    )]
+    pub cmd_run_timout: u64,
+    #[serde(default)]
+    pub compression: AiChatCompressionConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AiChatCompressionConfig {
+    #[serde(
+        rename = "max-history-messages",
+        default = "default_chat_compression_max_history_messages"
+    )]
+    pub max_history_messages: usize,
+    #[serde(
+        rename = "max-chars-count",
+        default = "default_chat_compression_max_chars_count"
+    )]
+    pub max_chars_count: usize,
+}
+
+impl Default for AiChatCompressionConfig {
+    fn default() -> Self {
+        Self {
+            max_history_messages: default_chat_compression_max_history_messages(),
+            max_chars_count: default_chat_compression_max_chars_count(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -219,6 +262,18 @@ pub struct ConsoleConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LogConfig {
+    #[serde(default = "default_log_dir")]
+    pub dir: String,
+    #[serde(rename = "log-file-name", default = "default_log_file_name")]
+    pub log_file_name: String,
+    #[serde(rename = "max-file-size", default = "default_log_max_file_size")]
+    pub max_file_size: String,
+    #[serde(rename = "max-save-time", default = "default_log_max_save_time")]
+    pub max_save_time: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SessionConfig {
     #[serde(default = "default_context_recent_messages")]
     pub recent_messages: usize,
@@ -250,6 +305,9 @@ impl Default for AiChatConfig {
             context_critical_percent: default_chat_context_critical_percent(),
             stream_output: default_chat_stream_output(),
             output_multilines: default_chat_output_multilines(),
+            skip_env_profile: default_chat_skip_env_profile(),
+            cmd_run_timout: default_chat_cmd_run_timout_seconds(),
+            compression: AiChatCompressionConfig::default(),
         }
     }
 }
@@ -281,6 +339,17 @@ impl Default for ConsoleConfig {
     fn default() -> Self {
         Self {
             colorful: default_console_colorful(),
+        }
+    }
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_log_dir(),
+            log_file_name: default_log_file_name(),
+            max_file_size: default_log_max_file_size(),
+            max_save_time: default_log_max_save_time(),
         }
     }
 }
@@ -358,6 +427,12 @@ context-warn-percent = 80 # optional
 context-critical-percent = 95 # optional
 stream-output = false # optional, default false
 output-multilines = false # optional, default false
+skip-env-profile = true # optional, default true
+cmd-run-timout = 30 # optional, default 30 seconds
+
+[ai.chat.compression]
+max-history-messages = 40 # optional, default 40
+max-chars-count = 80000 # optional, default 80000
 
 [cmd]
 write-cmd-run-confirm = true # optional, default true
@@ -386,6 +461,12 @@ args = [] # optional
 
 [console]
 colorful = true # optional, default true
+
+[log]
+dir = "logs" # optional, default executable_dir/logs
+log-file-name = "session-{session-id}.log" # optional, supports strftime and %N
+max-file-size = "50mb" # optional, units: b, kb, mb, gb, tb
+max-save-time = "7d" # optional, units: s, m, h, d, M, y
 
 [session]
 recent_messages = 40 # optional, default 40
@@ -452,6 +533,21 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
             "ai.chat context-warn-percent cannot exceed context-critical-percent".to_string(),
         ));
     }
+    if cfg.ai.chat.cmd_run_timout == 0 {
+        return Err(AppError::Config(
+            "ai.chat.cmd-run-timout must be greater than 0".to_string(),
+        ));
+    }
+    if cfg.ai.chat.compression.max_history_messages == 0 {
+        return Err(AppError::Config(
+            "ai.chat.compression.max-history-messages must be greater than 0".to_string(),
+        ));
+    }
+    if cfg.ai.chat.compression.max_chars_count == 0 {
+        return Err(AppError::Config(
+            "ai.chat.compression.max-chars-count must be greater than 0".to_string(),
+        ));
+    }
     if cfg.session.recent_messages == 0 {
         return Err(AppError::Config(
             "session.recent_messages must be greater than 0".to_string(),
@@ -470,6 +566,26 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
     if cfg.session.recent_messages > cfg.session.max_messages {
         return Err(AppError::Config(
             "session.recent_messages cannot exceed session.max_messages".to_string(),
+        ));
+    }
+    if cfg.log.log_file_name.trim().is_empty() || !has_file_extension(&cfg.log.log_file_name) {
+        return Err(AppError::Config(
+            "log.log-file-name must include a file extension".to_string(),
+        ));
+    }
+    if cfg.log.log_file_name.contains('/') || cfg.log.log_file_name.contains('\\') {
+        return Err(AppError::Config(
+            "log.log-file-name must not contain path separators".to_string(),
+        ));
+    }
+    if cfg.log.max_file_size.trim().is_empty() {
+        return Err(AppError::Config(
+            "log.max-file-size must not be empty".to_string(),
+        ));
+    }
+    if cfg.log.max_save_time.trim().is_empty() {
+        return Err(AppError::Config(
+            "log.max-save-time must not be empty".to_string(),
         ));
     }
     Ok(())
@@ -599,6 +715,22 @@ fn default_console_colorful() -> bool {
     DEFAULT_CONSOLE_COLORFUL
 }
 
+fn default_log_dir() -> String {
+    DEFAULT_LOG_DIR.to_string()
+}
+
+fn default_log_file_name() -> String {
+    DEFAULT_LOG_FILE_NAME.to_string()
+}
+
+fn default_log_max_file_size() -> String {
+    DEFAULT_LOG_MAX_FILE_SIZE.to_string()
+}
+
+fn default_log_max_save_time() -> String {
+    DEFAULT_LOG_MAX_SAVE_TIME.to_string()
+}
+
 fn default_ai_max_retries() -> u32 {
     DEFAULT_AI_MAX_RETRIES
 }
@@ -663,10 +795,37 @@ fn default_chat_output_multilines() -> bool {
     DEFAULT_CHAT_OUTPUT_MULTILINES
 }
 
+fn default_chat_skip_env_profile() -> bool {
+    DEFAULT_CHAT_SKIP_ENV_PROFILE
+}
+
+fn default_chat_cmd_run_timout_seconds() -> u64 {
+    DEFAULT_CHAT_CMD_RUN_TIMOUT_SECONDS
+}
+
+fn default_chat_compression_max_history_messages() -> usize {
+    DEFAULT_CHAT_COMPRESSION_MAX_HISTORY_MESSAGES
+}
+
+fn default_chat_compression_max_chars_count() -> usize {
+    DEFAULT_CHAT_COMPRESSION_MAX_CHARS_COUNT
+}
+
 fn default_context_recent_messages() -> usize {
     DEFAULT_CONTEXT_RECENT_MESSAGES
 }
 
 fn default_context_max_messages() -> usize {
     MAX_CONTEXT_MESSAGES
+}
+
+fn has_file_extension(file_name: &str) -> bool {
+    let trimmed = file_name.trim();
+    if trimmed.is_empty() || trimmed.ends_with('.') {
+        return false;
+    }
+    if let Some(idx) = trimmed.rfind('.') {
+        return idx > 0 && idx < trimmed.len() - 1;
+    }
+    false
 }

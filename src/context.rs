@@ -74,6 +74,9 @@ pub struct SessionStore {
     state: SessionState,
     recent_limit: usize,
     max_limit: usize,
+    compression_max_history_messages: usize,
+    compression_max_chars_count: usize,
+    compression_keep_recent_messages: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +97,8 @@ impl SessionStore {
         path: PathBuf,
         recent_limit: usize,
         max_limit: usize,
+        compression_max_history_messages: usize,
+        compression_max_chars_count: usize,
     ) -> Result<Self, AppError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
@@ -131,6 +136,11 @@ impl SessionStore {
             state,
             recent_limit,
             max_limit,
+            compression_max_history_messages,
+            compression_max_chars_count,
+            compression_keep_recent_messages: compute_keep_recent_messages(
+                compression_max_history_messages,
+            ),
         };
         store.repair_compass();
         store.enforce_max_limit();
@@ -243,6 +253,14 @@ impl SessionStore {
         self.state.summary.chars().count()
     }
 
+    pub fn total_message_chars(&self) -> usize {
+        self.state
+            .messages
+            .iter()
+            .map(|msg| msg.content.chars().count())
+            .sum()
+    }
+
     pub fn file_path(&self) -> &Path {
         &self.path
     }
@@ -301,24 +319,28 @@ impl SessionStore {
     }
 
     pub fn build_ai_compression_plan(&self) -> Option<AiCompressionPlan> {
-        if self.state.messages.len() <= self.recent_limit {
+        let total_messages = self.state.messages.len();
+        let total_chars = self.total_message_chars();
+        if total_messages <= self.compression_max_history_messages
+            || total_chars <= self.compression_max_chars_count
+        {
             return None;
         }
-        let overflow_end = self.state.messages.len().saturating_sub(self.recent_limit);
-        if overflow_end == 0 {
+        let candidate_end = total_messages.saturating_sub(self.compression_keep_recent_messages);
+        if candidate_end == 0 {
             return None;
         }
-        let start = compression_start_index(&self.state.messages, overflow_end);
-        if start >= overflow_end {
+        let start = compression_start_index(&self.state.messages, candidate_end);
+        if start >= candidate_end {
             return None;
         }
-        let previous_summaries = self.state.messages[..overflow_end]
+        let previous_summaries = self.state.messages[..candidate_end]
             .iter()
             .filter(|msg| is_ai_compression_message(msg))
             .map(|msg| strip_marker(msg.content.trim(), AI_COMPRESSION_MARKER))
             .filter(|text| !text.trim().is_empty())
             .collect::<Vec<_>>();
-        let candidate = self.state.messages[start..overflow_end]
+        let candidate = self.state.messages[start..candidate_end]
             .iter()
             .filter(|msg| !is_ai_compression_message(msg))
             .cloned()
@@ -350,22 +372,26 @@ impl SessionStore {
         summary: &str,
     ) -> Option<AiCompressionApplyResult> {
         let normalized = summary.trim();
-        if normalized.is_empty() || self.state.messages.len() <= self.recent_limit {
+        if normalized.is_empty() {
             return None;
         }
-        let overflow_end = self.state.messages.len().saturating_sub(self.recent_limit);
-        if overflow_end == 0 {
+        let candidate_end = self
+            .state
+            .messages
+            .len()
+            .saturating_sub(self.compression_keep_recent_messages);
+        if candidate_end == 0 {
             return None;
         }
-        let start = compression_start_index(&self.state.messages, overflow_end);
-        if start >= overflow_end {
+        let start = compression_start_index(&self.state.messages, candidate_end);
+        if start >= candidate_end {
             return None;
         }
-        let removed = overflow_end.saturating_sub(start);
+        let removed = candidate_end.saturating_sub(start);
         if removed == 0 {
             return None;
         }
-        self.state.messages.drain(start..overflow_end);
+        self.state.messages.drain(start..candidate_end);
         self.state.messages.insert(
             start,
             SessionMessage {
@@ -507,6 +533,11 @@ impl SessionStore {
             ))
         })
     }
+}
+
+fn compute_keep_recent_messages(max_history_messages: usize) -> usize {
+    let compress_recent = max_history_messages / 2;
+    max_history_messages.saturating_sub(compress_recent).max(1)
 }
 
 fn new_compass() -> SessionCompass {
