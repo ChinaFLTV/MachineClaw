@@ -235,50 +235,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
     let mut tool_call_cache = HashMap::<String, ToolCallCacheItem>::new();
     let command_cache_ttl_ms = services.cfg.ai.chat.command_cache_ttl_seconds as u128 * 1000;
     let external_mcp_tools: Vec<ExternalToolDefinition> = services.mcp.external_tool_definitions();
-    if services.cfg.ai.chat.show_tips {
-        println!(
-            "{}",
-            render::render_chat_notice(
-                &i18n::chat_welcome(
-                    services.session.session_id(),
-                    services.session.file_path(),
-                    services.session.message_count(),
-                    services.session.summary_len(),
-                    services.cfg.session.recent_messages,
-                    services.cfg.session.max_messages,
-                    services.os_name,
-                    &services.cfg.ai.model,
-                    services.skills.len(),
-                    services.mcp_summary.as_str(),
-                    &services.cfg.ai.chat
-                ),
-                services.cfg.console.colorful
-            )
-        );
-        println!(
-            "{}",
-            render::render_chat_notice(i18n::chat_hint(), services.cfg.console.colorful)
-        );
-        if let Some(warn_message) = services.session.context_pressure_warning(
-            services.cfg.ai.chat.context_warn_percent,
-            services.cfg.ai.chat.context_critical_percent,
-        ) {
-            println!(
-                "{}",
-                render::render_chat_notice(&warn_message, services.cfg.console.colorful)
-            );
-        }
-    }
-    if services.cfg.skills.enabled {
-        println!(
-            "{}",
-            render::render_chat_custom_tag_event(
-                i18n::chat_tag_skill(),
-                &i18n::chat_skill_enabled(services.skills.len()),
-                services.cfg.console.colorful
-            )
-        );
-    }
+    render_chat_window_header(services, false);
 
     loop {
         print!(
@@ -292,7 +249,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             .flush()
             .map_err(|err| AppError::Command(format!("failed to flush chat prompt: {err}")))?;
 
-        let message = if let Some(next_message) = pending_message.take() {
+        let message_raw = if let Some(next_message) = pending_message.take() {
             println!("{next_message}");
             next_message
         } else {
@@ -312,6 +269,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             }
             String::from_utf8_lossy(&input).trim().to_string()
         };
+        let message = normalize_chat_message(&message_raw);
         if message.is_empty() {
             continue;
         }
@@ -450,18 +408,15 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         }
         if message.eq_ignore_ascii_case("/clear") {
             clear_terminal()?;
+            render_chat_window_header(services, true);
+            continue;
+        }
+        if let Some(unknown_cmd) = detect_unknown_builtin_command(&message) {
             println!(
                 "{}",
-                render::render_markdown_for_terminal(
-                    i18n::chat_cleared(),
-                    services.cfg.console.colorful
-                )
-            );
-            println!(
-                "{}",
-                render::render_markdown_for_terminal(
-                    i18n::chat_hint(),
-                    services.cfg.console.colorful
+                render::render_chat_notice(
+                    &i18n::chat_unknown_builtin_command(&unknown_cmd),
+                    services.cfg.console.colorful,
                 )
             );
             continue;
@@ -1341,6 +1296,54 @@ fn parse_chat_command_arg<'a>(message: &'a str, command: &str) -> Option<&'a str
     Some(rest)
 }
 
+fn normalize_chat_message(raw: &str) -> String {
+    let mut normalized = raw
+        .trim()
+        .chars()
+        .filter(|ch| {
+            !matches!(
+                ch,
+                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}'
+            )
+        })
+        .collect::<String>();
+    if let Some(first) = normalized.chars().next()
+        && matches!(first, '／' | '⁄' | '∕' | '⧸' | '╱')
+    {
+        normalized.replace_range(0..first.len_utf8(), "/");
+    }
+    normalized.trim().to_string()
+}
+
+fn detect_unknown_builtin_command(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let mut end = 1usize;
+    for (idx, ch) in trimmed.char_indices().skip(1) {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            end = idx + ch.len_utf8();
+            continue;
+        }
+        if ch.is_whitespace() {
+            break;
+        }
+        return None;
+    }
+    if end <= 1 {
+        return None;
+    }
+    let command_name = trimmed[1..end].to_ascii_lowercase();
+    let known = [
+        "help", "stats", "list", "change", "name", "new", "clear", "exit", "quit",
+    ];
+    if known.contains(&command_name.as_str()) {
+        return None;
+    }
+    Some(command_name)
+}
+
 fn format_chat_session_list_markdown(sessions: &[crate::context::SessionOverview]) -> String {
     if sessions.is_empty() {
         return i18n::chat_session_list_empty().to_string();
@@ -1449,6 +1452,62 @@ fn clear_terminal() -> Result<(), AppError> {
     io::stdout()
         .flush()
         .map_err(|err| AppError::Command(format!("failed to clear terminal: {err}")))
+}
+
+fn render_chat_window_header(services: &ActionServices<'_>, after_clear: bool) {
+    if after_clear {
+        println!(
+            "{}",
+            render::render_markdown_for_terminal(
+                i18n::chat_cleared(),
+                services.cfg.console.colorful
+            )
+        );
+    }
+    if services.cfg.ai.chat.show_tips || after_clear {
+        println!(
+            "{}",
+            render::render_chat_notice(
+                &i18n::chat_welcome(
+                    services.session.session_id(),
+                    services.session.file_path(),
+                    services.session.message_count(),
+                    services.session.summary_len(),
+                    services.cfg.session.recent_messages,
+                    services.cfg.session.max_messages,
+                    services.os_name,
+                    &services.cfg.ai.model,
+                    services.skills.len(),
+                    services.mcp_summary.as_str(),
+                    &services.cfg.ai.chat
+                ),
+                services.cfg.console.colorful
+            )
+        );
+        println!(
+            "{}",
+            render::render_chat_notice(i18n::chat_hint(), services.cfg.console.colorful)
+        );
+        if let Some(warn_message) = services.session.context_pressure_warning(
+            services.cfg.ai.chat.context_warn_percent,
+            services.cfg.ai.chat.context_critical_percent,
+        ) {
+            println!(
+                "{}",
+                render::render_chat_notice(&warn_message, services.cfg.console.colorful)
+            );
+        }
+    }
+    if services.cfg.skills.enabled {
+        println!(
+            "{}",
+            render::render_chat_custom_tag_event(
+                i18n::chat_tag_skill(),
+                &i18n::chat_skill_enabled(services.skills.len()),
+                services.cfg.console.colorful
+            )
+        );
+    }
 }
 
 fn build_chat_system_prompt(services: &ActionServices<'_>, base: &str) -> String {

@@ -919,6 +919,19 @@ pub fn chat_help_text() -> &'static str {
     }
 }
 
+pub fn chat_unknown_builtin_command(command: &str) -> String {
+    match current_language() {
+        Language::ZhCn => format!("未知内建命令: /{command}，可用命令请执行 /help"),
+        Language::ZhTw => format!("未知內建命令: /{command}，可用命令請執行 /help"),
+        Language::Fr => format!("Commande intégrée inconnue: /{command}, utilisez /help"),
+        Language::De => format!("Unbekannter Builtin-Befehl: /{command}, bitte /help verwenden"),
+        Language::Ja => {
+            format!("不明な組み込みコマンド: /{command}。利用可能なコマンドは /help")
+        }
+        Language::En => format!("unknown builtin command: /{command}; use /help"),
+    }
+}
+
 pub fn chat_change_usage() -> &'static str {
     match current_language() {
         Language::ZhCn => "用法: /change {完整session-id | session-id前缀 | 会话名称}",

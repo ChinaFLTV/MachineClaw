@@ -161,6 +161,7 @@ impl SessionStore {
                 compression_max_history_messages,
             ),
         };
+        store.ensure_session_path_in_sessions_dir()?;
         store.repair_compass();
         store.enforce_max_limit();
         store.persist_active_session_pointer()?;
@@ -243,21 +244,36 @@ impl SessionStore {
 
     pub fn session_file(path: &Path) -> PathBuf {
         let base_dir = path.join(".machineclaw");
-        let active_file = base_dir.join("active_session");
-        if let Ok(raw) = fs::read_to_string(&active_file) {
-            let trimmed = raw.trim();
-            if !trimmed.is_empty() {
+        let sessions_dir = base_dir.join("sessions");
+        let pointer_files = [
+            base_dir.join("active_session"),
+            sessions_dir.join("active_session"),
+        ];
+        for pointer_file in pointer_files {
+            if let Ok(raw) = fs::read_to_string(&pointer_file) {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
                 let candidate = PathBuf::from(trimmed);
                 if candidate.exists() {
                     return candidate;
                 }
-                let relative_candidate = base_dir.join(trimmed);
-                if relative_candidate.exists() {
-                    return relative_candidate;
+                let relative_base = base_dir.join(trimmed);
+                if relative_base.exists() {
+                    return relative_base;
+                }
+                let relative_sessions = sessions_dir.join(trimmed);
+                if relative_sessions.exists() {
+                    return relative_sessions;
                 }
             }
         }
-        base_dir.join("session.json")
+        let legacy_default = base_dir.join("session.json");
+        if legacy_default.exists() {
+            return legacy_default;
+        }
+        sessions_dir.join("session.json")
     }
 
     pub fn session_id(&self) -> &str {
@@ -327,11 +343,15 @@ impl SessionStore {
             messages: Vec::new(),
             compass: new_compass(),
         };
-        let parent = self.path.parent().ok_or_else(|| {
-            AppError::Runtime("failed to resolve session parent directory".to_string())
+        let session_dir = session_dir_from_session_path(&self.path);
+        fs::create_dir_all(&session_dir).map_err(|err| {
+            AppError::Runtime(format!(
+                "failed to create session directory {}: {err}",
+                session_dir.display()
+            ))
         })?;
         let filename = format!("session-{new_session_id}.json");
-        self.path = parent.join(filename);
+        self.path = session_dir.join(filename);
         self.persist()?;
         self.persist_active_session_pointer()
     }
@@ -687,22 +707,52 @@ impl SessionStore {
     }
 
     fn persist_active_session_pointer(&self) -> Result<(), AppError> {
-        let Some(parent) = self.path.parent() else {
-            return Ok(());
-        };
-        fs::create_dir_all(parent).map_err(|err| {
+        let base_dir = machineclaw_base_dir_from_session_path(&self.path);
+        fs::create_dir_all(&base_dir).map_err(|err| {
             AppError::Runtime(format!(
                 "failed to create session directory {}: {err}",
-                parent.display()
+                base_dir.display()
             ))
         })?;
-        let pointer_file = parent.join("active_session");
-        fs::write(&pointer_file, self.path.to_string_lossy().to_string()).map_err(|err| {
+        let pointer_file = base_dir.join("active_session");
+        let pointer_value = self
+            .path
+            .strip_prefix(&base_dir)
+            .ok()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.path.to_string_lossy().to_string());
+        fs::write(&pointer_file, pointer_value).map_err(|err| {
             AppError::Runtime(format!(
                 "failed to write active session pointer {}: {err}",
                 pointer_file.display()
             ))
         })
+    }
+
+    fn ensure_session_path_in_sessions_dir(&mut self) -> Result<(), AppError> {
+        let target_dir = session_dir_from_session_path(&self.path);
+        let current_dir = self.path.parent().map(Path::to_path_buf);
+        if current_dir.as_ref() == Some(&target_dir) {
+            return Ok(());
+        }
+        fs::create_dir_all(&target_dir).map_err(|err| {
+            AppError::Runtime(format!(
+                "failed to create session directory {}: {err}",
+                target_dir.display()
+            ))
+        })?;
+        let current_file_name = self
+            .path
+            .file_name()
+            .and_then(|item| item.to_str())
+            .unwrap_or("session.json")
+            .to_string();
+        let mut target_path = target_dir.join(current_file_name);
+        if target_path.exists() && target_path != self.path {
+            target_path = target_dir.join(format!("session-{}.json", self.state.session_id));
+        }
+        self.path = target_path;
+        self.persist()
     }
 }
 
@@ -1012,4 +1062,22 @@ fn now_epoch_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn machineclaw_base_dir_from_session_path(session_path: &Path) -> PathBuf {
+    let Some(parent) = session_path.parent() else {
+        return PathBuf::from(".machineclaw");
+    };
+    let parent_name = parent.file_name().and_then(|item| item.to_str());
+    if parent_name == Some("sessions") {
+        return parent
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| parent.to_path_buf());
+    }
+    parent.to_path_buf()
+}
+
+fn session_dir_from_session_path(session_path: &Path) -> PathBuf {
+    machineclaw_base_dir_from_session_path(session_path).join("sessions")
 }
