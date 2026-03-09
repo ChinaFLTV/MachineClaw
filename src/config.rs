@@ -36,6 +36,8 @@ const DEFAULT_CHAT_STREAM_OUTPUT: bool = false;
 const DEFAULT_CHAT_OUTPUT_MULTILINES: bool = false;
 const DEFAULT_CHAT_SKIP_ENV_PROFILE: bool = true;
 const DEFAULT_CHAT_CMD_RUN_TIMOUT_SECONDS: u64 = 30;
+const DEFAULT_CHAT_MAX_TOOL_ROUNDS: usize = 16;
+const DEFAULT_CHAT_MAX_TOTAL_TOOL_CALLS: usize = 40;
 const DEFAULT_CHAT_COMPRESSION_MAX_HISTORY_MESSAGES: usize = 40;
 const DEFAULT_CHAT_COMPRESSION_MAX_CHARS_COUNT: usize = 80_000;
 const DEFAULT_LOG_DIR: &str = "logs";
@@ -156,6 +158,13 @@ pub struct AiChatConfig {
         default = "default_chat_cmd_run_timout_seconds"
     )]
     pub cmd_run_timout: u64,
+    #[serde(rename = "max-tool-rounds", default = "default_chat_max_tool_rounds")]
+    pub max_tool_rounds: usize,
+    #[serde(
+        rename = "max-total-tool-calls",
+        default = "default_chat_max_total_tool_calls"
+    )]
+    pub max_total_tool_calls: usize,
     #[serde(default)]
     pub compression: AiChatCompressionConfig,
 }
@@ -324,6 +333,8 @@ impl Default for AiChatConfig {
             output_multilines: default_chat_output_multilines(),
             skip_env_profile: default_chat_skip_env_profile(),
             cmd_run_timout: default_chat_cmd_run_timout_seconds(),
+            max_tool_rounds: default_chat_max_tool_rounds(),
+            max_total_tool_calls: default_chat_max_total_tool_calls(),
             compression: AiChatCompressionConfig::default(),
         }
     }
@@ -449,6 +460,8 @@ stream-output = false # optional, default false
 output-multilines = false # optional, default false
 skip-env-profile = true # optional, default true
 cmd-run-timout = 30 # optional, default 30 seconds
+max-tool-rounds = 16 # optional, default 16
+max-total-tool-calls = 40 # optional, default 40
 
 [ai.chat.compression]
 max-history-messages = 40 # optional, default 40
@@ -586,6 +599,16 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
     if cfg.ai.chat.cmd_run_timout == 0 {
         return Err(AppError::Config(
             "ai.chat.cmd-run-timout must be greater than 0".to_string(),
+        ));
+    }
+    if cfg.ai.chat.max_tool_rounds == 0 {
+        return Err(AppError::Config(
+            "ai.chat.max-tool-rounds must be greater than 0".to_string(),
+        ));
+    }
+    if cfg.ai.chat.max_total_tool_calls == 0 {
+        return Err(AppError::Config(
+            "ai.chat.max-total-tool-calls must be greater than 0".to_string(),
         ));
     }
     if cfg.ai.chat.compression.max_history_messages == 0 {
@@ -851,6 +874,14 @@ fn default_chat_skip_env_profile() -> bool {
 
 fn default_chat_cmd_run_timout_seconds() -> u64 {
     DEFAULT_CHAT_CMD_RUN_TIMOUT_SECONDS
+}
+
+fn default_chat_max_tool_rounds() -> usize {
+    DEFAULT_CHAT_MAX_TOOL_ROUNDS
+}
+
+fn default_chat_max_total_tool_calls() -> usize {
+    DEFAULT_CHAT_MAX_TOTAL_TOOL_CALLS
 }
 
 fn default_chat_compression_max_history_messages() -> usize {

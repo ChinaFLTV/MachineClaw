@@ -219,12 +219,15 @@ impl AiClient {
         Ok(content)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn chat_with_shell_tool<F>(
         &self,
         history: &[ChatMessage],
         system_prompt: &str,
         user_prompt: &str,
         policy: ToolUsePolicy,
+        max_tool_rounds: usize,
+        max_total_tool_calls: usize,
         extra_tools: &[ExternalToolDefinition],
         mut execute_tool: F,
         mut on_round_event: impl FnMut(ChatRoundEvent),
@@ -232,11 +235,10 @@ impl AiClient {
     where
         F: FnMut(&ToolCallRequest) -> String,
     {
-        const MAX_TOOL_ROUNDS: usize = 8;
-        const MAX_TOTAL_TOOL_CALLS: usize = 20;
         const MAX_REPEAT_SAME_TOOL: usize = 3;
         const MAX_TIMEOUT_TOOL_CALLS_TOTAL: usize = 2;
         const MAX_TIMEOUT_SAME_TOOL_CALL: usize = 1;
+        const MAX_FORCE_CONTINUE_HINT_ROUNDS: usize = 2;
 
         let mut messages = build_base_messages(history, system_prompt, user_prompt);
         let mut tools = vec![shell_tool_definition()];
@@ -249,6 +251,7 @@ impl AiClient {
         let mut timeout_total: usize = 0;
         let mut thinking_chunks: Vec<String> = Vec::new();
         let mut metrics = ChatMetrics::default();
+        let mut forced_continue_hint_rounds: usize = 0;
         let mut tool_choice_mode = if model_prefers_omit_tool_choice(&self.model) {
             logging::info(
                 "model prefers omitting tool_choice for compatibility; starting with tool_choice omitted",
@@ -258,7 +261,7 @@ impl AiClient {
             ToolChoiceMode::Policy
         };
 
-        for _ in 0..MAX_TOOL_ROUNDS {
+        for _ in 0..max_tool_rounds {
             let tool_choice = match tool_choice_mode {
                 ToolChoiceMode::Disabled => None,
                 ToolChoiceMode::AutoOnly => Some(json!("auto")),
@@ -367,7 +370,7 @@ impl AiClient {
                     let signature = normalize_tool_signature(&request.name, &request.arguments);
                     let tool_result = if let Some(reason) = finalize_reason {
                         build_guard_tool_result(reason)
-                    } else if total_tool_calls > MAX_TOTAL_TOOL_CALLS {
+                    } else if total_tool_calls > max_total_tool_calls {
                         finalize_reason = Some("tool_call_limit_exceeded");
                         build_guard_tool_result("tool_call_limit_exceeded")
                     } else {
@@ -429,6 +432,34 @@ impl AiClient {
                 messages.push(ApiMessage {
                     role: "system".to_string(),
                     content: Some("You are running locally with direct tool access. You MUST call run_shell_command at least once before giving a final answer for this request.".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                continue;
+            }
+
+            if !assistant_content.trim().is_empty()
+                && forced_continue_hint_rounds < MAX_FORCE_CONTINUE_HINT_ROUNDS
+                && should_force_continue_with_tools(&assistant_content)
+            {
+                forced_continue_hint_rounds += 1;
+                logging::warn(
+                    "assistant asked user to run/provide command output; forcing another tool-calling round",
+                );
+                messages.push(ApiMessage {
+                    role: "assistant".to_string(),
+                    content: optional_content(assistant_content.clone()),
+                    reasoning_content: Some(build_reasoning_content_for_tool_round(
+                        assistant.reasoning_content.as_deref(),
+                        assistant.reasoning.as_ref(),
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                messages.push(ApiMessage {
+                    role: "system".to_string(),
+                    content: Some("You have direct local tool access in this CLI. Continue investigating by calling tools yourself. Do NOT ask the user to execute commands or provide command output unless execution is explicitly blocked by policy/safety constraints.".to_string()),
                     reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -950,6 +981,29 @@ fn is_tool_choice_unsupported_error(err: &AppError) -> bool {
 fn model_prefers_omit_tool_choice(model: &str) -> bool {
     let normalized = model.trim().to_ascii_lowercase();
     normalized == "deepseek-reasoner"
+}
+
+fn should_force_continue_with_tools(content: &str) -> bool {
+    let lowered = content.to_ascii_lowercase();
+    let patterns = [
+        "请执行",
+        "请在终端执行",
+        "请手动执行",
+        "把结果发给我",
+        "把输出发给我",
+        "请提供输出",
+        "请提供结果",
+        "我无法自动执行",
+        "无法自动执行命令",
+        "please run",
+        "run this command",
+        "paste the output",
+        "provide the output",
+        "i cannot execute",
+        "can't execute commands",
+        "execute it yourself",
+    ];
+    patterns.iter().any(|p| lowered.contains(p))
 }
 
 fn build_chat_url(base_url: &str) -> String {

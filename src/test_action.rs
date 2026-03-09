@@ -229,7 +229,7 @@ fn item_matches_literal(item: &Item, literal: &str) -> bool {
 fn parse_toml_literal_to_value(literal: &str) -> Option<toml::Value> {
     let wrapped = format!("value = {literal}");
     let parsed = toml::from_str::<toml::Table>(&wrapped).ok()?;
-    parsed.get("value").cloned().map(toml::Value::from)
+    parsed.get("value").cloned()
 }
 
 fn read_colorful_hint(raw: &str) -> Option<bool> {

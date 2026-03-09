@@ -96,7 +96,7 @@ pub fn human_count_u128(value: u128) -> String {
     for (idx, ch) in text.chars().enumerate() {
         out.push(ch);
         let left = len.saturating_sub(idx + 1);
-        if left > 0 && left % 3 == 0 {
+        if left > 0 && left.is_multiple_of(3) {
             out.push(',');
         }
     }
@@ -462,6 +462,7 @@ pub fn risk_no_obvious() -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_metrics_overview(
     os_name: &str,
     commands_total: usize,
@@ -723,6 +724,7 @@ pub fn chat_requires_interactive_terminal() -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn chat_welcome(
     session_id: &str,
     session_file: &Path,
@@ -742,7 +744,7 @@ pub fn chat_welcome(
     let max_limit_fmt = human_count_u128(max_limit as u128);
     let skills_count_fmt = human_count_u128(skills_count as u128);
     let tool_flags = format!(
-        "tool={}, tool_ok={}, tool_err={}, tool_timeout={}, tips={}, stream_output={}, output_multilines={}, cmd_run_timout={}s",
+        "tool={}, tool_ok={}, tool_err={}, tool_timeout={}, tips={}, stream_output={}, output_multilines={}, cmd_run_timout={}s, max_tool_rounds={}, max_total_tool_calls={}",
         chat_cfg.show_tool,
         chat_cfg.show_tool_ok,
         chat_cfg.show_tool_err,
@@ -750,7 +752,9 @@ pub fn chat_welcome(
         chat_cfg.show_tips,
         chat_cfg.stream_output,
         chat_cfg.output_multilines,
-        chat_cfg.cmd_run_timout
+        chat_cfg.cmd_run_timout,
+        human_count_u128(chat_cfg.max_tool_rounds as u128),
+        human_count_u128(chat_cfg.max_total_tool_calls as u128),
     );
     match current_language() {
         Language::ZhCn => format!(
@@ -1987,6 +1991,22 @@ fn localize_detail(detail: &str) -> String {
             Language::Fr => "ai.chat.cmd-run-timout doit être supérieur à 0".to_string(),
             Language::De => "ai.chat.cmd-run-timout muss größer als 0 sein".to_string(),
             Language::Ja => "ai.chat.cmd-run-timout は 0 より大きい必要があります".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "ai.chat.max-tool-rounds must be greater than 0" => match current_language() {
+            Language::ZhCn => "ai.chat.max-tool-rounds 必须大于 0".to_string(),
+            Language::ZhTw => "ai.chat.max-tool-rounds 必須大於 0".to_string(),
+            Language::Fr => "ai.chat.max-tool-rounds doit être supérieur à 0".to_string(),
+            Language::De => "ai.chat.max-tool-rounds muss größer als 0 sein".to_string(),
+            Language::Ja => "ai.chat.max-tool-rounds は 0 より大きい必要があります".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "ai.chat.max-total-tool-calls must be greater than 0" => match current_language() {
+            Language::ZhCn => "ai.chat.max-total-tool-calls 必须大于 0".to_string(),
+            Language::ZhTw => "ai.chat.max-total-tool-calls 必須大於 0".to_string(),
+            Language::Fr => "ai.chat.max-total-tool-calls doit être supérieur à 0".to_string(),
+            Language::De => "ai.chat.max-total-tool-calls muss größer als 0 sein".to_string(),
+            Language::Ja => "ai.chat.max-total-tool-calls は 0 より大きい必要があります".to_string(),
             Language::En => detail.to_string(),
         },
         "session.recent_messages must be greater than 0" => match current_language() {

@@ -487,6 +487,8 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             &system_prompt,
             &message,
             policy,
+            services.cfg.ai.chat.max_tool_rounds,
+            services.cfg.ai.chat.max_total_tool_calls,
             &external_mcp_tools,
             |tool_call| {
                 execute_tool_call(
