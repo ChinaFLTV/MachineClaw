@@ -256,6 +256,7 @@ fn is_required_key(key: &str) -> bool {
 pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
     match key {
         "app.env-mode" => Some("\"prod\""),
+        "ai.connectivity-check" => Some("true"),
         "ai.retry.max-retries" => Some("2"),
         "ai.retry.backoff-millis" => Some("1500"),
         "ai.chat.show-tool" => Some("false"),
@@ -311,6 +312,7 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
         "ai.base-url",
         "ai.token",
         "ai.model",
+        "ai.connectivity-check",
         "ai.retry.max-retries",
         "ai.retry.backoff-millis",
         "ai.chat.show-tool",

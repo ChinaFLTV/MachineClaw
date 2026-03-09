@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    error::Error as StdError,
     thread,
     time::{Duration, Instant},
 };
@@ -193,6 +194,7 @@ struct AssistantMessage {
 impl AiClient {
     pub fn new(cfg: &AiConfig) -> Result<Self, AppError> {
         let client = Client::builder()
+            .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(60))
             .build()
             .map_err(|err| AppError::Ai(format!("failed to build AI http client: {err}")))?;
@@ -582,7 +584,7 @@ impl AiClient {
                     return Err(AppError::Ai(err_msg));
                 }
                 Err(err) => {
-                    let err_msg = format!("AI request failed: {err}");
+                    let err_msg = format!("AI request failed: {}", format_reqwest_error(&err));
                     logging::warn(&err_msg);
                     if attempt <= self.max_retries {
                         thread::sleep(Duration::from_millis(self.backoff_millis));
@@ -642,6 +644,52 @@ impl AiClient {
             tool_rounds_used,
             total_tool_calls,
         })
+    }
+}
+
+fn format_reqwest_error(err: &reqwest::Error) -> String {
+    let category = if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connect"
+    } else if err.is_decode() {
+        "decode"
+    } else if err.is_status() {
+        "status"
+    } else if err.is_request() {
+        "request"
+    } else {
+        "unknown"
+    };
+
+    let mut causes = Vec::<String>::new();
+    let mut source = err.source();
+    while let Some(item) = source {
+        let text = item.to_string();
+        if !text.trim().is_empty() {
+            causes.push(text);
+        }
+        if causes.len() >= 4 {
+            break;
+        }
+        source = item.source();
+    }
+
+    let hint = if err.is_timeout() {
+        "hint=检查网络连通性/代理与防火墙策略，或适当增大重试与超时"
+    } else if err.is_connect() {
+        "hint=检查 ai.base-url、DNS 解析、证书链和出口网络策略"
+    } else {
+        "hint=检查 AI 服务可用性与配置项是否正确"
+    };
+
+    if causes.is_empty() {
+        format!("kind={category}, error={err}, {hint}")
+    } else {
+        format!(
+            "kind={category}, error={err}, causes={}, {hint}",
+            causes.join(" | ")
+        )
     }
 }
 

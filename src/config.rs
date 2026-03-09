@@ -20,6 +20,7 @@ const DEFAULT_SKILLS_ENABLED: bool = false;
 const DEFAULT_CONSOLE_COLORFUL: bool = true;
 const DEFAULT_AI_MAX_RETRIES: u32 = 2;
 const DEFAULT_AI_BACKOFF_MILLIS: u64 = 1500;
+const DEFAULT_AI_CONNECTIVITY_CHECK: bool = true;
 const DEFAULT_AI_INPUT_PRICE_PER_MILLION: f64 = 0.0;
 const DEFAULT_AI_OUTPUT_PRICE_PER_MILLION: f64 = 0.0;
 const DEFAULT_CHAT_SHOW_TOOL: bool = false;
@@ -90,6 +91,11 @@ pub struct AiConfig {
     pub base_url: String,
     pub token: String,
     pub model: String,
+    #[serde(
+        rename = "connectivity-check",
+        default = "default_ai_connectivity_check"
+    )]
+    pub connectivity_check: bool,
     #[serde(default)]
     pub retry: RetryConfig,
     #[serde(default)]
@@ -438,6 +444,7 @@ env-mode = "prod" # optional: prod, test, dev
 base-url = "https://api.deepseek.com/v1" # required
 token = "sk-xxxx" # required
 model = "deepseek-chat" # required
+connectivity-check = true # optional, default true (chat startup)
 input-price-per-million = 0 # optional
 output-price-per-million = 0 # optional
 
@@ -810,6 +817,10 @@ fn default_ai_max_retries() -> u32 {
 
 fn default_ai_backoff_millis() -> u64 {
     DEFAULT_AI_BACKOFF_MILLIS
+}
+
+fn default_ai_connectivity_check() -> bool {
+    DEFAULT_AI_CONNECTIVITY_CHECK
 }
 
 fn default_ai_input_price_per_million() -> f64 {

@@ -330,6 +330,84 @@ pub fn prefix_info() -> &'static str {
     }
 }
 
+pub fn preflight_notice_start() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "正在执行启动前检查...",
+        Language::ZhTw => "正在執行啟動前檢查...",
+        Language::Fr => "Vérifications préalables au démarrage en cours...",
+        Language::De => "Vorabprüfungen beim Start werden ausgeführt...",
+        Language::Ja => "起動前チェックを実行中です...",
+        Language::En => "Running startup preflight checks...",
+    }
+}
+
+pub fn preflight_notice_config_check() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "校验配置完整性...",
+        Language::ZhTw => "校驗配置完整性...",
+        Language::Fr => "Validation de l'intégrité de la configuration...",
+        Language::De => "Konfigurationsintegrität wird geprüft...",
+        Language::Ja => "設定の整合性を検証中...",
+        Language::En => "Validating configuration integrity...",
+    }
+}
+
+pub fn preflight_notice_permission_check() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "校验运行权限...",
+        Language::ZhTw => "校驗執行權限...",
+        Language::Fr => "Vérification des permissions d'exécution...",
+        Language::De => "Ausführungsberechtigungen werden geprüft...",
+        Language::Ja => "実行権限を確認中...",
+        Language::En => "Checking runtime permissions...",
+    }
+}
+
+pub fn preflight_notice_ai_check() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "校验 AI 连通性（网络不稳定时可能需要更久）...",
+        Language::ZhTw => "校驗 AI 連通性（網路不穩時可能較久）...",
+        Language::Fr => {
+            "Vérification de la connectivité IA (peut prendre plus de temps si le réseau est instable)..."
+        }
+        Language::De => {
+            "KI-Konnektivität wird geprüft (bei instabilem Netzwerk kann es länger dauern)..."
+        }
+        Language::Ja => {
+            "AI 接続性を確認中です（ネットワークが不安定な場合は時間がかかることがあります）..."
+        }
+        Language::En => "Checking AI connectivity (may take longer on unstable networks)...",
+    }
+}
+
+pub fn preflight_notice_ai_check_skipped() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "已按配置跳过 AI 连通性检测（ai.connectivity-check=false）",
+        Language::ZhTw => "已依配置略過 AI 連通性檢測（ai.connectivity-check=false）",
+        Language::Fr => {
+            "Vérification de connectivité IA ignorée par configuration (ai.connectivity-check=false)"
+        }
+        Language::De => {
+            "KI-Konnektivitätsprüfung per Konfiguration übersprungen (ai.connectivity-check=false)"
+        }
+        Language::Ja => {
+            "設定により AI 接続性チェックをスキップしました（ai.connectivity-check=false）"
+        }
+        Language::En => "AI connectivity check skipped by config (ai.connectivity-check=false)",
+    }
+}
+
+pub fn preflight_notice_done(elapsed: &str) -> String {
+    match current_language() {
+        Language::ZhCn => format!("启动前检查完成，耗时 {elapsed}"),
+        Language::ZhTw => format!("啟動前檢查完成，耗時 {elapsed}"),
+        Language::Fr => format!("Pré-vérification terminée, durée {elapsed}"),
+        Language::De => format!("Vorabprüfung abgeschlossen, Dauer {elapsed}"),
+        Language::Ja => format!("起動前チェック完了、所要時間 {elapsed}"),
+        Language::En => format!("Startup preflight completed in {elapsed}"),
+    }
+}
+
 pub fn output_label_action() -> &'static str {
     match current_language() {
         Language::ZhCn => "动作",

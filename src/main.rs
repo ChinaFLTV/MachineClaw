@@ -16,9 +16,19 @@ mod skills;
 mod snapshot;
 mod test_action;
 
-use std::path::Path;
+use std::{
+    io::{self, IsTerminal, Write},
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use clap::Parser;
+use clap::error::ErrorKind;
 
 use crate::{
     actions::ActionServices,
@@ -70,7 +80,16 @@ fn run() -> Result<ExitCode, AppError> {
         return Ok(ExitCode::Success);
     }
 
-    let cli = Cli::try_parse().map_err(|err| AppError::Runtime(err.to_string()))?;
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => match err.kind() {
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                print!("{err}");
+                return Ok(ExitCode::Success);
+            }
+            _ => return Err(AppError::Runtime(err.to_string())),
+        },
+    };
     if cli.show_config_template {
         println!(
             "{}",
@@ -180,7 +199,9 @@ fn run() -> Result<ExitCode, AppError> {
     }
 
     let ai_client = AiClient::new(&cfg.ai)?;
-    run_preflight_checks(&cfg, &ai_client)?;
+    let run_ai_connectivity_check =
+        !matches!(&command, Commands::Chat) || cfg.ai.connectivity_check;
+    run_preflight_checks(&cfg, &ai_client, run_ai_connectivity_check)?;
 
     let skills_dir = expand_tilde(&cfg.skills.dir);
     let skill_list = if cfg.skills.enabled {
@@ -249,11 +270,106 @@ fn run() -> Result<ExitCode, AppError> {
     Ok(outcome.exit_code)
 }
 
-fn run_preflight_checks(cfg: &config::AppConfig, ai_client: &AiClient) -> Result<(), AppError> {
+fn run_preflight_checks(
+    cfg: &config::AppConfig,
+    ai_client: &AiClient,
+    run_ai_connectivity_check: bool,
+) -> Result<(), AppError> {
     logging::info("preflight start");
+    let started = Instant::now();
+    println!(
+        "{}: {}",
+        i18n::prefix_info(),
+        i18n::preflight_notice_start()
+    );
+    println!(
+        "{}: {}",
+        i18n::prefix_info(),
+        i18n::preflight_notice_config_check()
+    );
     validate_config(cfg)?;
+    println!(
+        "{}: {}",
+        i18n::prefix_info(),
+        i18n::preflight_notice_permission_check()
+    );
     require_elevated_permissions()?;
-    ai_client.validate_connectivity()?;
+    if run_ai_connectivity_check {
+        let mut ai_spinner = PreflightSpinner::start(
+            i18n::preflight_notice_ai_check().to_string(),
+            cfg.console.colorful,
+        );
+        let ai_result = ai_client.validate_connectivity();
+        ai_spinner.stop();
+        ai_result?;
+    } else {
+        println!(
+            "{}: {}",
+            i18n::prefix_info(),
+            i18n::preflight_notice_ai_check_skipped()
+        );
+    }
+    println!(
+        "{}: {}",
+        i18n::prefix_info(),
+        i18n::preflight_notice_done(&i18n::human_duration_ms(started.elapsed().as_millis()))
+    );
     logging::info("preflight finished");
     Ok(())
+}
+
+struct PreflightSpinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl PreflightSpinner {
+    fn start(message: String, colorful: bool) -> Self {
+        if !io::stdout().is_terminal() {
+            println!("{}: {}", i18n::prefix_info(), message);
+            return Self {
+                stop: Arc::new(AtomicBool::new(true)),
+                handle: None,
+            };
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_cloned = stop.clone();
+        let handle = thread::spawn(move || {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut idx = 0usize;
+            while !stop_cloned.load(Ordering::SeqCst) {
+                let text = format!("{message} {}", frames[idx % frames.len()]);
+                print!("\r{}", render::render_chat_notice(&text, colorful));
+                let _ = io::stdout().flush();
+                idx = idx.wrapping_add(1);
+                thread::sleep(Duration::from_millis(100));
+            }
+            clear_preflight_line();
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for PreflightSpinner {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn clear_preflight_line() {
+    if !io::stdout().is_terminal() {
+        return;
+    }
+    print!("\r{: <180}\r", "");
+    let _ = io::stdout().flush();
 }
