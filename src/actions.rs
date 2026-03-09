@@ -269,7 +269,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             }
             String::from_utf8_lossy(&input).trim().to_string()
         };
-        let message = normalize_chat_message(&message_raw);
+        let message = normalize_builtin_command_alias(normalize_chat_message(&message_raw));
         if message.is_empty() {
             continue;
         }
@@ -277,148 +277,146 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             continue;
         }
 
-        if message.eq_ignore_ascii_case("/exit") || message.eq_ignore_ascii_case("/quit") {
-            break;
-        }
-        if message.eq_ignore_ascii_case("/help") {
-            println!(
-                "{}",
-                render::render_markdown_for_terminal(
-                    i18n::chat_help_text(),
-                    services.cfg.console.colorful
-                )
-            );
-            continue;
-        }
-        if message.eq_ignore_ascii_case("/stats") {
-            println!(
-                "{}",
-                render::render_markdown_for_terminal(
-                    &i18n::chat_stats(
-                        services.session.session_id(),
-                        services.session.file_path(),
-                        services.session.message_count(),
-                        services.session.summary_len(),
-                        services.cfg.session.recent_messages,
-                        services.cfg.session.max_messages,
-                        chat_turns,
-                        services.os_name,
-                        &services.cfg.ai.model,
-                        services.skills.len(),
-                        services.mcp_summary.as_str(),
-                        services.session.count_by_role("user"),
-                        services.session.count_by_role("assistant"),
-                        services.session.count_by_role("tool"),
-                        services.session.count_by_role("system")
-                    ),
-                    services.cfg.console.colorful
-                )
-            );
-            continue;
-        }
-        if message.eq_ignore_ascii_case("/list") {
-            let sessions = services.session.list_sessions()?;
-            let markdown = format_chat_session_list_markdown(&sessions);
-            println!(
-                "{}",
-                render::render_markdown_for_terminal(&markdown, services.cfg.console.colorful)
-            );
-            continue;
-        }
-        if let Some(change_query) = parse_chat_command_arg(&message, "/change") {
-            if change_query.is_empty() {
-                println!(
-                    "{}",
-                    render::render_chat_notice(
-                        i18n::chat_change_usage(),
-                        services.cfg.console.colorful
-                    )
-                );
-                continue;
-            }
-            match services.session.switch_session_by_query(change_query) {
-                Ok(switched) => {
+        if let Some(command) = parse_builtin_command(&message) {
+            match command.name.as_str() {
+                "exit" | "quit" => break,
+                "help" if command.arg.is_empty() => {
+                    println!(
+                        "{}",
+                        render::render_markdown_for_terminal(
+                            i18n::chat_help_text(),
+                            services.cfg.console.colorful
+                        )
+                    );
+                }
+                "stats" if command.arg.is_empty() => {
+                    println!(
+                        "{}",
+                        render::render_markdown_for_terminal(
+                            &i18n::chat_stats(
+                                services.session.session_id(),
+                                services.session.file_path(),
+                                services.session.message_count(),
+                                services.session.summary_len(),
+                                services.cfg.session.recent_messages,
+                                services.cfg.session.max_messages,
+                                chat_turns,
+                                services.os_name,
+                                &services.cfg.ai.model,
+                                services.skills.len(),
+                                services.mcp_summary.as_str(),
+                                services.session.count_by_role("user"),
+                                services.session.count_by_role("assistant"),
+                                services.session.count_by_role("tool"),
+                                services.session.count_by_role("system")
+                            ),
+                            services.cfg.console.colorful
+                        )
+                    );
+                }
+                "list" if command.arg.is_empty() => {
+                    let sessions = services.session.list_sessions()?;
+                    let markdown = format_chat_session_list_markdown(&sessions);
+                    println!(
+                        "{}",
+                        render::render_markdown_for_terminal(
+                            &markdown,
+                            services.cfg.console.colorful
+                        )
+                    );
+                }
+                "change" => {
+                    if command.arg.is_empty() {
+                        println!(
+                            "{}",
+                            render::render_chat_notice(
+                                i18n::chat_change_usage(),
+                                services.cfg.console.colorful
+                            )
+                        );
+                        continue;
+                    }
+                    match services.session.switch_session_by_query(&command.arg) {
+                        Ok(switched) => {
+                            pending_message = None;
+                            last_assistant_reply.clear();
+                            maybe_ensure_chat_environment_profile(services, &system_prompt)?;
+                            println!(
+                                "{}",
+                                render::render_markdown_for_terminal(
+                                    &i18n::chat_session_changed(
+                                        &switched.session_name,
+                                        &switched.session_id,
+                                        &switched.file_path
+                                    ),
+                                    services.cfg.console.colorful
+                                )
+                            );
+                        }
+                        Err(err) => {
+                            println!(
+                                "{}",
+                                render::render_chat_notice(
+                                    &i18n::localize_error(&err),
+                                    services.cfg.console.colorful
+                                )
+                            );
+                        }
+                    }
+                }
+                "name" => {
+                    if command.arg.is_empty() {
+                        println!(
+                            "{}",
+                            render::render_chat_notice(
+                                i18n::chat_name_usage(),
+                                services.cfg.console.colorful
+                            )
+                        );
+                        continue;
+                    }
+                    services.session.rename_current_session(&command.arg)?;
+                    println!(
+                        "{}",
+                        render::render_markdown_for_terminal(
+                            &i18n::chat_session_renamed(
+                                services.session.session_name(),
+                                services.session.session_id()
+                            ),
+                            services.cfg.console.colorful
+                        )
+                    );
+                }
+                "new" if command.arg.is_empty() => {
+                    services.session.start_new_session_with_new_file()?;
                     pending_message = None;
                     last_assistant_reply.clear();
                     maybe_ensure_chat_environment_profile(services, &system_prompt)?;
                     println!(
                         "{}",
                         render::render_markdown_for_terminal(
-                            &i18n::chat_session_changed(
-                                &switched.session_name,
-                                &switched.session_id,
-                                &switched.file_path
+                            &i18n::chat_session_switched(
+                                services.session.session_id(),
+                                services.session.file_path()
                             ),
                             services.cfg.console.colorful
                         )
                     );
                 }
-                Err(err) => {
+                "clear" if command.arg.is_empty() => {
+                    clear_terminal()?;
+                    render_chat_window_header(services, true);
+                }
+                other => {
                     println!(
                         "{}",
                         render::render_chat_notice(
-                            &i18n::localize_error(&err),
-                            services.cfg.console.colorful
+                            &i18n::chat_unknown_builtin_command(other),
+                            services.cfg.console.colorful,
                         )
                     );
                 }
             }
-            continue;
-        }
-        if let Some(new_name) = parse_chat_command_arg(&message, "/name") {
-            if new_name.is_empty() {
-                println!(
-                    "{}",
-                    render::render_chat_notice(
-                        i18n::chat_name_usage(),
-                        services.cfg.console.colorful
-                    )
-                );
-                continue;
-            }
-            services.session.rename_current_session(new_name)?;
-            println!(
-                "{}",
-                render::render_markdown_for_terminal(
-                    &i18n::chat_session_renamed(
-                        services.session.session_name(),
-                        services.session.session_id()
-                    ),
-                    services.cfg.console.colorful
-                )
-            );
-            continue;
-        }
-        if message.eq_ignore_ascii_case("/new") {
-            services.session.start_new_session_with_new_file()?;
-            pending_message = None;
-            last_assistant_reply.clear();
-            maybe_ensure_chat_environment_profile(services, &system_prompt)?;
-            println!(
-                "{}",
-                render::render_markdown_for_terminal(
-                    &i18n::chat_session_switched(
-                        services.session.session_id(),
-                        services.session.file_path()
-                    ),
-                    services.cfg.console.colorful
-                )
-            );
-            continue;
-        }
-        if message.eq_ignore_ascii_case("/clear") {
-            clear_terminal()?;
-            render_chat_window_header(services, true);
-            continue;
-        }
-        if let Some(unknown_cmd) = detect_unknown_builtin_command(&message) {
-            println!(
-                "{}",
-                render::render_chat_notice(
-                    &i18n::chat_unknown_builtin_command(&unknown_cmd),
-                    services.cfg.console.colorful,
-                )
-            );
             continue;
         }
 
@@ -1273,49 +1271,12 @@ fn extract_skill_name_with_prefix(command: &str, prefix: &str) -> Option<String>
     Some(skill_name)
 }
 
-fn parse_chat_command_arg<'a>(message: &'a str, command: &str) -> Option<&'a str> {
-    let message_trimmed = message.trim();
-    if message_trimmed.len() < command.len() {
-        return None;
-    }
-    let head = message_trimmed.get(..command.len())?;
-    if !head.eq_ignore_ascii_case(command) {
-        return None;
-    }
-    let tail = message_trimmed.get(command.len()..)?;
-    if !tail.is_empty()
-        && !tail
-            .chars()
-            .next()
-            .map(|ch| ch.is_whitespace())
-            .unwrap_or(false)
-    {
-        return None;
-    }
-    let rest = tail.trim();
-    Some(rest)
+struct BuiltinCommand {
+    name: String,
+    arg: String,
 }
 
-fn normalize_chat_message(raw: &str) -> String {
-    let mut normalized = raw
-        .trim()
-        .chars()
-        .filter(|ch| {
-            !matches!(
-                ch,
-                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}'
-            )
-        })
-        .collect::<String>();
-    if let Some(first) = normalized.chars().next()
-        && matches!(first, '／' | '⁄' | '∕' | '⧸' | '╱')
-    {
-        normalized.replace_range(0..first.len_utf8(), "/");
-    }
-    normalized.trim().to_string()
-}
-
-fn detect_unknown_builtin_command(message: &str) -> Option<String> {
+fn parse_builtin_command(message: &str) -> Option<BuiltinCommand> {
     let trimmed = message.trim();
     if !trimmed.starts_with('/') {
         return None;
@@ -1326,22 +1287,112 @@ fn detect_unknown_builtin_command(message: &str) -> Option<String> {
             end = idx + ch.len_utf8();
             continue;
         }
-        if ch.is_whitespace() {
-            break;
-        }
-        return None;
+        break;
     }
     if end <= 1 {
         return None;
     }
-    let command_name = trimmed[1..end].to_ascii_lowercase();
+    let name = trimmed.get(1..end)?.to_ascii_lowercase();
     let known = [
         "help", "stats", "list", "change", "name", "new", "clear", "exit", "quit",
     ];
-    if known.contains(&command_name.as_str()) {
+    if !known.contains(&name.as_str()) {
         return None;
     }
-    Some(command_name)
+    let suffix = trimmed.get(end..)?.trim_start();
+    if suffix.starts_with('/') {
+        return None;
+    }
+    Some(BuiltinCommand {
+        name,
+        arg: suffix.to_string(),
+    })
+}
+
+fn normalize_chat_message(raw: &str) -> String {
+    let stripped = strip_terminal_control_sequences(raw);
+    let mut normalized = stripped
+        .trim()
+        .chars()
+        .filter(|ch| {
+            !matches!(
+                ch,
+                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}'
+            ) && !ch.is_control()
+        })
+        .collect::<String>();
+    if let Some(first) = normalized.chars().next()
+        && matches!(first, '／' | '⁄' | '∕' | '⧸' | '╱')
+    {
+        normalized.replace_range(0..first.len_utf8(), "/");
+    }
+    normalized.trim().to_string()
+}
+
+fn normalize_builtin_command_alias(message: String) -> String {
+    let prompt = i18n::chat_prompt_user().trim();
+    let mut trimmed = message.trim();
+    if let Some(rest) = trimmed.strip_prefix(prompt) {
+        trimmed = rest.trim_start();
+    }
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        return trimmed.to_string();
+    }
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or_default();
+    let rest = parts.next().unwrap_or_default().trim();
+    let first_lower = first.to_ascii_lowercase();
+    let alias_noarg = ["help", "stats", "list", "new", "clear", "exit", "quit"];
+    if alias_noarg.contains(&first_lower.as_str()) && rest.is_empty() {
+        return format!("/{first_lower}");
+    }
+    if (first_lower == "change" || first_lower == "name") && !rest.is_empty() {
+        return format!("/{first_lower} {rest}");
+    }
+    trimmed.to_string()
+}
+
+fn strip_terminal_control_sequences(input: &str) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Normal,
+        Esc,
+        Csi,
+        Osc,
+    }
+    let mut state = State::Normal;
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match state {
+            State::Normal => {
+                if ch == '\u{1B}' {
+                    state = State::Esc;
+                } else {
+                    out.push(ch);
+                }
+            }
+            State::Esc => {
+                if ch == '[' {
+                    state = State::Csi;
+                } else if ch == ']' {
+                    state = State::Osc;
+                } else {
+                    state = State::Normal;
+                }
+            }
+            State::Csi => {
+                if ('\u{40}'..='\u{7E}').contains(&ch) {
+                    state = State::Normal;
+                }
+            }
+            State::Osc => {
+                if ch == '\u{07}' {
+                    state = State::Normal;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn format_chat_session_list_markdown(sessions: &[crate::context::SessionOverview]) -> String {
