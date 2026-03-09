@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     error::Error as StdError,
+    io::{BufRead, BufReader, Read},
     thread,
     time::{Duration, Instant},
 };
@@ -70,8 +71,22 @@ pub struct ChatRoundEvent {
     pub round: usize,
     pub content: String,
     pub thinking: Option<String>,
+    pub streamed_content: bool,
+    pub streamed_thinking: bool,
     pub has_tool_calls: bool,
     pub tool_call_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatStreamEventKind {
+    Content,
+    Thinking,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatStreamEvent {
+    pub kind: ChatStreamEventKind,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -110,7 +125,7 @@ enum ToolChoiceMode {
     Disabled,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ChatCompletionRequest {
     model: String,
     messages: Vec<ApiMessage>,
@@ -119,6 +134,8 @@ struct ChatCompletionRequest {
     tools: Option<Vec<ApiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -167,6 +184,14 @@ struct ChatCompletionResponse {
     usage: Usage,
 }
 
+#[derive(Debug, Deserialize)]
+struct ChatCompletionStreamResponse {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Usage,
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct Usage {
     #[serde(default)]
@@ -183,6 +208,12 @@ struct Choice {
 }
 
 #[derive(Debug, Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: AssistantDeltaMessage,
+}
+
+#[derive(Debug, Deserialize)]
 struct AssistantMessage {
     content: Option<serde_json::Value>,
     #[serde(default)]
@@ -191,6 +222,38 @@ struct AssistantMessage {
     reasoning: Option<serde_json::Value>,
     #[serde(default)]
     tool_calls: Vec<ApiToolCall>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AssistantDeltaMessage {
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_calls: Vec<StreamToolCallDelta>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct StreamToolCallDelta {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "type")]
+    r#type: Option<String>,
+    #[serde(default)]
+    function: Option<StreamToolFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct StreamToolFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 impl AiClient {
@@ -237,6 +300,7 @@ impl AiClient {
             temperature: 0.2,
             tools: None,
             tool_choice: None,
+            stream: None,
         })?;
         let assistant = call.assistant;
 
@@ -248,7 +312,7 @@ impl AiClient {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn chat_with_shell_tool<F>(
+    pub fn chat_with_shell_tool<F, G>(
         &self,
         history: &[ChatMessage],
         system_prompt: &str,
@@ -256,12 +320,15 @@ impl AiClient {
         policy: ToolUsePolicy,
         max_tool_rounds: usize,
         max_total_tool_calls: usize,
+        stream_output: bool,
         extra_tools: &[ExternalToolDefinition],
         mut execute_tool: F,
         mut on_round_event: impl FnMut(ChatRoundEvent),
+        mut on_stream_event: G,
     ) -> Result<ChatToolResponse, AppError>
     where
         F: FnMut(&ToolCallRequest) -> String,
+        G: FnMut(ChatStreamEvent),
     {
         const MAX_REPEAT_SAME_TOOL: usize = 3;
         const MAX_TIMEOUT_TOOL_CALLS_TOTAL: usize = 2;
@@ -306,13 +373,19 @@ impl AiClient {
                     }
                 },
             };
-            let call = match self.send_chat_completion(&ChatCompletionRequest {
+            let request = ChatCompletionRequest {
                 model: self.model.clone(),
                 messages: messages.clone(),
                 temperature: 0.2,
                 tools: Some(tools.clone()),
                 tool_choice,
-            }) {
+                stream: None,
+            };
+            let call = match self.send_chat_completion_with_optional_streaming(
+                &request,
+                stream_output,
+                &mut on_stream_event,
+            ) {
                 Ok(call) => call,
                 Err(err) => {
                     if is_tool_choice_unsupported_error(&err) {
@@ -375,6 +448,8 @@ impl AiClient {
                     } else {
                         Some(round_thinking)
                     },
+                    streamed_content: call.streamed_content,
+                    streamed_thinking: call.streamed_thinking,
                     has_tool_calls: !tool_calls.is_empty(),
                     tool_call_count: tool_calls.len(),
                 });
@@ -489,6 +564,8 @@ impl AiClient {
                             total_tool_calls,
                         },
                         finalize_reason,
+                        stream_output,
+                        &mut on_stream_event,
                     );
                 }
                 continue;
@@ -582,6 +659,25 @@ impl AiClient {
                 });
             }
 
+            if total_tool_calls > 0
+                || !thinking_chunks.is_empty()
+                || !visible_assistant_chunks.is_empty()
+            {
+                logging::warn(
+                    "assistant returned empty final content after tool-calling round; using recoverable fallback response",
+                );
+                return Ok(self.build_recoverable_chat_response(
+                    FinalizeWithoutToolsState {
+                        thinking_chunks,
+                        visible_assistant_chunks,
+                        metrics,
+                        tool_rounds_used,
+                        total_tool_calls,
+                    },
+                    None,
+                ));
+            }
+
             return Err(AppError::Ai("AI returned empty content".to_string()));
         }
 
@@ -595,6 +691,8 @@ impl AiClient {
                 total_tool_calls,
             },
             Some(ChatStopReason::MaxToolRoundsReached),
+            stream_output,
+            &mut on_stream_event,
         )
     }
 
@@ -640,6 +738,8 @@ impl AiClient {
                             assistant: choice.message,
                             usage: parsed.usage,
                             elapsed_ms: started.elapsed().as_millis(),
+                            streamed_content: false,
+                            streamed_thinking: false,
                         });
                     }
 
@@ -664,11 +764,116 @@ impl AiClient {
         }
     }
 
+    fn send_chat_completion_with_optional_streaming<G>(
+        &self,
+        body: &ChatCompletionRequest,
+        stream_output: bool,
+        on_stream_event: &mut G,
+    ) -> Result<ApiChatCallResult, AppError>
+    where
+        G: FnMut(ChatStreamEvent),
+    {
+        if !stream_output {
+            return self.send_chat_completion(body);
+        }
+
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            logging::info(&format!(
+                "AI streaming request started, attempt={attempt}"
+            ));
+            let started = Instant::now();
+            let mut stream_body = body.clone();
+            stream_body.stream = Some(true);
+            let resp = self
+                .client
+                .post(&self.base_url)
+                .bearer_auth(&self.token)
+                .json(&stream_body)
+                .send();
+
+            match resp {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let response_body = resp
+                            .text()
+                            .unwrap_or_else(|_| "<unreadable body>".to_string());
+                        let safe_body = mask_sensitive(&response_body);
+                        if should_fallback_to_non_streaming(status, &response_body) {
+                            logging::warn(&format!(
+                                "AI streaming unsupported, fallback to non-streaming, status={status}, body={safe_body}"
+                            ));
+                            return self.send_chat_completion(body);
+                        }
+                        let err_msg = format!("AI HTTP status={status}, body={safe_body}");
+                        logging::warn(&err_msg);
+                        if attempt <= self.max_retries && should_retry_status(status) {
+                            thread::sleep(Duration::from_millis(self.backoff_millis));
+                            continue;
+                        }
+                        return Err(AppError::Ai(err_msg));
+                    }
+
+                    match parse_streaming_chat_response(resp, on_stream_event) {
+                        Ok(parsed) => {
+                            logging::info("AI streaming request finished successfully");
+                            return Ok(ApiChatCallResult {
+                                assistant: parsed.assistant,
+                                usage: parsed.usage,
+                                elapsed_ms: started.elapsed().as_millis(),
+                                streamed_content: parsed.streamed_content,
+                                streamed_thinking: parsed.streamed_thinking,
+                            });
+                        }
+                        Err(StreamParseResult::FallbackJson(body_text)) => {
+                            logging::warn(
+                                "AI streaming response was not SSE; fallback to non-streaming JSON parsing",
+                            );
+                            let parsed = parse_chat_completion_response_text(&body_text)?;
+                            return Ok(ApiChatCallResult {
+                                assistant: parsed.message,
+                                usage: parsed.usage,
+                                elapsed_ms: started.elapsed().as_millis(),
+                                streamed_content: false,
+                                streamed_thinking: false,
+                            });
+                        }
+                        Err(StreamParseResult::Retryable(err_msg)) => {
+                            logging::warn(&err_msg);
+                            if attempt <= self.max_retries {
+                                thread::sleep(Duration::from_millis(self.backoff_millis));
+                                continue;
+                            }
+                            return Err(AppError::Ai(err_msg));
+                        }
+                        Err(StreamParseResult::Fatal(err_msg)) => {
+                            logging::warn(&err_msg);
+                            return Err(AppError::Ai(err_msg));
+                        }
+                    }
+                }
+                Err(err) => {
+                    let err_msg = format!("AI request failed: {}", format_reqwest_error(&err));
+                    logging::warn(&err_msg);
+                    if attempt <= self.max_retries {
+                        thread::sleep(Duration::from_millis(self.backoff_millis));
+                        continue;
+                    }
+                    return Err(AppError::Ai(err_msg));
+                }
+            }
+        }
+    }
+
     fn finalize_without_tools(
         &self,
         mut messages: Vec<ApiMessage>,
         mut state: FinalizeWithoutToolsState,
         stop_reason: Option<ChatStopReason>,
+        stream_output: bool,
+        on_stream_event: &mut impl FnMut(ChatStreamEvent),
     ) -> Result<ChatToolResponse, AppError> {
         messages.push(ApiMessage {
             role: "system".to_string(),
@@ -677,13 +882,16 @@ impl AiClient {
             tool_calls: None,
             tool_call_id: None,
         });
-        let call = self.send_chat_completion(&ChatCompletionRequest {
+        let request = ChatCompletionRequest {
             model: self.model.clone(),
             messages,
             temperature: 0.2,
             tools: None,
             tool_choice: None,
-        })?;
+            stream: None,
+        };
+        let call =
+            self.send_chat_completion_with_optional_streaming(&request, stream_output, on_stream_event)?;
         state.metrics.api_rounds += 1;
         state.metrics.api_duration_ms += call.elapsed_ms;
         state.metrics.prompt_tokens += call.usage.prompt_tokens;
@@ -699,44 +907,10 @@ impl AiClient {
         let archived_content =
             merge_visible_chunks(&state.visible_assistant_chunks, Some(&content));
         if content.trim().is_empty() {
-            if !archived_content.trim().is_empty() {
-                return Ok(ChatToolResponse {
-                    content: archived_content.clone(),
-                    archived_content,
-                    thinking: merge_thinking_chunks(state.thinking_chunks),
-                    metrics: with_cost(
-                        state.metrics,
-                        &self.model,
-                        self.input_price_per_million,
-                        self.output_price_per_million,
-                    ),
-                    stop_reason,
-                    tool_rounds_used: state.tool_rounds_used,
-                    total_tool_calls: state.total_tool_calls,
-                });
-            }
             logging::warn(
                 "AI returned empty content after tool-calling finalization; using local fallback response",
             );
-            let fallback = build_finalization_fallback(
-                stop_reason,
-                state.tool_rounds_used,
-                state.total_tool_calls,
-            );
-            return Ok(ChatToolResponse {
-                archived_content: fallback.clone(),
-                content: fallback,
-                thinking: merge_thinking_chunks(state.thinking_chunks),
-                metrics: with_cost(
-                    state.metrics,
-                    &self.model,
-                    self.input_price_per_million,
-                    self.output_price_per_million,
-                ),
-                stop_reason,
-                tool_rounds_used: state.tool_rounds_used,
-                total_tool_calls: state.total_tool_calls,
-            });
+            return Ok(self.build_recoverable_chat_response(state, stop_reason));
         }
         Ok(ChatToolResponse {
             archived_content,
@@ -752,6 +926,37 @@ impl AiClient {
             tool_rounds_used: state.tool_rounds_used,
             total_tool_calls: state.total_tool_calls,
         })
+    }
+
+    fn build_recoverable_chat_response(
+        &self,
+        state: FinalizeWithoutToolsState,
+        stop_reason: Option<ChatStopReason>,
+    ) -> ChatToolResponse {
+        let archived_content = merge_visible_chunks(&state.visible_assistant_chunks, None);
+        let content = if archived_content.trim().is_empty() {
+            build_finalization_fallback(stop_reason, state.tool_rounds_used, state.total_tool_calls)
+        } else {
+            archived_content.clone()
+        };
+        ChatToolResponse {
+            archived_content: if archived_content.trim().is_empty() {
+                content.clone()
+            } else {
+                archived_content
+            },
+            content,
+            thinking: merge_thinking_chunks(state.thinking_chunks),
+            metrics: with_cost(
+                state.metrics,
+                &self.model,
+                self.input_price_per_million,
+                self.output_price_per_million,
+            ),
+            stop_reason,
+            tool_rounds_used: state.tool_rounds_used,
+            total_tool_calls: state.total_tool_calls,
+        }
     }
 }
 
@@ -823,6 +1028,34 @@ struct ApiChatCallResult {
     assistant: AssistantMessage,
     usage: Usage,
     elapsed_ms: u128,
+    streamed_content: bool,
+    streamed_thinking: bool,
+}
+
+struct ParsedChatResponse {
+    message: AssistantMessage,
+    usage: Usage,
+}
+
+struct ParsedStreamingChatResponse {
+    assistant: AssistantMessage,
+    usage: Usage,
+    streamed_content: bool,
+    streamed_thinking: bool,
+}
+
+enum StreamParseResult {
+    FallbackJson(String),
+    Retryable(String),
+    Fatal(String),
+}
+
+#[derive(Debug, Default)]
+struct PartialToolCall {
+    id: String,
+    r#type: String,
+    name: String,
+    arguments: String,
 }
 
 struct FinalizeWithoutToolsState {
@@ -831,6 +1064,259 @@ struct FinalizeWithoutToolsState {
     metrics: ChatMetrics,
     tool_rounds_used: usize,
     total_tool_calls: usize,
+}
+
+fn parse_chat_completion_response_text(body: &str) -> Result<ParsedChatResponse, AppError> {
+    let parsed: ChatCompletionResponse = serde_json::from_str(body)
+        .map_err(|err| AppError::Ai(format!("failed to parse AI response: {err}")))?;
+    let Some(choice) = parsed.choices.into_iter().next() else {
+        return Err(AppError::Ai("AI returned empty choices".to_string()));
+    };
+    Ok(ParsedChatResponse {
+        message: choice.message,
+        usage: parsed.usage,
+    })
+}
+
+fn parse_streaming_chat_response<G>(
+    response: reqwest::blocking::Response,
+    on_stream_event: &mut G,
+) -> Result<ParsedStreamingChatResponse, StreamParseResult>
+where
+    G: FnMut(ChatStreamEvent),
+{
+    let mut reader = BufReader::new(response);
+    let mut line = String::new();
+    let mut buffered_body = String::new();
+    let mut saw_sse = false;
+    let mut usage = Usage::default();
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::<PartialToolCall>::new();
+    let mut streamed_content = false;
+    let mut streamed_thinking = false;
+
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).map_err(|err| {
+            if streamed_content || streamed_thinking {
+                StreamParseResult::Fatal(format!("failed to read AI streaming response: {err}"))
+            } else {
+                StreamParseResult::Retryable(format!(
+                    "failed to read AI streaming response: {err}"
+                ))
+            }
+        })?;
+        if read == 0 {
+            break;
+        }
+        let trimmed_line = line.trim_end_matches(['\r', '\n']);
+        let meaningful = trimmed_line.trim();
+        if meaningful.is_empty() || meaningful.starts_with(':') {
+            continue;
+        }
+        if !meaningful.starts_with("data:") {
+            if !saw_sse {
+                buffered_body.push_str(trimmed_line);
+                buffered_body.push('\n');
+                reader
+                    .read_to_string(&mut buffered_body)
+                    .map_err(|err| {
+                        StreamParseResult::Retryable(format!(
+                            "failed to read AI fallback body: {err}"
+                        ))
+                    })?;
+                return Err(StreamParseResult::FallbackJson(buffered_body));
+            }
+            continue;
+        }
+
+        saw_sse = true;
+        let payload = meaningful.trim_start_matches("data:").trim();
+        if payload == "[DONE]" {
+            break;
+        }
+        let parsed: ChatCompletionStreamResponse =
+            serde_json::from_str(payload).map_err(|err| {
+                if streamed_content || streamed_thinking {
+                    StreamParseResult::Fatal(format!(
+                        "failed to parse AI streaming chunk: {err}"
+                    ))
+                } else {
+                    StreamParseResult::Retryable(format!(
+                        "failed to parse AI streaming chunk: {err}"
+                    ))
+                }
+            })?;
+        usage = merge_usage(usage, parsed.usage);
+        for choice in parsed.choices {
+            let thinking_delta = assistant_delta_reasoning_text(&choice.delta);
+            let added_thinking = merge_text_delta(&mut reasoning, &thinking_delta);
+            if !added_thinking.is_empty() {
+                streamed_thinking = true;
+                on_stream_event(ChatStreamEvent {
+                    kind: ChatStreamEventKind::Thinking,
+                    text: added_thinking,
+                });
+            }
+
+            let content_delta = assistant_delta_content_text(&choice.delta);
+            let added_content = merge_text_delta(&mut content, &content_delta);
+            if !added_content.is_empty() {
+                streamed_content = true;
+                on_stream_event(ChatStreamEvent {
+                    kind: ChatStreamEventKind::Content,
+                    text: added_content,
+                });
+            }
+
+            for tool_call_delta in choice.delta.tool_calls {
+                merge_tool_call_delta(&mut tool_calls, &tool_call_delta);
+            }
+        }
+    }
+
+    if !saw_sse {
+        return Err(StreamParseResult::Retryable(
+            "AI streaming response was empty".to_string(),
+        ));
+    }
+
+    Ok(ParsedStreamingChatResponse {
+        assistant: AssistantMessage {
+            content: optional_json_text(content),
+            reasoning_content: optional_text(reasoning),
+            reasoning: None,
+            tool_calls: finalize_tool_calls(tool_calls),
+        },
+        usage,
+        streamed_content,
+        streamed_thinking,
+    })
+}
+
+fn assistant_delta_content_text(message: &AssistantDeltaMessage) -> String {
+    let Some(content) = message.content.as_ref() else {
+        return String::new();
+    };
+    extract_text_from_value(content).trim().to_string()
+}
+
+fn assistant_delta_reasoning_text(message: &AssistantDeltaMessage) -> String {
+    let assistant = AssistantMessage {
+        content: message.content.clone(),
+        reasoning_content: message.reasoning_content.clone(),
+        reasoning: message.reasoning.clone(),
+        tool_calls: Vec::new(),
+    };
+    assistant_reasoning_text(&assistant)
+}
+
+fn merge_text_delta(target: &mut String, incoming: &str) -> String {
+    if incoming.is_empty() {
+        return String::new();
+    }
+    if target.is_empty() {
+        target.push_str(incoming);
+        return incoming.to_string();
+    }
+    if incoming.starts_with(target.as_str()) {
+        let suffix = &incoming[target.len()..];
+        if !suffix.is_empty() {
+            target.push_str(suffix);
+        }
+        return suffix.to_string();
+    }
+    if target.ends_with(incoming) {
+        return String::new();
+    }
+    target.push_str(incoming);
+    incoming.to_string()
+}
+
+fn merge_tool_call_delta(tool_calls: &mut Vec<PartialToolCall>, delta: &StreamToolCallDelta) {
+    let index = delta.index.unwrap_or(tool_calls.len());
+    while tool_calls.len() <= index {
+        tool_calls.push(PartialToolCall::default());
+    }
+    let item = &mut tool_calls[index];
+    if let Some(id) = delta.id.as_deref()
+        && !id.is_empty()
+    {
+        item.id = id.to_string();
+    }
+    if let Some(tool_type) = delta.r#type.as_deref()
+        && !tool_type.is_empty()
+    {
+        item.r#type = tool_type.to_string();
+    }
+    if let Some(function) = delta.function.as_ref() {
+        if let Some(name) = function.name.as_deref() {
+            let _ = merge_text_delta(&mut item.name, name);
+        }
+        if let Some(arguments) = function.arguments.as_deref() {
+            let _ = merge_text_delta(&mut item.arguments, arguments);
+        }
+    }
+}
+
+fn finalize_tool_calls(tool_calls: Vec<PartialToolCall>) -> Vec<ApiToolCall> {
+    tool_calls
+        .into_iter()
+        .filter_map(|item| {
+            if item.id.trim().is_empty()
+                || item.name.trim().is_empty()
+                || item.arguments.trim().is_empty()
+            {
+                return None;
+            }
+            Some(ApiToolCall {
+                id: item.id,
+                r#type: if item.r#type.trim().is_empty() {
+                    "function".to_string()
+                } else {
+                    item.r#type
+                },
+                function: ApiToolFunction {
+                    name: item.name,
+                    arguments: item.arguments,
+                },
+            })
+        })
+        .collect()
+}
+
+fn optional_json_text(value: String) -> Option<serde_json::Value> {
+    optional_text(value).map(serde_json::Value::String)
+}
+
+fn optional_text(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        return None;
+    }
+    Some(value)
+}
+
+fn merge_usage(current: Usage, next: Usage) -> Usage {
+    Usage {
+        prompt_tokens: current.prompt_tokens.max(next.prompt_tokens),
+        completion_tokens: current.completion_tokens.max(next.completion_tokens),
+        total_tokens: current.total_tokens.max(next.total_tokens),
+    }
+}
+
+fn should_fallback_to_non_streaming(status: StatusCode, body: &str) -> bool {
+    if !status.is_client_error() {
+        return false;
+    }
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains("stream")
+        && (lowered.contains("unsupported")
+            || lowered.contains("not support")
+            || lowered.contains("not_supported")
+            || lowered.contains("unknown field")
+            || lowered.contains("invalid parameter")
+            || lowered.contains("unrecognized"))
 }
 
 fn assistant_content_text(message: &AssistantMessage) -> String {
@@ -1324,12 +1810,28 @@ fn build_chat_url(base_url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use reqwest::blocking::Client;
+    use reqwest::StatusCode;
     use serde_json::json;
 
     use super::{
-        ChatMetrics, builtin_model_prices, extract_text_from_value, merge_visible_chunks,
-        resolve_effective_model_prices, with_cost,
+        AiClient, ChatMetrics, ChatStopReason, FinalizeWithoutToolsState, builtin_model_prices,
+        extract_text_from_value, merge_text_delta, merge_visible_chunks,
+        resolve_effective_model_prices, should_fallback_to_non_streaming, with_cost,
     };
+
+    fn test_ai_client() -> AiClient {
+        AiClient {
+            client: Client::builder().build().expect("test client"),
+            base_url: "https://example.com/chat/completions".to_string(),
+            token: "token".to_string(),
+            model: "unknown-model".to_string(),
+            max_retries: 0,
+            backoff_millis: 0,
+            input_price_per_million: 0.0,
+            output_price_per_million: 0.0,
+        }
+    }
 
     #[test]
     fn extracts_nested_visible_text_blocks() {
@@ -1364,5 +1866,63 @@ mod tests {
     fn cost_is_unavailable_for_unknown_model_without_config() {
         let metrics = with_cost(ChatMetrics::default(), "unknown-model", 0.0, 0.0);
         assert_eq!(metrics.estimated_cost_usd, None);
+    }
+
+    #[test]
+    fn merges_stream_deltas_without_duplicate_suffixes() {
+        let mut target = String::new();
+        assert_eq!(merge_text_delta(&mut target, "Hello"), "Hello");
+        assert_eq!(merge_text_delta(&mut target, "Hello"), "");
+        assert_eq!(merge_text_delta(&mut target, "Hello world"), " world");
+        assert_eq!(target, "Hello world");
+    }
+
+    #[test]
+    fn falls_back_when_server_rejects_stream_parameter() {
+        assert!(should_fallback_to_non_streaming(
+            StatusCode::BAD_REQUEST,
+            "{\"error\":{\"message\":\"stream is unsupported\"}}"
+        ));
+        assert!(!should_fallback_to_non_streaming(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stream is unsupported"
+        ));
+    }
+
+    #[test]
+    fn recoverable_chat_response_prefers_archived_visible_content() {
+        let client = test_ai_client();
+        let response = client.build_recoverable_chat_response(
+            FinalizeWithoutToolsState {
+                thinking_chunks: vec!["thought".to_string()],
+                visible_assistant_chunks: vec!["alpha".to_string(), "beta".to_string()],
+                metrics: ChatMetrics::default(),
+                tool_rounds_used: 3,
+                total_tool_calls: 2,
+            },
+            None,
+        );
+        assert_eq!(response.content, "alpha\n\nbeta");
+        assert_eq!(response.archived_content, "alpha\n\nbeta");
+        assert_eq!(response.thinking.as_deref(), Some("thought"));
+    }
+
+    #[test]
+    fn recoverable_chat_response_uses_fallback_when_no_visible_content_exists() {
+        let client = test_ai_client();
+        let response = client.build_recoverable_chat_response(
+            FinalizeWithoutToolsState {
+                thinking_chunks: vec!["thought".to_string()],
+                visible_assistant_chunks: Vec::new(),
+                metrics: ChatMetrics::default(),
+                tool_rounds_used: 5,
+                total_tool_calls: 7,
+            },
+            Some(ChatStopReason::MaxToolRoundsReached),
+        );
+        assert!(response.content.contains("AI 在收尾阶段未返回可展示文本"));
+        assert!(response.content.contains("reason=max_tool_rounds_reached"));
+        assert_eq!(response.archived_content, response.content);
+        assert_eq!(response.thinking.as_deref(), Some("thought"));
     }
 }

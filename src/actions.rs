@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
     io::{self, BufRead, IsTerminal, Write},
     path::Path,
@@ -18,7 +19,10 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    ai::{AiClient, ChatRoundEvent, ExternalToolDefinition, ToolCallRequest, ToolUsePolicy},
+    ai::{
+        AiClient, ChatRoundEvent, ChatStreamEvent, ChatStreamEventKind, ExternalToolDefinition,
+        ToolCallRequest, ToolUsePolicy,
+    },
     cli::InspectTarget,
     config::{AppConfig, expand_tilde},
     context::SessionStore,
@@ -469,9 +473,11 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         let mut printed_round_thinking = false;
         let mut last_round_thinking = String::new();
         let mut last_round_content = String::new();
-        let mut ai_wait_spinner =
-            ActivitySpinner::start(i18n::chat_progress_analyzing().to_string(), colorful);
-        let spinner_stop = ai_wait_spinner.stop_signal();
+        let stream_printer = RefCell::new(render::ChatStreamPrinter::new(colorful));
+        let ai_wait_spinner = RefCell::new(Some(ActivitySpinner::start(
+            i18n::chat_progress_analyzing().to_string(),
+            colorful,
+        )));
         let spinner_first_output = Arc::new(AtomicBool::new(false));
         let spinner_first_output_cloned = spinner_first_output.clone();
         let response = services.ai.chat_with_shell_tool(
@@ -481,6 +487,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             policy,
             services.cfg.ai.chat.max_tool_rounds,
             services.cfg.ai.chat.max_total_tool_calls,
+            stream_output,
             &external_mcp_tools,
             |tool_call| {
                 execute_tool_call(
@@ -493,11 +500,9 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                 )
             },
             |event: ChatRoundEvent| {
-                if !spinner_first_output_cloned.swap(true, Ordering::SeqCst) {
-                    spinner_stop.store(true, Ordering::SeqCst);
-                    clear_spinner_line();
-                }
+                stop_activity_spinner_once(&ai_wait_spinner, &spinner_first_output_cloned);
                 if show_tips && event.has_tool_calls {
+                    let _ = stream_printer.borrow_mut().finish();
                     println!(
                         "{}",
                         render::render_chat_notice(
@@ -511,29 +516,54 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                 {
                     printed_round_thinking = true;
                     last_round_thinking = thinking.trim().to_string();
-                    println!(
-                        "{}",
-                        render::render_chat_thinking(
-                            i18n::chat_prompt_thinking(),
-                            thinking,
-                            colorful
-                        )
-                    );
+                    if !event.streamed_thinking {
+                        let _ = stream_printer.borrow_mut().finish();
+                        println!(
+                            "{}",
+                            render::render_chat_thinking(
+                                i18n::chat_prompt_thinking(),
+                                thinking,
+                                colorful
+                            )
+                        );
+                    }
                 }
                 if !event.content.trim().is_empty() {
                     last_round_content = event.content.trim().to_string();
-                    println!(
-                        "{}",
-                        render::render_chat_assistant_reply(
-                            i18n::chat_prompt_assistant(),
-                            event.content.trim(),
-                            colorful
-                        )
-                    );
+                    if !event.streamed_content {
+                        let _ = stream_printer.borrow_mut().finish();
+                        println!(
+                            "{}",
+                            render::render_chat_assistant_reply(
+                                i18n::chat_prompt_assistant(),
+                                event.content.trim(),
+                                colorful
+                            )
+                        );
+                    }
                 }
             },
+            |event: ChatStreamEvent| {
+                stop_activity_spinner_once(&ai_wait_spinner, &spinner_first_output_cloned);
+                let result = match event.kind {
+                    ChatStreamEventKind::Content => stream_printer.borrow_mut().write(
+                        render::ChatStreamBlockKind::Assistant,
+                        i18n::chat_prompt_assistant(),
+                        &event.text,
+                    ),
+                    ChatStreamEventKind::Thinking => stream_printer.borrow_mut().write(
+                        render::ChatStreamBlockKind::Thinking,
+                        i18n::chat_prompt_thinking(),
+                        &event.text,
+                    ),
+                };
+                let _ = result;
+            },
         )?;
-        ai_wait_spinner.stop();
+        stream_printer.borrow_mut().finish()?;
+        if let Some(mut spinner) = ai_wait_spinner.into_inner() {
+            spinner.stop();
+        }
         logging::info("AI chat finished");
 
         if let Some(stop_reason) = response.stop_reason {
@@ -570,22 +600,14 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         let final_content_already_printed =
             !last_round_content.trim().is_empty() && last_round_content.trim() == final_content;
         if !final_content_already_printed {
-            if stream_output {
-                render::print_chat_assistant_reply_stream(
+            println!(
+                "{}",
+                render::render_chat_assistant_reply(
                     i18n::chat_prompt_assistant(),
                     final_content,
-                    colorful,
-                )?;
-            } else {
-                println!(
-                    "{}",
-                    render::render_chat_assistant_reply(
-                        i18n::chat_prompt_assistant(),
-                        final_content,
-                        colorful
-                    )
-                );
-            }
+                    colorful
+                )
+            );
         }
         if services.cfg.ai.chat.show_round_metrics && services.cfg.ai.chat.show_tips {
             println!(
@@ -1961,10 +1983,6 @@ impl ActivitySpinner {
         }
     }
 
-    fn stop_signal(&self) -> Arc<AtomicBool> {
-        self.stop.clone()
-    }
-
     fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
@@ -1985,6 +2003,20 @@ fn clear_spinner_line() {
     }
     print!("\r{: <160}\r", "");
     let _ = io::stdout().flush();
+}
+
+fn stop_activity_spinner_once(
+    spinner: &RefCell<Option<ActivitySpinner>>,
+    first_output: &Arc<AtomicBool>,
+) {
+    if first_output.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(mut active_spinner) = spinner.borrow_mut().take() {
+        active_spinner.stop();
+    } else {
+        clear_spinner_line();
+    }
 }
 
 fn compression_keep_recent_messages(max_history_messages: usize) -> usize {
