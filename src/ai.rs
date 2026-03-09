@@ -36,6 +36,30 @@ pub struct ChatToolResponse {
     pub content: String,
     pub thinking: Option<String>,
     pub metrics: ChatMetrics,
+    pub stop_reason: Option<ChatStopReason>,
+    pub tool_rounds_used: usize,
+    pub total_tool_calls: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatStopReason {
+    ToolCallLimitExceeded,
+    RepeatedSameToolCall,
+    RepeatedToolTimeout,
+    TooManyToolTimeouts,
+    MaxToolRoundsReached,
+}
+
+impl ChatStopReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            ChatStopReason::ToolCallLimitExceeded => "tool_call_limit_exceeded",
+            ChatStopReason::RepeatedSameToolCall => "repeated_same_tool_call",
+            ChatStopReason::RepeatedToolTimeout => "repeated_tool_timeout",
+            ChatStopReason::TooManyToolTimeouts => "too_many_tool_timeouts",
+            ChatStopReason::MaxToolRoundsReached => "max_tool_rounds_reached",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +275,7 @@ impl AiClient {
         let mut timeout_total: usize = 0;
         let mut thinking_chunks: Vec<String> = Vec::new();
         let mut metrics = ChatMetrics::default();
+        let mut tool_rounds_used: usize = 0;
         let mut forced_continue_hint_rounds: usize = 0;
         let mut tool_choice_mode = if model_prefers_omit_tool_choice(&self.model) {
             logging::info(
@@ -308,6 +333,7 @@ impl AiClient {
                 }
             };
             metrics.api_rounds += 1;
+            tool_rounds_used += 1;
             metrics.api_duration_ms += call.elapsed_ms;
             metrics.prompt_tokens += call.usage.prompt_tokens;
             metrics.completion_tokens += call.usage.completion_tokens;
@@ -359,7 +385,7 @@ impl AiClient {
                     tool_call_id: None,
                 });
 
-                let mut finalize_reason: Option<&str> = None;
+                let mut finalize_reason: Option<ChatStopReason> = None;
                 for tool_call in tool_calls {
                     total_tool_calls += 1;
                     let request = ToolCallRequest {
@@ -369,15 +395,15 @@ impl AiClient {
                     };
                     let signature = normalize_tool_signature(&request.name, &request.arguments);
                     let tool_result = if let Some(reason) = finalize_reason {
-                        build_guard_tool_result(reason)
+                        build_guard_tool_result(reason.code())
                     } else if total_tool_calls > max_total_tool_calls {
-                        finalize_reason = Some("tool_call_limit_exceeded");
+                        finalize_reason = Some(ChatStopReason::ToolCallLimitExceeded);
                         build_guard_tool_result("tool_call_limit_exceeded")
                     } else {
                         let count_entry = same_tool_counter.entry(signature.clone()).or_insert(0);
                         *count_entry += 1;
                         if *count_entry > MAX_REPEAT_SAME_TOOL {
-                            finalize_reason = Some("repeated_same_tool_call");
+                            finalize_reason = Some(ChatStopReason::RepeatedSameToolCall);
                             build_guard_tool_result("repeated_same_tool_call")
                         } else if let Some(cached) = tool_result_cache.get(&signature) {
                             if tool_result_timed_out(cached) {
@@ -386,9 +412,9 @@ impl AiClient {
                                     timeout_tool_counter.entry(signature.clone()).or_insert(0);
                                 *timeout_count += 1;
                                 if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
-                                    finalize_reason = Some("repeated_tool_timeout");
+                                    finalize_reason = Some(ChatStopReason::RepeatedToolTimeout);
                                 } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
-                                    finalize_reason = Some("too_many_tool_timeouts");
+                                    finalize_reason = Some(ChatStopReason::TooManyToolTimeouts);
                                 }
                             }
                             cached.clone()
@@ -400,9 +426,9 @@ impl AiClient {
                                     timeout_tool_counter.entry(signature.clone()).or_insert(0);
                                 *timeout_count += 1;
                                 if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
-                                    finalize_reason = Some("repeated_tool_timeout");
+                                    finalize_reason = Some(ChatStopReason::RepeatedToolTimeout);
                                 } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
-                                    finalize_reason = Some("too_many_tool_timeouts");
+                                    finalize_reason = Some(ChatStopReason::TooManyToolTimeouts);
                                 }
                             }
                             tool_result_cache.insert(signature, result.clone());
@@ -420,9 +446,16 @@ impl AiClient {
                 if finalize_reason.is_some() {
                     logging::warn(&format!(
                         "tool-calling guard triggered, reason={}",
-                        finalize_reason.unwrap_or("unknown")
+                        finalize_reason.map(|item| item.code()).unwrap_or("unknown")
                     ));
-                    return self.finalize_without_tools(messages, thinking_chunks, metrics);
+                    return self.finalize_without_tools(
+                        messages,
+                        thinking_chunks,
+                        metrics,
+                        finalize_reason,
+                        tool_rounds_used,
+                        total_tool_calls,
+                    );
                 }
                 continue;
             }
@@ -476,13 +509,23 @@ impl AiClient {
                         self.input_price_per_million,
                         self.output_price_per_million,
                     ),
+                    stop_reason: None,
+                    tool_rounds_used,
+                    total_tool_calls,
                 });
             }
 
             return Err(AppError::Ai("AI returned empty content".to_string()));
         }
 
-        self.finalize_without_tools(messages, thinking_chunks, metrics)
+        self.finalize_without_tools(
+            messages,
+            thinking_chunks,
+            metrics,
+            Some(ChatStopReason::MaxToolRoundsReached),
+            tool_rounds_used,
+            total_tool_calls,
+        )
     }
 
     fn send_chat_completion(
@@ -556,6 +599,9 @@ impl AiClient {
         mut messages: Vec<ApiMessage>,
         mut thinking_chunks: Vec<String>,
         mut metrics: ChatMetrics,
+        stop_reason: Option<ChatStopReason>,
+        tool_rounds_used: usize,
+        total_tool_calls: usize,
     ) -> Result<ChatToolResponse, AppError> {
         messages.push(ApiMessage {
             role: "system".to_string(),
@@ -592,6 +638,9 @@ impl AiClient {
                 self.input_price_per_million,
                 self.output_price_per_million,
             ),
+            stop_reason,
+            tool_rounds_used,
+            total_tool_calls,
         })
     }
 }

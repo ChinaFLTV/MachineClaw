@@ -550,6 +550,17 @@ pub fn chat_tag_info() -> &'static str {
     }
 }
 
+pub fn chat_tag_warn() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "[警告]",
+        Language::ZhTw => "[警告]",
+        Language::Fr => "[alerte]",
+        Language::De => "[warnung]",
+        Language::Ja => "[警告]",
+        Language::En => "[warn]",
+    }
+}
+
 pub fn chat_tag_tool() -> &'static str {
     match current_language() {
         Language::ZhCn => "[工具]",
@@ -1553,6 +1564,93 @@ pub fn chat_context_pressure_warning(
                 "Context pressure warning ({usage_percent}%): messages={message_count_fmt}/{max_limit_fmt}, recent={recent_limit_fmt}, summary_chars={summary_chars_fmt}. Further messages may trigger stronger compression."
             )
         }
+    }
+}
+
+pub fn chat_tool_guard_warning(
+    reason_code: &str,
+    tool_rounds_used: usize,
+    total_tool_calls: usize,
+    max_tool_rounds: usize,
+    max_total_tool_calls: usize,
+) -> String {
+    let reason_text = chat_tool_guard_reason_text(reason_code);
+    let rounds_used_fmt = human_count_u128(tool_rounds_used as u128);
+    let total_tool_calls_fmt = human_count_u128(total_tool_calls as u128);
+    let max_tool_rounds_fmt = human_count_u128(max_tool_rounds as u128);
+    let max_total_tool_calls_fmt = human_count_u128(max_total_tool_calls as u128);
+    match current_language() {
+        Language::ZhCn => format!(
+            "工具调用流程已触发保护性收口\n原因: {reason_text}\n当前计数: 工具轮次 {rounds_used_fmt}/{max_tool_rounds_fmt}, 工具调用 {total_tool_calls_fmt}/{max_total_tool_calls_fmt}\n建议: 1) 细化问题范围 2) 指定更明确的目标命令 3) 必要时执行 /new 开启新会话后继续"
+        ),
+        Language::ZhTw => format!(
+            "工具呼叫流程已觸發保護性收口\n原因: {reason_text}\n目前計數: 工具輪次 {rounds_used_fmt}/{max_tool_rounds_fmt}, 工具呼叫 {total_tool_calls_fmt}/{max_total_tool_calls_fmt}\n建議: 1) 縮小問題範圍 2) 指定更明確的目標命令 3) 必要時使用 /new 建立新會話再繼續"
+        ),
+        Language::Fr => format!(
+            "Le flux d'appels d'outils a été clôturé par protection\nCause: {reason_text}\nCompteurs: tours outil {rounds_used_fmt}/{max_tool_rounds_fmt}, appels outil {total_tool_calls_fmt}/{max_total_tool_calls_fmt}\nConseils: 1) affiner la demande 2) préciser la commande cible 3) utiliser /new si nécessaire"
+        ),
+        Language::De => format!(
+            "Der Tool-Aufruf-Workflow wurde aus Schutzgründen beendet\nGrund: {reason_text}\nZähler: Tool-Runden {rounds_used_fmt}/{max_tool_rounds_fmt}, Tool-Aufrufe {total_tool_calls_fmt}/{max_total_tool_calls_fmt}\nEmpfehlung: 1) Anfrage eingrenzen 2) Zielbefehl präzisieren 3) bei Bedarf mit /new neu starten"
+        ),
+        Language::Ja => format!(
+            "ツール呼び出しフローは保護制御により収束しました\n理由: {reason_text}\n現在値: ツールラウンド {rounds_used_fmt}/{max_tool_rounds_fmt}, ツール呼び出し {total_tool_calls_fmt}/{max_total_tool_calls_fmt}\n提案: 1) 問題範囲を絞る 2) 目的コマンドを具体化する 3) 必要なら /new で新規セッションを開始"
+        ),
+        Language::En => format!(
+            "Tool-calling flow was safely finalized\nReason: {reason_text}\nCounters: tool rounds {rounds_used_fmt}/{max_tool_rounds_fmt}, tool calls {total_tool_calls_fmt}/{max_total_tool_calls_fmt}\nNext steps: 1) narrow the question 2) specify target commands 3) use /new and continue if needed"
+        ),
+    }
+}
+
+fn chat_tool_guard_reason_text(reason_code: &str) -> &'static str {
+    match reason_code {
+        "tool_call_limit_exceeded" => match current_language() {
+            Language::ZhCn => "工具调用总次数已达到上限",
+            Language::ZhTw => "工具呼叫總次數已達上限",
+            Language::Fr => "la limite totale des appels d'outil est atteinte",
+            Language::De => "das Gesamtlimit für Tool-Aufrufe wurde erreicht",
+            Language::Ja => "ツール呼び出し総数が上限に達しました",
+            Language::En => "total tool call limit reached",
+        },
+        "repeated_same_tool_call" => match current_language() {
+            Language::ZhCn => "检测到同一工具调用被重复触发",
+            Language::ZhTw => "偵測到同一工具呼叫被重複觸發",
+            Language::Fr => "des appels d'outil identiques sont répétés",
+            Language::De => "wiederholte identische Tool-Aufrufe erkannt",
+            Language::Ja => "同一ツール呼び出しの反復を検出しました",
+            Language::En => "repeated identical tool call detected",
+        },
+        "repeated_tool_timeout" => match current_language() {
+            Language::ZhCn => "同一工具调用连续超时",
+            Language::ZhTw => "同一工具呼叫連續逾時",
+            Language::Fr => "timeouts répétés sur le même outil",
+            Language::De => "wiederholte Timeouts beim selben Tool",
+            Language::Ja => "同一ツールで連続タイムアウトが発生しました",
+            Language::En => "repeated timeout on the same tool",
+        },
+        "too_many_tool_timeouts" => match current_language() {
+            Language::ZhCn => "工具调用超时次数过多",
+            Language::ZhTw => "工具呼叫逾時次數過多",
+            Language::Fr => "trop de timeouts d'appels d'outil",
+            Language::De => "zu viele Tool-Timeouts",
+            Language::Ja => "ツール呼び出しのタイムアウト回数が多すぎます",
+            Language::En => "too many tool timeouts",
+        },
+        "max_tool_rounds_reached" => match current_language() {
+            Language::ZhCn => "工具调用轮次达到上限",
+            Language::ZhTw => "工具呼叫輪次達到上限",
+            Language::Fr => "le nombre maximal de tours d'outil est atteint",
+            Language::De => "maximale Anzahl von Tool-Runden erreicht",
+            Language::Ja => "ツール呼び出しラウンド数が上限に達しました",
+            Language::En => "maximum tool-calling rounds reached",
+        },
+        _ => match current_language() {
+            Language::ZhCn => "触发了保护性收口条件",
+            Language::ZhTw => "觸發了保護性收口條件",
+            Language::Fr => "condition de protection déclenchée",
+            Language::De => "Schutzbedingung ausgelöst",
+            Language::Ja => "保護条件が発動しました",
+            Language::En => "a safety guard condition was triggered",
+        },
     }
 }
 

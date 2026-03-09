@@ -158,6 +158,21 @@ pub fn render_chat_notice(text: &str, colorful: bool) -> String {
     )
 }
 
+pub fn render_chat_warning(text: &str, colorful: bool) -> String {
+    let multiline = text.contains('\n');
+    let tag = i18n::chat_tag_warn();
+    if !supports_color(colorful) {
+        if multiline {
+            return format!("{tag}\n{text}");
+        }
+        return format!("{tag} {text}");
+    }
+    if multiline {
+        return format!("{}\n{}", tag.bright_red().bold(), text.bright_yellow());
+    }
+    format!("{} {}", tag.bright_red().bold(), text.bright_yellow())
+}
+
 pub fn render_chat_custom_tag_event(tag: &str, text: &str, colorful: bool) -> String {
     let multiline = text.contains('\n');
     if !supports_color(colorful) {

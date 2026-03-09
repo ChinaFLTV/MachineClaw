@@ -545,6 +545,22 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         ai_wait_spinner.stop();
         logging::info("AI chat finished");
 
+        if let Some(stop_reason) = response.stop_reason {
+            println!(
+                "{}",
+                render::render_chat_warning(
+                    &i18n::chat_tool_guard_warning(
+                        stop_reason.code(),
+                        response.tool_rounds_used,
+                        response.total_tool_calls,
+                        services.cfg.ai.chat.max_tool_rounds,
+                        services.cfg.ai.chat.max_total_tool_calls,
+                    ),
+                    services.cfg.console.colorful,
+                )
+            );
+        }
+
         if !printed_round_thinking
             && let Some(thinking) = response.thinking.as_deref()
             && !thinking.trim().is_empty()
