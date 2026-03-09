@@ -13,6 +13,7 @@ mod platform;
 mod render;
 mod shell;
 mod skills;
+mod snapshot;
 mod test_action;
 
 use std::path::Path;
@@ -24,8 +25,8 @@ use crate::{
     ai::AiClient,
     cli::{Cli, Commands},
     config::{
-        config_template_example, expand_tilde, load_config, read_language_hint,
-        resolve_config_path, validate_config,
+        config_template_example, expand_tilde, read_language_hint, resolve_config_path,
+        validate_config,
     },
     config_action::run_config_command,
     context::SessionStore,
@@ -35,6 +36,9 @@ use crate::{
     platform::{current_os, os_name, require_elevated_permissions},
     shell::ShellExecutor,
     skills::detect_skills,
+    snapshot::{
+        build_snapshot_binary, load_effective_config, render_show_config, render_snapshot_result,
+    },
     test_action::run_test_command,
 };
 
@@ -81,7 +85,7 @@ fn run() -> Result<ExitCode, AppError> {
         println!("{}", cli::localized_help(cli::HelpTopic::Global));
         return Ok(ExitCode::Success);
     };
-    let config_path = resolve_config_path(cli.conf)?;
+    let config_path = resolve_config_path(cli.conf.clone())?;
     if let Some(language_hint) = read_language_hint(&config_path) {
         set_language(resolve_language(Some(&language_hint)));
     }
@@ -100,7 +104,9 @@ fn run() -> Result<ExitCode, AppError> {
         return Ok(outcome.exit_code);
     }
 
-    let mut cfg = load_config(&config_path)?;
+    let effective = load_effective_config(cli.conf.clone())?;
+    let mut cfg = effective.cfg;
+    let config_source_desc = effective.source.describe();
     let selected_language = resolve_language(cfg.app.language.as_deref());
     set_language(selected_language);
     cfg.console.colorful = render::resolve_colorful_enabled(cfg.console.colorful);
@@ -113,6 +119,23 @@ fn run() -> Result<ExitCode, AppError> {
             None
         }
     });
+    if matches!(&command, Commands::ShowConfig) {
+        let rendered = render_show_config(&cfg, &config_source_desc)?;
+        println!(
+            "{}",
+            render::render_markdown_for_terminal(&rendered, cfg.console.colorful)
+        );
+        return Ok(ExitCode::Success);
+    }
+    if let Commands::Snapshot { output } = &command {
+        let result = build_snapshot_binary(&cfg, config_source_desc.clone(), output.clone())?;
+        let rendered = render_snapshot_result(&result);
+        println!(
+            "{}",
+            render::render_markdown_for_terminal(&rendered, cfg.console.colorful)
+        );
+        return Ok(ExitCode::Success);
+    }
 
     let run_dir = std::env::current_dir()
         .map_err(|err| AppError::Runtime(format!("failed to resolve runtime directory: {err}")))?;
@@ -134,7 +157,7 @@ fn run() -> Result<ExitCode, AppError> {
     let log_file = logging::init(&cfg.log, &executable_dir, session.session_id())?;
     logging::info(&format!(
         "MachineClaw start, config={}, log_file={}",
-        config_path.display(),
+        config_source_desc,
         log_file.display()
     ));
     logging::info(&format!(
@@ -208,6 +231,16 @@ fn run() -> Result<ExitCode, AppError> {
         Commands::Config { .. } => {
             return Err(AppError::Runtime(
                 "config command should be handled before runtime actions".to_string(),
+            ));
+        }
+        Commands::Snapshot { .. } => {
+            return Err(AppError::Runtime(
+                "snapshot command should be handled before runtime actions".to_string(),
+            ));
+        }
+        Commands::ShowConfig => {
+            return Err(AppError::Runtime(
+                "show-config command should be handled before runtime actions".to_string(),
             ));
         }
     };
