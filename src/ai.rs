@@ -76,6 +76,13 @@ pub struct AiClient {
     output_price_per_million: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolChoiceMode {
+    Policy,
+    AutoOnly,
+    Disabled,
+}
+
 #[derive(Debug, Serialize)]
 struct ChatCompletionRequest {
     model: String,
@@ -242,25 +249,61 @@ impl AiClient {
         let mut timeout_total: usize = 0;
         let mut thinking_chunks: Vec<String> = Vec::new();
         let mut metrics = ChatMetrics::default();
+        let mut tool_choice_mode = if model_prefers_omit_tool_choice(&self.model) {
+            logging::info(
+                "model prefers omitting tool_choice for compatibility; starting with tool_choice omitted",
+            );
+            ToolChoiceMode::Disabled
+        } else {
+            ToolChoiceMode::Policy
+        };
 
         for _ in 0..MAX_TOOL_ROUNDS {
-            let tool_choice = match policy {
-                ToolUsePolicy::Auto => Some(json!("auto")),
-                ToolUsePolicy::RequireAtLeastOne => {
-                    if forced_retry_used {
-                        Some(json!("auto"))
-                    } else {
-                        Some(json!("required"))
+            let tool_choice = match tool_choice_mode {
+                ToolChoiceMode::Disabled => None,
+                ToolChoiceMode::AutoOnly => Some(json!("auto")),
+                ToolChoiceMode::Policy => match policy {
+                    ToolUsePolicy::Auto => Some(json!("auto")),
+                    ToolUsePolicy::RequireAtLeastOne => {
+                        if forced_retry_used {
+                            Some(json!("auto"))
+                        } else {
+                            Some(json!("required"))
+                        }
                     }
-                }
+                },
             };
-            let call = self.send_chat_completion(&ChatCompletionRequest {
+            let call = match self.send_chat_completion(&ChatCompletionRequest {
                 model: self.model.clone(),
                 messages: messages.clone(),
                 temperature: 0.2,
                 tools: Some(tools.clone()),
                 tool_choice,
-            })?;
+            }) {
+                Ok(call) => call,
+                Err(err) => {
+                    if is_tool_choice_unsupported_error(&err) {
+                        match tool_choice_mode {
+                            ToolChoiceMode::Policy => {
+                                logging::warn(
+                                    "model does not support requested tool_choice; fallback to tool_choice=auto",
+                                );
+                                tool_choice_mode = ToolChoiceMode::AutoOnly;
+                                continue;
+                            }
+                            ToolChoiceMode::AutoOnly => {
+                                logging::warn(
+                                    "model does not support tool_choice=auto; fallback to tool_choice omitted",
+                                );
+                                tool_choice_mode = ToolChoiceMode::Disabled;
+                                continue;
+                            }
+                            ToolChoiceMode::Disabled => {}
+                        }
+                    }
+                    return Err(err);
+                }
+            };
             metrics.api_rounds += 1;
             metrics.api_duration_ms += call.elapsed_ms;
             metrics.prompt_tokens += call.usage.prompt_tokens;
@@ -504,7 +547,7 @@ impl AiClient {
         metrics.total_tokens += call.usage.total_tokens;
         let assistant = call.assistant;
         append_unique_thinking_chunk(&mut thinking_chunks, assistant_reasoning_text(&assistant));
-        let content = assistant_content_text(&assistant);
+        let content = sanitize_assistant_content(&assistant_content_text(&assistant));
         if content.trim().is_empty() {
             return Err(AppError::Ai(
                 "AI returned empty content after tool-calling finalization".to_string(),
@@ -666,7 +709,8 @@ fn collect_reasoning_from_value(value: &serde_json::Value, output: &mut Vec<Stri
 }
 
 fn append_unique_thinking_chunk(chunks: &mut Vec<String>, chunk: String) {
-    let normalized = chunk.trim();
+    let cleaned_chunk = sanitize_assistant_content(&chunk);
+    let normalized = cleaned_chunk.trim();
     if normalized.is_empty() {
         return;
     }
@@ -892,6 +936,20 @@ fn decode_dsml_text(raw: &str) -> String {
         .replace("&amp;", "&")
         .trim()
         .to_string()
+}
+
+fn is_tool_choice_unsupported_error(err: &AppError) -> bool {
+    let AppError::Ai(detail) = err else {
+        return false;
+    };
+    let lowered = detail.to_ascii_lowercase();
+    lowered.contains("does not support this tool_choice")
+        || lowered.contains("unsupported tool_choice")
+}
+
+fn model_prefers_omit_tool_choice(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    normalized == "deepseek-reasoner"
 }
 
 fn build_chat_url(base_url: &str) -> String {

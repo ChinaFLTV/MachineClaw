@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
@@ -200,6 +201,10 @@ pub struct CmdConfig {
         default = "default_write_cmd_confirm_mode"
     )]
     pub write_cmd_confirm_mode: String,
+    #[serde(rename = "allow-cmd-list", default)]
+    pub allow_cmd_list: Vec<String>,
+    #[serde(rename = "deny-cmd-list", default)]
+    pub deny_cmd_list: Vec<String>,
     #[serde(rename = "write-cmd-allow-patterns", default)]
     pub write_cmd_allow_patterns: Vec<String>,
     #[serde(rename = "write-cmd-deny-patterns", default)]
@@ -319,6 +324,8 @@ impl Default for CmdConfig {
             command_timeout_seconds: default_cmd_timeout_seconds(),
             command_timeout_kill_after_seconds: default_cmd_timeout_kill_after_seconds(),
             write_cmd_confirm_mode: default_write_cmd_confirm_mode(),
+            allow_cmd_list: Vec::new(),
+            deny_cmd_list: Vec::new(),
             write_cmd_allow_patterns: Vec::new(),
             write_cmd_deny_patterns: Vec::new(),
             command_output_max_bytes: default_command_output_max_bytes(),
@@ -437,6 +444,8 @@ max-chars-count = 80000 # optional, default 80000
 [cmd]
 write-cmd-run-confirm = true # optional, default true
 write-cmd-confirm-mode = "allow-once" # optional: deny, edit, allow-once, allow-session
+allow-cmd-list = [] # optional, regex list; non-empty means allow-list mode
+deny-cmd-list = [] # optional, regex list; higher priority than allow-cmd-list
 write-cmd-allow-patterns = [] # optional
 write-cmd-deny-patterns = [] # optional
 command-timeout-seconds = 30 # optional, default 30
@@ -503,6 +512,28 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
         return Err(AppError::Config(
             "cmd.command-output-max-bytes must be >= 1024".to_string(),
         ));
+    }
+    for item in &cfg.cmd.allow_cmd_list {
+        let pattern = item.trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        Regex::new(pattern).map_err(|err| {
+            AppError::Config(format!(
+                "cmd.allow-cmd-list has invalid regex '{pattern}': {err}"
+            ))
+        })?;
+    }
+    for item in &cfg.cmd.deny_cmd_list {
+        let pattern = item.trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        Regex::new(pattern).map_err(|err| {
+            AppError::Config(format!(
+                "cmd.deny-cmd-list has invalid regex '{pattern}': {err}"
+            ))
+        })?;
     }
     let confirm_mode = cfg.cmd.write_cmd_confirm_mode.trim().to_ascii_lowercase();
     if !matches!(

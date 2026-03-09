@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use chrono::{Local, TimeZone};
 use dialoguer::{MultiSelect, theme::ColorfulTheme};
 use regex::Regex;
 use serde::Deserialize;
@@ -19,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     ai::{AiClient, ChatRoundEvent, ExternalToolDefinition, ToolCallRequest, ToolUsePolicy},
     cli::InspectTarget,
-    config::AppConfig,
+    config::{AppConfig, expand_tilde},
     context::SessionStore,
     error::{AppError, ExitCode},
     i18n, logging,
@@ -344,6 +345,73 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                     services.session.count_by_role("assistant"),
                     services.session.count_by_role("tool"),
                     services.session.count_by_role("system")
+                )
+            );
+            continue;
+        }
+        if message.eq_ignore_ascii_case("/list") {
+            let sessions = services.session.list_sessions()?;
+            let markdown = format_chat_session_list_markdown(&sessions);
+            println!(
+                "{}",
+                render::render_markdown_for_terminal(&markdown, services.cfg.console.colorful)
+            );
+            continue;
+        }
+        if let Some(change_query) = parse_chat_command_arg(&message, "/change") {
+            if change_query.is_empty() {
+                println!(
+                    "{}",
+                    render::render_chat_notice(
+                        i18n::chat_change_usage(),
+                        services.cfg.console.colorful
+                    )
+                );
+                continue;
+            }
+            match services.session.switch_session_by_query(change_query) {
+                Ok(switched) => {
+                    pending_message = None;
+                    last_assistant_reply.clear();
+                    maybe_ensure_chat_environment_profile(services, &system_prompt)?;
+                    println!(
+                        "{}",
+                        i18n::chat_session_changed(
+                            &switched.session_name,
+                            &switched.session_id,
+                            &switched.file_path
+                        )
+                    );
+                }
+                Err(err) => {
+                    println!(
+                        "{}",
+                        render::render_chat_notice(
+                            &i18n::localize_error(&err),
+                            services.cfg.console.colorful
+                        )
+                    );
+                }
+            }
+            continue;
+        }
+        if let Some(new_name) = parse_chat_command_arg(&message, "/name") {
+            if new_name.is_empty() {
+                println!(
+                    "{}",
+                    render::render_chat_notice(
+                        i18n::chat_name_usage(),
+                        services.cfg.console.colorful
+                    )
+                );
+                continue;
+            }
+            services.session.rename_current_session(new_name)?;
+            println!(
+                "{}",
+                i18n::chat_session_renamed(
+                    services.session.session_name(),
+                    services.session.session_id()
                 )
             );
             continue;
@@ -712,6 +780,19 @@ fn execute_tool_call(
         command,
         mode,
     };
+    if services.cfg.skills.enabled
+        && let Some(skill_name) =
+            detect_skill_name_from_command(&spec.command, services.cfg.skills.dir.as_str())
+    {
+        println!(
+            "{}",
+            render::render_chat_custom_tag_event(
+                i18n::chat_tag_skill(),
+                &i18n::chat_skill_workflow_started(&skill_name),
+                services.cfg.console.colorful
+            )
+        );
+    }
     let mode_text = if matches!(spec.mode, CommandMode::Write) {
         i18n::command_mode_write()
     } else {
@@ -919,10 +1000,17 @@ fn execute_mcp_tool_call(
     stats: &mut ChatToolStats,
 ) -> String {
     let started = Instant::now();
+    let (server_name, remote_tool_name) = services
+        .mcp
+        .resolve_ai_tool_target(&tool_call.name)
+        .unwrap_or_else(|| ("unknown".to_string(), tool_call.name.clone()));
     let started_text = if services.cfg.ai.chat.output_multilines {
-        format!("type=mcp_tool_call\ntool={}", tool_call.name)
+        format!(
+            "type=mcp_service_request\nserver={}\ntool={}\nai_tool={}",
+            server_name, remote_tool_name, tool_call.name
+        )
     } else {
-        i18n::chat_mcp_call_started(&tool_call.name)
+        i18n::chat_mcp_service_request_started(&server_name, &remote_tool_name)
     };
     println!(
         "{}",
@@ -1120,6 +1208,145 @@ fn format_tool_preview_output(services: &ActionServices<'_>, preview: &str) -> S
         i18n::chat_tool_type_output_preview(),
         preview
     )
+}
+
+fn detect_skill_name_from_command(command: &str, configured_dir: &str) -> Option<String> {
+    let configured = configured_dir
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches('\\');
+    let mut prefixes = Vec::<String>::new();
+    if !configured.is_empty() {
+        prefixes.push(configured.to_string());
+        let expanded = expand_tilde(configured).to_string_lossy().to_string();
+        if !expanded.is_empty() && expanded != configured {
+            prefixes.push(expanded);
+        }
+    }
+    prefixes.push("~/.codex/skills".to_string());
+    if let Some(home) = dirs::home_dir() {
+        prefixes.push(
+            home.join(".codex")
+                .join("skills")
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    for prefix in prefixes {
+        if let Some(name) = extract_skill_name_with_prefix(command, &prefix) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn extract_skill_name_with_prefix(command: &str, prefix: &str) -> Option<String> {
+    let normalized_prefix = prefix.trim().replace('\\', "/");
+    if normalized_prefix.is_empty() {
+        return None;
+    }
+    let normalized_command = command.replace('\\', "/");
+    let marker = format!("{normalized_prefix}/");
+    let start = normalized_command.find(&marker)?;
+    let rest = &normalized_command[start + marker.len()..];
+    let skill_name = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-' || *ch == '.')
+        .collect::<String>();
+    if skill_name.is_empty() || skill_name == "." || skill_name == ".." {
+        return None;
+    }
+    Some(skill_name)
+}
+
+fn parse_chat_command_arg<'a>(message: &'a str, command: &str) -> Option<&'a str> {
+    let message_trimmed = message.trim();
+    if message_trimmed.len() < command.len() {
+        return None;
+    }
+    let head = message_trimmed.get(..command.len())?;
+    if !head.eq_ignore_ascii_case(command) {
+        return None;
+    }
+    let tail = message_trimmed.get(command.len()..)?;
+    if !tail.is_empty()
+        && !tail
+            .chars()
+            .next()
+            .map(|ch| ch.is_whitespace())
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let rest = tail.trim();
+    Some(rest)
+}
+
+fn format_chat_session_list_markdown(sessions: &[crate::context::SessionOverview]) -> String {
+    if sessions.is_empty() {
+        return i18n::chat_session_list_empty().to_string();
+    }
+    let mut lines = Vec::<String>::new();
+    lines.push(format!(
+        "### {}",
+        i18n::chat_session_list_title(sessions.len())
+    ));
+    lines.push(String::new());
+    lines.push(format!(
+        "| {} | {} | {} | {} | {} | {} | {} | {} |",
+        i18n::chat_session_list_header_active(),
+        i18n::chat_session_list_header_name(),
+        i18n::chat_session_list_header_id(),
+        i18n::chat_session_list_header_messages(),
+        i18n::chat_session_list_header_summary(),
+        i18n::chat_session_list_header_created(),
+        i18n::chat_session_list_header_updated(),
+        i18n::chat_session_list_header_file(),
+    ));
+    lines.push("|---|---|---|---|---|---|---|---|".to_string());
+    for item in sessions {
+        let active = if item.active {
+            i18n::chat_session_list_active_yes()
+        } else {
+            i18n::chat_session_list_active_no()
+        };
+        let counts = format!(
+            "{} (u:{} a:{} t:{} s:{})",
+            i18n::human_count_u128(item.message_count as u128),
+            i18n::human_count_u128(item.user_count as u128),
+            i18n::human_count_u128(item.assistant_count as u128),
+            i18n::human_count_u128(item.tool_count as u128),
+            i18n::human_count_u128(item.system_count as u128),
+        );
+        let summary = i18n::human_count_u128(item.summary_len as u128);
+        let created = format_local_datetime(item.created_at_epoch_ms);
+        let updated = format_local_datetime(item.last_updated_epoch_ms);
+        let short_id = trim_text(&item.session_id, 16);
+        lines.push(format!(
+            "| {} | {} | `{}` | {} | {} | {} | {} | `{}` |",
+            active,
+            item.session_name.replace('|', "\\|"),
+            short_id,
+            counts,
+            summary,
+            created,
+            updated,
+            item.file_path.display()
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_local_datetime(epoch_ms: u128) -> String {
+    if epoch_ms == 0 || epoch_ms > i64::MAX as u128 {
+        return "-".to_string();
+    }
+    let Some(ts) = Local.timestamp_millis_opt(epoch_ms as i64).single() else {
+        return "-".to_string();
+    };
+    ts.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn result_timeout_hint(command: &str, stdout: &str, stderr: &str) -> Option<String> {

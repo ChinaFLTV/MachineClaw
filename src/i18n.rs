@@ -782,39 +782,246 @@ pub fn chat_welcome(
 
 pub fn chat_hint() -> &'static str {
     match current_language() {
-        Language::ZhCn => "输入问题开始对话。命令: /help, /stats, /new, /clear, /exit",
-        Language::ZhTw => "輸入問題開始對話。命令: /help, /stats, /new, /clear, /exit",
+        Language::ZhCn => {
+            "输入问题开始对话。命令: /help, /stats, /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+        }
+        Language::ZhTw => {
+            "輸入問題開始對話。命令: /help, /stats, /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+        }
         Language::Fr => {
-            "Saisissez votre question pour commencer. Commandes: /help, /stats, /new, /clear, /exit"
+            "Saisissez votre question pour commencer. Commandes: /help, /stats, /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
         Language::De => {
-            "Geben Sie eine Frage ein, um zu starten. Befehle: /help, /stats, /new, /clear, /exit"
+            "Geben Sie eine Frage ein, um zu starten. Befehle: /help, /stats, /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
-        Language::Ja => "質問を入力して開始します。コマンド: /help, /stats, /new, /clear, /exit",
-        Language::En => "Type a question to start. Commands: /help, /stats, /new, /clear, /exit",
+        Language::Ja => {
+            "質問を入力して開始します。コマンド: /help, /stats, /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+        }
+        Language::En => {
+            "Type a question to start. Commands: /help, /stats, /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+        }
     }
 }
 
 pub fn chat_help_text() -> &'static str {
     match current_language() {
         Language::ZhCn => {
-            "/help 显示帮助, /stats 查看上下文统计, /new 新建会话, /clear 清屏(不清历史), /exit 退出 chat"
+            "/help 显示帮助, /stats 查看上下文统计, /list 列出会话, /change <id|name> 切换会话, /name <new-name> 重命名当前会话, /new 新建会话, /clear 清屏(不清历史), /exit 退出 chat"
         }
         Language::ZhTw => {
-            "/help 顯示說明, /stats 查看上下文統計, /new 建立新會話, /clear 清屏(不清歷史), /exit 離開 chat"
+            "/help 顯示說明, /stats 查看上下文統計, /list 列出會話, /change <id|name> 切換會話, /name <new-name> 重新命名目前會話, /new 建立新會話, /clear 清屏(不清歷史), /exit 離開 chat"
         }
         Language::Fr => {
-            "/help aide, /stats statistiques du contexte, /new nouvelle session, /clear effacer l'écran (garde l'historique), /exit quitter chat"
+            "/help aide, /stats statistiques du contexte, /list lister les sessions, /change <id|name> changer de session, /name <new-name> renommer la session actuelle, /new nouvelle session, /clear effacer l'écran (garde l'historique), /exit quitter chat"
         }
         Language::De => {
-            "/help Hilfe, /stats Kontextstatistik, /new neue Sitzung, /clear Bildschirm leeren (Verlauf bleibt), /exit chat beenden"
+            "/help Hilfe, /stats Kontextstatistik, /list Sitzungen auflisten, /change <id|name> Sitzung wechseln, /name <new-name> aktuelle Sitzung umbenennen, /new neue Sitzung, /clear Bildschirm leeren (Verlauf bleibt), /exit chat beenden"
         }
         Language::Ja => {
-            "/help ヘルプ, /stats コンテキスト統計, /new 新規セッション, /clear 画面クリア(履歴保持), /exit chat 終了"
+            "/help ヘルプ, /stats コンテキスト統計, /list セッション一覧, /change <id|name> セッション切替, /name <new-name> 現在セッション名変更, /new 新規セッション, /clear 画面クリア(履歴保持), /exit chat 終了"
         }
         Language::En => {
-            "/help help, /stats context stats, /new new session, /clear clear screen (keep history), /exit leave chat"
+            "/help help, /stats context stats, /list list sessions, /change <id|name> switch session, /name <new-name> rename current session, /new new session, /clear clear screen (keep history), /exit leave chat"
         }
+    }
+}
+
+pub fn chat_change_usage() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "用法: /change {完整session-id | session-id前缀 | 会话名称}",
+        Language::ZhTw => "用法: /change {完整session-id | session-id前綴 | 會話名稱}",
+        Language::Fr => "Usage: /change {session-id complet | préfixe session-id | nom de session}",
+        Language::De => {
+            "Verwendung: /change {vollständige session-id | session-id-Präfix | Sitzungsname}"
+        }
+        Language::Ja => "使い方: /change {完全なsession-id | session-idの接頭辞 | セッション名}",
+        Language::En => "Usage: /change {full session-id | session-id prefix | session name}",
+    }
+}
+
+pub fn chat_name_usage() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "用法: /name {当前会话的新名称}",
+        Language::ZhTw => "用法: /name {目前會話的新名稱}",
+        Language::Fr => "Usage: /name {nouveau nom de la session courante}",
+        Language::De => "Verwendung: /name {neuer Name der aktuellen Sitzung}",
+        Language::Ja => "使い方: /name {現在のセッションの新しい名前}",
+        Language::En => "Usage: /name {new name for current session}",
+    }
+}
+
+pub fn chat_session_renamed(name: &str, session_id: &str) -> String {
+    match current_language() {
+        Language::ZhCn => format!("会话已重命名\n名称: {name}\n会话: {session_id}"),
+        Language::ZhTw => format!("會話已重新命名\n名稱: {name}\n會話: {session_id}"),
+        Language::Fr => format!("Session renommée\nNom: {name}\nSession: {session_id}"),
+        Language::De => format!("Sitzung umbenannt\nName: {name}\nSitzung: {session_id}"),
+        Language::Ja => {
+            format!("セッション名を変更しました\n名前: {name}\nセッション: {session_id}")
+        }
+        Language::En => format!("session renamed\nname: {name}\nsession: {session_id}"),
+    }
+}
+
+pub fn chat_session_changed(name: &str, session_id: &str, session_file: &Path) -> String {
+    match current_language() {
+        Language::ZhCn => format!(
+            "会话已切换\n名称: {name}\n会话: {session_id}\n会话文件: {}",
+            session_file.display()
+        ),
+        Language::ZhTw => format!(
+            "會話已切換\n名稱: {name}\n會話: {session_id}\n會話檔案: {}",
+            session_file.display()
+        ),
+        Language::Fr => format!(
+            "Session changée\nNom: {name}\nSession: {session_id}\nFichier: {}",
+            session_file.display()
+        ),
+        Language::De => format!(
+            "Sitzung gewechselt\nName: {name}\nSitzung: {session_id}\nDatei: {}",
+            session_file.display()
+        ),
+        Language::Ja => format!(
+            "セッションを切り替えました\n名前: {name}\nセッション: {session_id}\nファイル: {}",
+            session_file.display()
+        ),
+        Language::En => format!(
+            "session switched\nname: {name}\nsession: {session_id}\nfile: {}",
+            session_file.display()
+        ),
+    }
+}
+
+pub fn chat_session_list_empty() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "当前没有可用会话。",
+        Language::ZhTw => "目前沒有可用會話。",
+        Language::Fr => "Aucune session disponible.",
+        Language::De => "Keine verfügbaren Sitzungen.",
+        Language::Ja => "利用可能なセッションはありません。",
+        Language::En => "No sessions available.",
+    }
+}
+
+pub fn chat_session_list_title(total: usize) -> String {
+    let total_fmt = human_count_u128(total as u128);
+    match current_language() {
+        Language::ZhCn => format!("已暂存会话列表（共 {total_fmt} 条）"),
+        Language::ZhTw => format!("已暫存會話列表（共 {total_fmt} 筆）"),
+        Language::Fr => format!("Sessions enregistrées ({total_fmt})"),
+        Language::De => format!("Gespeicherte Sitzungen ({total_fmt})"),
+        Language::Ja => format!("保存済みセッション一覧（{total_fmt} 件）"),
+        Language::En => format!("Stored sessions ({total_fmt})"),
+    }
+}
+
+pub fn chat_session_list_header_active() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "当前",
+        Language::ZhTw => "目前",
+        Language::Fr => "Actif",
+        Language::De => "Aktiv",
+        Language::Ja => "現在",
+        Language::En => "Active",
+    }
+}
+
+pub fn chat_session_list_header_name() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "会话名称",
+        Language::ZhTw => "會話名稱",
+        Language::Fr => "Nom",
+        Language::De => "Name",
+        Language::Ja => "セッション名",
+        Language::En => "Name",
+    }
+}
+
+pub fn chat_session_list_header_id() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "会话ID",
+        Language::ZhTw => "會話ID",
+        Language::Fr => "Session ID",
+        Language::De => "Session-ID",
+        Language::Ja => "セッションID",
+        Language::En => "Session ID",
+    }
+}
+
+pub fn chat_session_list_header_messages() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "消息(总/分角色)",
+        Language::ZhTw => "訊息(總/分角色)",
+        Language::Fr => "Messages(total/rôles)",
+        Language::De => "Nachrichten(total/Rollen)",
+        Language::Ja => "メッセージ(合計/役割別)",
+        Language::En => "Messages(total/roles)",
+    }
+}
+
+pub fn chat_session_list_header_summary() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "摘要字符",
+        Language::ZhTw => "摘要字元",
+        Language::Fr => "Résumé(chars)",
+        Language::De => "Zusammenfassung(Zeichen)",
+        Language::Ja => "要約文字数",
+        Language::En => "Summary(chars)",
+    }
+}
+
+pub fn chat_session_list_header_updated() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "更新时间",
+        Language::ZhTw => "更新時間",
+        Language::Fr => "Mis à jour",
+        Language::De => "Aktualisiert",
+        Language::Ja => "更新時刻",
+        Language::En => "Updated",
+    }
+}
+
+pub fn chat_session_list_header_created() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "创建时间",
+        Language::ZhTw => "建立時間",
+        Language::Fr => "Créée",
+        Language::De => "Erstellt",
+        Language::Ja => "作成時刻",
+        Language::En => "Created",
+    }
+}
+
+pub fn chat_session_list_header_file() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "会话文件",
+        Language::ZhTw => "會話檔案",
+        Language::Fr => "Fichier",
+        Language::De => "Datei",
+        Language::Ja => "ファイル",
+        Language::En => "File",
+    }
+}
+
+pub fn chat_session_list_active_yes() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "是",
+        Language::ZhTw => "是",
+        Language::Fr => "oui",
+        Language::De => "ja",
+        Language::Ja => "はい",
+        Language::En => "yes",
+    }
+}
+
+pub fn chat_session_list_active_no() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "否",
+        Language::ZhTw => "否",
+        Language::Fr => "non",
+        Language::De => "nein",
+        Language::Ja => "いいえ",
+        Language::En => "no",
     }
 }
 
@@ -1220,14 +1427,27 @@ pub fn chat_skill_prepare_started(count: usize) -> String {
     }
 }
 
-pub fn chat_mcp_call_started(name: &str) -> String {
+pub fn chat_skill_workflow_started(name: &str) -> String {
     match current_language() {
-        Language::ZhCn => format!("调用 MCP 工具: {name}"),
-        Language::ZhTw => format!("呼叫 MCP 工具: {name}"),
-        Language::Fr => format!("Appel de l'outil MCP: {name}"),
-        Language::De => format!("MCP-Tool-Aufruf: {name}"),
-        Language::Ja => format!("MCP ツール呼び出し: {name}"),
-        Language::En => format!("Calling MCP tool: {name}"),
+        Language::ZhCn => format!("即将执行 Skill 规范逻辑: {name}"),
+        Language::ZhTw => format!("即將執行 Skill 規範邏輯: {name}"),
+        Language::Fr => format!("Exécution imminente du workflow skill: {name}"),
+        Language::De => format!("Skill-Workflow wird gleich ausgeführt: {name}"),
+        Language::Ja => format!("Skill ワークフローをこれから実行します: {name}"),
+        Language::En => format!("About to execute skill workflow: {name}"),
+    }
+}
+
+pub fn chat_mcp_service_request_started(server: &str, tool: &str) -> String {
+    match current_language() {
+        Language::ZhCn => format!("即将请求 MCP 服务: {server}, 工具: {tool}"),
+        Language::ZhTw => format!("即將請求 MCP 服務: {server}, 工具: {tool}"),
+        Language::Fr => format!("Requête MCP imminente: service {server}, outil {tool}"),
+        Language::De => format!("MCP-Anfrage folgt: Dienst {server}, Tool {tool}"),
+        Language::Ja => {
+            format!("これから MCP サービスへリクエストします: {server}, ツール: {tool}")
+        }
+        Language::En => format!("About to request MCP service: {server}, tool: {tool}"),
     }
 }
 
@@ -1873,6 +2093,90 @@ fn localize_detail(detail: &str) -> String {
                 "mcp.enabled=true の場合、少なくとも 1 つの MCP サーバー設定が必要です"
                     .to_string()
             }
+            Language::En => detail.to_string(),
+        },
+        _ if detail.starts_with("cmd.allow-cmd-list has invalid regex '") => {
+            match current_language() {
+                Language::ZhCn => format!("cmd.allow-cmd-list 包含非法正则: {detail}"),
+                Language::ZhTw => format!("cmd.allow-cmd-list 包含非法正則: {detail}"),
+                Language::Fr => format!("cmd.allow-cmd-list contient une regex invalide: {detail}"),
+                Language::De => format!("cmd.allow-cmd-list enthält einen ungültigen Regex: {detail}"),
+                Language::Ja => format!("cmd.allow-cmd-list に不正な正規表現があります: {detail}"),
+                Language::En => detail.to_string(),
+            }
+        }
+        _ if detail.starts_with("cmd.deny-cmd-list has invalid regex '") => {
+            match current_language() {
+                Language::ZhCn => format!("cmd.deny-cmd-list 包含非法正则: {detail}"),
+                Language::ZhTw => format!("cmd.deny-cmd-list 包含非法正則: {detail}"),
+                Language::Fr => format!("cmd.deny-cmd-list contient une regex invalide: {detail}"),
+                Language::De => format!("cmd.deny-cmd-list enthält einen ungültigen Regex: {detail}"),
+                Language::Ja => format!("cmd.deny-cmd-list に不正な正規表現があります: {detail}"),
+                Language::En => detail.to_string(),
+            }
+        }
+        "session query cannot be empty" => match current_language() {
+            Language::ZhCn => "会话切换条件不能为空".to_string(),
+            Language::ZhTw => "會話切換條件不能為空".to_string(),
+            Language::Fr => "Le critère de changement de session ne peut pas être vide".to_string(),
+            Language::De => "Die Sitzungsabfrage darf nicht leer sein".to_string(),
+            Language::Ja => "セッション切替クエリは空にできません".to_string(),
+            Language::En => detail.to_string(),
+        },
+        _ if detail.starts_with("session not found: ") => match current_language() {
+            Language::ZhCn => format!(
+                "未找到匹配会话: {}",
+                detail.trim_start_matches("session not found: ").trim()
+            ),
+            Language::ZhTw => format!(
+                "找不到匹配會話: {}",
+                detail.trim_start_matches("session not found: ").trim()
+            ),
+            Language::Fr => format!(
+                "Session introuvable: {}",
+                detail.trim_start_matches("session not found: ").trim()
+            ),
+            Language::De => format!(
+                "Sitzung nicht gefunden: {}",
+                detail.trim_start_matches("session not found: ").trim()
+            ),
+            Language::Ja => format!(
+                "一致するセッションが見つかりません: {}",
+                detail.trim_start_matches("session not found: ").trim()
+            ),
+            Language::En => detail.to_string(),
+        },
+        _ if detail.starts_with("session query is ambiguous: ") => match current_language() {
+            Language::ZhCn => format!(
+                "会话匹配到多项，请使用更完整的 session-id 或更精确名称: {}",
+                detail
+                    .trim_start_matches("session query is ambiguous: ")
+                    .trim()
+            ),
+            Language::ZhTw => format!(
+                "會話匹配到多項，請使用更完整的 session-id 或更精確名稱: {}",
+                detail
+                    .trim_start_matches("session query is ambiguous: ")
+                    .trim()
+            ),
+            Language::Fr => format!(
+                "Requête de session ambiguë, utilisez un session-id plus précis ou un nom exact: {}",
+                detail
+                    .trim_start_matches("session query is ambiguous: ")
+                    .trim()
+            ),
+            Language::De => format!(
+                "Mehrdeutige Sitzungsabfrage, verwenden Sie eine genauere session-id oder einen exakten Namen: {}",
+                detail
+                    .trim_start_matches("session query is ambiguous: ")
+                    .trim()
+            ),
+            Language::Ja => format!(
+                "セッションが複数一致しました。より完全な session-id か正確な名前を指定してください: {}",
+                detail
+                    .trim_start_matches("session query is ambiguous: ")
+                    .trim()
+            ),
             Language::En => detail.to_string(),
         },
         _ if detail.starts_with("mcp server '")

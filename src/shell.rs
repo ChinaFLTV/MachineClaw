@@ -8,6 +8,7 @@ use std::{
 };
 
 use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::Serialize;
 use wait_timeout::ChildExt;
 
@@ -89,6 +90,8 @@ pub struct ShellExecutor {
     kill_after: Duration,
     write_confirm: bool,
     confirm_mode: WriteConfirmMode,
+    allow_cmd_list: Vec<String>,
+    deny_cmd_list: Vec<String>,
     allow_patterns: Vec<String>,
     deny_patterns: Vec<String>,
     output_max_bytes: usize,
@@ -117,6 +120,8 @@ impl ShellExecutor {
             kill_after: Duration::from_secs(cfg.command_timeout_kill_after_seconds),
             write_confirm: cfg.write_cmd_run_confirm,
             confirm_mode: parse_confirm_mode(&cfg.write_cmd_confirm_mode),
+            allow_cmd_list: cfg.allow_cmd_list.clone(),
+            deny_cmd_list: cfg.deny_cmd_list.clone(),
             allow_patterns: cfg.write_cmd_allow_patterns.clone(),
             deny_patterns: cfg.write_cmd_deny_patterns.clone(),
             output_max_bytes: cfg.command_output_max_bytes,
@@ -211,6 +216,64 @@ impl ShellExecutor {
         }
 
         let lowered = format!(" {} ", command.to_ascii_lowercase());
+        let effective_mode =
+            if spec.mode == CommandMode::Write || looks_like_write_command(&lowered) {
+                CommandMode::Write
+            } else {
+                CommandMode::Read
+            };
+
+        if let Some(pattern) = self
+            .deny_cmd_list
+            .iter()
+            .find(|pattern| command_matches_regex_rule(command, pattern))
+        {
+            let reason = i18n::command_blocked_by_deny_pattern(pattern);
+            logging::warn(&format!(
+                "blocked command by deny-cmd-list regex: {}",
+                mask_sensitive(command)
+            ));
+            return Ok(CommandResult {
+                label: spec.label.clone(),
+                command: mask_sensitive(command),
+                mode: mode_to_str(effective_mode).to_string(),
+                success: false,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                duration_ms: 0,
+                timed_out: false,
+                interrupted: false,
+                blocked: true,
+                block_reason: reason,
+            });
+        }
+        if !self.allow_cmd_list.is_empty()
+            && !self
+                .allow_cmd_list
+                .iter()
+                .any(|pattern| command_matches_regex_rule(command, pattern))
+        {
+            logging::warn(&format!(
+                "blocked command by allow-cmd-list policy: {}",
+                mask_sensitive(command)
+            ));
+            return Ok(CommandResult {
+                label: spec.label.clone(),
+                command: mask_sensitive(command),
+                mode: mode_to_str(effective_mode).to_string(),
+                success: false,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                duration_ms: 0,
+                timed_out: false,
+                interrupted: false,
+                blocked: true,
+                block_reason: i18n::command_blocked_by_allow_policy(),
+            });
+        }
+
         if let Some(pattern) = self.deny_patterns.iter().find(|pattern| {
             !pattern.trim().is_empty() && lowered.contains(&pattern.to_ascii_lowercase())
         }) {
@@ -222,7 +285,7 @@ impl ShellExecutor {
             return Ok(CommandResult {
                 label: spec.label.clone(),
                 command: mask_sensitive(command),
-                mode: mode_to_str(spec.mode).to_string(),
+                mode: mode_to_str(effective_mode).to_string(),
                 success: false,
                 exit_code: None,
                 stdout: String::new(),
@@ -243,7 +306,7 @@ impl ShellExecutor {
             return Ok(CommandResult {
                 label: spec.label.clone(),
                 command: mask_sensitive(command),
-                mode: mode_to_str(spec.mode).to_string(),
+                mode: mode_to_str(effective_mode).to_string(),
                 success: false,
                 exit_code: None,
                 stdout: String::new(),
@@ -255,13 +318,6 @@ impl ShellExecutor {
                 block_reason: reason,
             });
         }
-
-        let effective_mode =
-            if spec.mode == CommandMode::Write || looks_like_write_command(&lowered) {
-                CommandMode::Write
-            } else {
-                CommandMode::Read
-            };
 
         if effective_mode == CommandMode::Write
             && !self.allow_patterns.is_empty()
@@ -338,6 +394,56 @@ impl ShellExecutor {
             }
 
             let lowered_effective = format!(" {} ", effective_command.to_ascii_lowercase());
+            if let Some(pattern) = self
+                .deny_cmd_list
+                .iter()
+                .find(|pattern| command_matches_regex_rule(&effective_command, pattern))
+            {
+                let reason = i18n::command_blocked_by_deny_pattern(pattern);
+                logging::warn(&format!(
+                    "blocked command by deny-cmd-list regex: {}",
+                    mask_sensitive(&effective_command)
+                ));
+                return Ok(CommandResult {
+                    label: spec.label.clone(),
+                    command: mask_sensitive(&effective_command),
+                    mode: mode_to_str(effective_mode).to_string(),
+                    success: false,
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    duration_ms: 0,
+                    timed_out: false,
+                    interrupted: false,
+                    blocked: true,
+                    block_reason: reason,
+                });
+            }
+            if !self.allow_cmd_list.is_empty()
+                && !self
+                    .allow_cmd_list
+                    .iter()
+                    .any(|pattern| command_matches_regex_rule(&effective_command, pattern))
+            {
+                logging::warn(&format!(
+                    "blocked command by allow-cmd-list policy: {}",
+                    mask_sensitive(&effective_command)
+                ));
+                return Ok(CommandResult {
+                    label: spec.label.clone(),
+                    command: mask_sensitive(&effective_command),
+                    mode: mode_to_str(effective_mode).to_string(),
+                    success: false,
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    duration_ms: 0,
+                    timed_out: false,
+                    interrupted: false,
+                    blocked: true,
+                    block_reason: i18n::command_blocked_by_allow_policy(),
+                });
+            }
             if let Some(pattern) = self.deny_patterns.iter().find(|pattern| {
                 !pattern.trim().is_empty()
                     && lowered_effective.contains(&pattern.to_ascii_lowercase())
@@ -355,6 +461,46 @@ impl ShellExecutor {
                     interrupted: false,
                     blocked: true,
                     block_reason: i18n::command_blocked_by_deny_pattern(pattern),
+                });
+            }
+            if let Some(pattern) = DANGEROUS_PATTERNS
+                .iter()
+                .find(|pattern| lowered_effective.contains(&pattern.to_ascii_lowercase()))
+            {
+                return Ok(CommandResult {
+                    label: spec.label.clone(),
+                    command: mask_sensitive(&effective_command),
+                    mode: mode_to_str(effective_mode).to_string(),
+                    success: false,
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    duration_ms: 0,
+                    timed_out: false,
+                    interrupted: false,
+                    blocked: true,
+                    block_reason: i18n::dangerous_command_blocked(pattern),
+                });
+            }
+            if !self.allow_patterns.is_empty()
+                && !self.allow_patterns.iter().any(|pattern| {
+                    let value = pattern.trim();
+                    !value.is_empty() && lowered_effective.contains(&value.to_ascii_lowercase())
+                })
+            {
+                return Ok(CommandResult {
+                    label: spec.label.clone(),
+                    command: mask_sensitive(&effective_command),
+                    mode: mode_to_str(effective_mode).to_string(),
+                    success: false,
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    duration_ms: 0,
+                    timed_out: false,
+                    interrupted: false,
+                    blocked: true,
+                    block_reason: i18n::command_blocked_by_allow_policy(),
                 });
             }
             return self.run_inner(spec, &effective_command, effective_mode, effective_timeout);
@@ -484,6 +630,24 @@ fn shell_command(command: &str) -> Command {
         let mut cmd = Command::new("/bin/sh");
         cmd.args(["-c", command]);
         cmd
+    }
+}
+
+fn command_matches_regex_rule(command: &str, pattern: &str) -> bool {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    match Regex::new(trimmed) {
+        Ok(regex) => regex.is_match(command),
+        Err(err) => {
+            logging::warn(&format!(
+                "invalid command regex pattern ignored: pattern={}, err={}",
+                mask_sensitive(trimmed),
+                err
+            ));
+            false
+        }
     }
 }
 

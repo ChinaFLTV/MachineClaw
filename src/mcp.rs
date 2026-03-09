@@ -245,6 +245,12 @@ impl McpManager {
         self.tool_index.contains_key(name)
     }
 
+    pub fn resolve_ai_tool_target(&self, name: &str) -> Option<(String, String)> {
+        let binding = self.tool_index.get(name)?;
+        let connection = self.connections.get(binding.connection_idx)?;
+        Some((connection.name.clone(), binding.remote_name.clone()))
+    }
+
     pub fn call_ai_tool(&mut self, name: &str, raw_arguments: &str) -> Result<String, AppError> {
         if !self.enabled {
             return Err(AppError::Runtime("mcp is disabled".to_string()));

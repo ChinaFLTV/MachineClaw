@@ -63,6 +63,8 @@ pub struct SessionCompass {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
     pub session_id: String,
+    #[serde(default)]
+    pub session_name: String,
     pub summary: String,
     pub messages: Vec<SessionMessage>,
     #[serde(default)]
@@ -77,6 +79,22 @@ pub struct SessionStore {
     compression_max_history_messages: usize,
     compression_max_chars_count: usize,
     compression_keep_recent_messages: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionOverview {
+    pub session_id: String,
+    pub session_name: String,
+    pub file_path: PathBuf,
+    pub message_count: usize,
+    pub summary_len: usize,
+    pub user_count: usize,
+    pub assistant_count: usize,
+    pub tool_count: usize,
+    pub system_count: usize,
+    pub created_at_epoch_ms: u128,
+    pub last_updated_epoch_ms: u128,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +143,7 @@ impl SessionStore {
         } else {
             SessionState {
                 session_id: Uuid::new_v4().to_string(),
+                session_name: String::new(),
                 summary: String::new(),
                 messages: Vec::new(),
                 compass: new_compass(),
@@ -245,6 +264,10 @@ impl SessionStore {
         &self.state.session_id
     }
 
+    pub fn session_name(&self) -> &str {
+        &self.state.session_name
+    }
+
     pub fn message_count(&self) -> usize {
         self.state.messages.len()
     }
@@ -299,6 +322,7 @@ impl SessionStore {
         let new_session_id = Uuid::new_v4().to_string();
         self.state = SessionState {
             session_id: new_session_id.clone(),
+            session_name: default_session_name(&new_session_id),
             summary: String::new(),
             messages: Vec::new(),
             compass: new_compass(),
@@ -310,6 +334,151 @@ impl SessionStore {
         self.path = parent.join(filename);
         self.persist()?;
         self.persist_active_session_pointer()
+    }
+
+    pub fn rename_current_session(&mut self, new_name: &str) -> Result<(), AppError> {
+        let normalized = normalize_session_name(&self.state.session_id, Some(new_name));
+        self.state.session_name = normalized;
+        self.state.compass.last_updated_epoch_ms = now_epoch_ms();
+        self.persist()
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<SessionOverview>, AppError> {
+        let parent = self.path.parent().ok_or_else(|| {
+            AppError::Runtime("failed to resolve session directory for listing".to_string())
+        })?;
+        fs::create_dir_all(parent).map_err(|err| {
+            AppError::Runtime(format!(
+                "failed to create session directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+
+        let mut sessions = Vec::<SessionOverview>::new();
+        let entries = fs::read_dir(parent).map_err(|err| {
+            AppError::Runtime(format!(
+                "failed to read session directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if !is_session_state_file_name(&file_name) {
+                continue;
+            }
+            let raw = match fs::read_to_string(&path) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let mut state = match serde_json::from_str::<SessionState>(&raw) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let expected_name =
+                normalize_session_name(&state.session_id, Some(&state.session_name));
+            if state.session_name != expected_name {
+                state.session_name = expected_name;
+            }
+            sessions.push(build_session_overview(&state, path, &self.path));
+        }
+
+        if sessions.is_empty() {
+            sessions.push(build_session_overview(
+                &self.state,
+                self.path.clone(),
+                &self.path,
+            ));
+        }
+
+        sessions.sort_by(|a, b| {
+            b.last_updated_epoch_ms
+                .cmp(&a.last_updated_epoch_ms)
+                .then_with(|| b.created_at_epoch_ms.cmp(&a.created_at_epoch_ms))
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        Ok(sessions)
+    }
+
+    pub fn switch_session_by_query(&mut self, query: &str) -> Result<SessionOverview, AppError> {
+        let normalized_query = query.trim();
+        if normalized_query.is_empty() {
+            return Err(AppError::Runtime(
+                "session query cannot be empty".to_string(),
+            ));
+        }
+        let sessions = self.list_sessions()?;
+        let q = normalized_query.to_ascii_lowercase();
+        let mut exact = Vec::<SessionOverview>::new();
+        let mut fuzzy = Vec::<SessionOverview>::new();
+        for item in sessions {
+            let id = item.session_id.as_str();
+            let name = item.session_name.as_str();
+            let name_l = name.to_ascii_lowercase();
+            if id == normalized_query || name.eq_ignore_ascii_case(normalized_query) {
+                exact.push(item);
+                continue;
+            }
+            if id.starts_with(normalized_query) || name_l.starts_with(&q) {
+                fuzzy.push(item);
+            }
+        }
+        let selected = if exact.len() == 1 {
+            exact.remove(0)
+        } else if exact.len() > 1 {
+            return Err(AppError::Runtime(format!(
+                "session query is ambiguous: {}",
+                normalized_query
+            )));
+        } else if fuzzy.len() == 1 {
+            fuzzy.remove(0)
+        } else if fuzzy.is_empty() {
+            return Err(AppError::Runtime(format!(
+                "session not found: {}",
+                normalized_query
+            )));
+        } else {
+            return Err(AppError::Runtime(format!(
+                "session query is ambiguous: {}",
+                normalized_query
+            )));
+        };
+
+        if selected.file_path != self.path {
+            let raw = fs::read_to_string(&selected.file_path).map_err(|err| {
+                AppError::Runtime(format!(
+                    "failed to read session file {}: {err}",
+                    selected.file_path.display()
+                ))
+            })?;
+            let mut state = serde_json::from_str::<SessionState>(&raw).map_err(|err| {
+                AppError::Runtime(format!(
+                    "failed to parse session file {}: {err}",
+                    selected.file_path.display()
+                ))
+            })?;
+            state.session_name =
+                normalize_session_name(&state.session_id, Some(&state.session_name));
+            self.state = state;
+            self.path = selected.file_path.clone();
+            self.repair_compass();
+            self.enforce_max_limit();
+            self.persist()?;
+        }
+        self.persist_active_session_pointer()?;
+        Ok(build_session_overview(
+            &self.state,
+            self.path.clone(),
+            &self.path,
+        ))
     }
 
     pub fn has_chat_profile(&self) -> bool {
@@ -507,6 +676,8 @@ impl SessionStore {
 
     fn repair_compass(&mut self) {
         let now = now_epoch_ms();
+        self.state.session_name =
+            normalize_session_name(&self.state.session_id, Some(&self.state.session_name));
         if self.state.compass.created_at_epoch_ms == 0 {
             self.state.compass.created_at_epoch_ms = now;
         }
@@ -538,6 +709,66 @@ impl SessionStore {
 fn compute_keep_recent_messages(max_history_messages: usize) -> usize {
     let compress_recent = max_history_messages / 2;
     max_history_messages.saturating_sub(compress_recent).max(1)
+}
+
+fn is_session_state_file_name(file_name: &str) -> bool {
+    if !file_name.ends_with(".json") {
+        return false;
+    }
+    if file_name == "session.json" {
+        return true;
+    }
+    file_name.starts_with("session-")
+}
+
+fn default_session_name(session_id: &str) -> String {
+    format!("session-{session_id}")
+}
+
+fn normalize_session_name(session_id: &str, raw_name: Option<&str>) -> String {
+    let trimmed = raw_name.unwrap_or_default().trim();
+    if trimmed.is_empty() {
+        return default_session_name(session_id);
+    }
+    let limited = trim_chars(trimmed, 80);
+    if limited.trim().is_empty() {
+        return default_session_name(session_id);
+    }
+    limited
+}
+
+fn build_session_overview(
+    state: &SessionState,
+    file_path: PathBuf,
+    active_path: &Path,
+) -> SessionOverview {
+    let mut user_count = 0usize;
+    let mut assistant_count = 0usize;
+    let mut tool_count = 0usize;
+    let mut system_count = 0usize;
+    for item in &state.messages {
+        match item.role.as_str() {
+            "user" => user_count += 1,
+            "assistant" => assistant_count += 1,
+            "tool" => tool_count += 1,
+            "system" => system_count += 1,
+            _ => {}
+        }
+    }
+    SessionOverview {
+        session_id: state.session_id.clone(),
+        session_name: normalize_session_name(&state.session_id, Some(&state.session_name)),
+        message_count: state.messages.len(),
+        summary_len: state.summary.chars().count(),
+        created_at_epoch_ms: state.compass.created_at_epoch_ms,
+        last_updated_epoch_ms: state.compass.last_updated_epoch_ms,
+        file_path: file_path.clone(),
+        user_count,
+        assistant_count,
+        tool_count,
+        system_count,
+        active: file_path == active_path,
+    }
 }
 
 fn new_compass() -> SessionCompass {
