@@ -7,6 +7,7 @@ use std::{
 
 use once_cell::sync::Lazy;
 use regex::Regex;
+use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -407,34 +408,59 @@ impl AiClient {
                         if *count_entry > MAX_REPEAT_SAME_TOOL {
                             finalize_reason = Some(ChatStopReason::RepeatedSameToolCall);
                             build_guard_tool_result("repeated_same_tool_call")
-                        } else if let Some(cached) = tool_result_cache.get(&signature) {
-                            if tool_result_timed_out(cached) {
-                                timeout_total += 1;
-                                let timeout_count =
-                                    timeout_tool_counter.entry(signature.clone()).or_insert(0);
-                                *timeout_count += 1;
-                                if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
-                                    finalize_reason = Some(ChatStopReason::RepeatedToolTimeout);
-                                } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
-                                    finalize_reason = Some(ChatStopReason::TooManyToolTimeouts);
-                                }
-                            }
-                            cached.clone()
                         } else {
-                            let result = execute_tool(&request);
-                            if tool_result_timed_out(&result) {
-                                timeout_total += 1;
-                                let timeout_count =
-                                    timeout_tool_counter.entry(signature.clone()).or_insert(0);
-                                *timeout_count += 1;
-                                if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
-                                    finalize_reason = Some(ChatStopReason::RepeatedToolTimeout);
-                                } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
-                                    finalize_reason = Some(ChatStopReason::TooManyToolTimeouts);
+                            let cacheable_request = is_cacheable_tool_request(&request);
+                            if cacheable_request {
+                                if let Some(cached) = tool_result_cache.get(&signature) {
+                                    if tool_result_timed_out(cached) {
+                                        timeout_total += 1;
+                                        let timeout_count = timeout_tool_counter
+                                            .entry(signature.clone())
+                                            .or_insert(0);
+                                        *timeout_count += 1;
+                                        if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
+                                            finalize_reason =
+                                                Some(ChatStopReason::RepeatedToolTimeout);
+                                        } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
+                                            finalize_reason =
+                                                Some(ChatStopReason::TooManyToolTimeouts);
+                                        }
+                                    }
+                                    cached.clone()
+                                } else {
+                                    let result = execute_tool(&request);
+                                    if tool_result_timed_out(&result) {
+                                        timeout_total += 1;
+                                        let timeout_count = timeout_tool_counter
+                                            .entry(signature.clone())
+                                            .or_insert(0);
+                                        *timeout_count += 1;
+                                        if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
+                                            finalize_reason =
+                                                Some(ChatStopReason::RepeatedToolTimeout);
+                                        } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
+                                            finalize_reason =
+                                                Some(ChatStopReason::TooManyToolTimeouts);
+                                        }
+                                    }
+                                    tool_result_cache.insert(signature, result.clone());
+                                    result
                                 }
+                            } else {
+                                let result = execute_tool(&request);
+                                if tool_result_timed_out(&result) {
+                                    timeout_total += 1;
+                                    let timeout_count =
+                                        timeout_tool_counter.entry(signature.clone()).or_insert(0);
+                                    *timeout_count += 1;
+                                    if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
+                                        finalize_reason = Some(ChatStopReason::RepeatedToolTimeout);
+                                    } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
+                                        finalize_reason = Some(ChatStopReason::TooManyToolTimeouts);
+                                    }
+                                }
+                                result
                             }
-                            tool_result_cache.insert(signature, result.clone());
-                            result
                         }
                     };
                     messages.push(ApiMessage {
@@ -502,6 +528,34 @@ impl AiClient {
                 continue;
             }
 
+            if matches!(policy, ToolUsePolicy::RequireAtLeastOne)
+                && total_tool_calls == 0
+                && forced_continue_hint_rounds < MAX_FORCE_CONTINUE_HINT_ROUNDS
+            {
+                forced_continue_hint_rounds += 1;
+                logging::warn(
+                    "policy requires at least one tool call; assistant returned no tool calls, forcing another round",
+                );
+                messages.push(ApiMessage {
+                    role: "assistant".to_string(),
+                    content: optional_content(assistant_content.clone()),
+                    reasoning_content: Some(build_reasoning_content_for_tool_round(
+                        assistant.reasoning_content.as_deref(),
+                        assistant.reasoning.as_ref(),
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                messages.push(ApiMessage {
+                    role: "system".to_string(),
+                    content: Some("Policy requires at least one local tool call in this round. You must call a tool now instead of giving a final text-only response.".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                continue;
+            }
+
             if !assistant_content.trim().is_empty() {
                 return Ok(ChatToolResponse {
                     content: assistant_content,
@@ -556,7 +610,7 @@ impl AiClient {
                         let safe_body = mask_sensitive(&body);
                         let err_msg = format!("AI HTTP status={status}, body={safe_body}");
                         logging::warn(&err_msg);
-                        if attempt <= self.max_retries {
+                        if attempt <= self.max_retries && should_retry_status(status) {
                             thread::sleep(Duration::from_millis(self.backoff_millis));
                             continue;
                         }
@@ -626,11 +680,26 @@ impl AiClient {
         metrics.total_tokens += call.usage.total_tokens;
         let assistant = call.assistant;
         append_unique_thinking_chunk(&mut thinking_chunks, assistant_reasoning_text(&assistant));
-        let content = sanitize_assistant_content(&assistant_content_text(&assistant));
+        let raw_content = assistant_content_text(&assistant);
+        let content = sanitize_assistant_content(&raw_content);
         if content.trim().is_empty() {
-            return Err(AppError::Ai(
-                "AI returned empty content after tool-calling finalization".to_string(),
-            ));
+            logging::warn(
+                "AI returned empty content after tool-calling finalization; using local fallback response",
+            );
+            let fallback =
+                build_finalization_fallback(stop_reason, tool_rounds_used, total_tool_calls);
+            return Ok(ChatToolResponse {
+                content: fallback,
+                thinking: merge_thinking_chunks(thinking_chunks),
+                metrics: with_cost(
+                    metrics,
+                    self.input_price_per_million,
+                    self.output_price_per_million,
+                ),
+                stop_reason,
+                tool_rounds_used,
+                total_tool_calls,
+            });
         }
         Ok(ChatToolResponse {
             content,
@@ -872,6 +941,22 @@ fn build_guard_tool_result(reason: &str) -> String {
     .to_string()
 }
 
+fn is_cacheable_tool_request(request: &ToolCallRequest) -> bool {
+    if request.name != "run_shell_command" {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&request.arguments) else {
+        return false;
+    };
+    let mode = value
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    mode == "read"
+}
+
 fn normalize_tool_signature(name: &str, arguments: &str) -> String {
     if name == "run_shell_command"
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments)
@@ -1075,6 +1160,14 @@ fn is_tool_choice_unsupported_error(err: &AppError) -> bool {
         || lowered.contains("unsupported tool_choice")
 }
 
+fn should_retry_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
 fn model_prefers_omit_tool_choice(model: &str) -> bool {
     let normalized = model.trim().to_ascii_lowercase();
     normalized == "deepseek-reasoner"
@@ -1101,6 +1194,19 @@ fn should_force_continue_with_tools(content: &str) -> bool {
         "execute it yourself",
     ];
     patterns.iter().any(|p| lowered.contains(p))
+}
+
+fn build_finalization_fallback(
+    stop_reason: Option<ChatStopReason>,
+    tool_rounds_used: usize,
+    total_tool_calls: usize,
+) -> String {
+    let reason_text = stop_reason
+        .map(|item| item.code().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "本轮工具调用已结束（reason={reason_text}, rounds={tool_rounds_used}, tool_calls={total_tool_calls}）。AI 在收尾阶段未返回可展示文本。请继续提问（可缩小排查范围或指定目标日志/目录），我会基于当前已收集证据继续分析。"
+    )
 }
 
 fn build_chat_url(base_url: &str) -> String {

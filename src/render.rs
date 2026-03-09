@@ -56,8 +56,10 @@ static INLINE_STRIKE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"~~([^~\n]+)~~").expect("valid strike regex"));
 static INLINE_ITALIC_ASTERISK_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\*([^*\n]+)\*").expect("valid italic asterisk regex"));
-static INLINE_ITALIC_UNDERSCORE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"_([^_\n]+)_").expect("valid italic underscore regex"));
+static INLINE_ITALIC_UNDERSCORE_SAFE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(^|[^[:alnum:]_])_([^_\n]+)_([^[:alnum:]_]|$)")
+        .expect("valid safe italic underscore regex")
+});
 static INLINE_LINK_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").expect("valid link regex"));
 static INLINE_IMAGE_RE: Lazy<Regex> =
@@ -155,6 +157,39 @@ pub fn render_chat_notice(text: &str, colorful: bool) -> String {
         "{} {}",
         i18n::chat_tag_info().bright_cyan().bold(),
         text.white()
+    )
+}
+
+pub fn render_info_line(text: &str, colorful: bool) -> String {
+    if !supports_color(colorful) {
+        return format!("{}: {text}", i18n::prefix_info());
+    }
+    format!(
+        "{} {}",
+        format!("[{}]", i18n::prefix_info()).bright_cyan().bold(),
+        text.white()
+    )
+}
+
+pub fn render_warn_line(text: &str, colorful: bool) -> String {
+    if !supports_color(colorful) {
+        return format!("{}: {text}", i18n::prefix_warn());
+    }
+    format!(
+        "{} {}",
+        format!("[{}]", i18n::prefix_warn()).bright_yellow().bold(),
+        text.bright_yellow()
+    )
+}
+
+pub fn render_error_line(text: &str, colorful: bool) -> String {
+    if !supports_color(colorful) {
+        return format!("{}: {text}", i18n::prefix_error());
+    }
+    format!(
+        "{} {}",
+        format!("[{}]", i18n::prefix_error()).bright_red().bold(),
+        text.bright_red()
     )
 }
 
@@ -742,9 +777,12 @@ fn style_inline_markdown(line: &str) -> String {
             caps[1].italic().to_string()
         })
         .to_string();
-    text = INLINE_ITALIC_UNDERSCORE_RE
+    text = INLINE_ITALIC_UNDERSCORE_SAFE_RE
         .replace_all(&text, |caps: &regex::Captures<'_>| {
-            caps[1].italic().to_string()
+            let pre = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+            let body = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+            let post = caps.get(3).map(|m| m.as_str()).unwrap_or_default();
+            format!("{pre}{}{post}", body.italic())
         })
         .to_string();
     INLINE_CODE_RE
@@ -782,8 +820,8 @@ fn style_inline_markdown_plain(line: &str) -> String {
     text = INLINE_ITALIC_ASTERISK_RE
         .replace_all(&text, "$1")
         .to_string();
-    text = INLINE_ITALIC_UNDERSCORE_RE
-        .replace_all(&text, "$1")
+    text = INLINE_ITALIC_UNDERSCORE_SAFE_RE
+        .replace_all(&text, "$1$2$3")
         .to_string();
     INLINE_CODE_RE.replace_all(&text, "$1").to_string()
 }

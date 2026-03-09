@@ -323,28 +323,37 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             break;
         }
         if message.eq_ignore_ascii_case("/help") {
-            println!("{}", i18n::chat_help_text());
+            println!(
+                "{}",
+                render::render_markdown_for_terminal(
+                    i18n::chat_help_text(),
+                    services.cfg.console.colorful
+                )
+            );
             continue;
         }
         if message.eq_ignore_ascii_case("/stats") {
             println!(
                 "{}",
-                i18n::chat_stats(
-                    services.session.session_id(),
-                    services.session.file_path(),
-                    services.session.message_count(),
-                    services.session.summary_len(),
-                    services.cfg.session.recent_messages,
-                    services.cfg.session.max_messages,
-                    chat_turns,
-                    services.os_name,
-                    &services.cfg.ai.model,
-                    services.skills.len(),
-                    services.mcp_summary.as_str(),
-                    services.session.count_by_role("user"),
-                    services.session.count_by_role("assistant"),
-                    services.session.count_by_role("tool"),
-                    services.session.count_by_role("system")
+                render::render_markdown_for_terminal(
+                    &i18n::chat_stats(
+                        services.session.session_id(),
+                        services.session.file_path(),
+                        services.session.message_count(),
+                        services.session.summary_len(),
+                        services.cfg.session.recent_messages,
+                        services.cfg.session.max_messages,
+                        chat_turns,
+                        services.os_name,
+                        &services.cfg.ai.model,
+                        services.skills.len(),
+                        services.mcp_summary.as_str(),
+                        services.session.count_by_role("user"),
+                        services.session.count_by_role("assistant"),
+                        services.session.count_by_role("tool"),
+                        services.session.count_by_role("system")
+                    ),
+                    services.cfg.console.colorful
                 )
             );
             continue;
@@ -376,10 +385,13 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                     maybe_ensure_chat_environment_profile(services, &system_prompt)?;
                     println!(
                         "{}",
-                        i18n::chat_session_changed(
-                            &switched.session_name,
-                            &switched.session_id,
-                            &switched.file_path
+                        render::render_markdown_for_terminal(
+                            &i18n::chat_session_changed(
+                                &switched.session_name,
+                                &switched.session_id,
+                                &switched.file_path
+                            ),
+                            services.cfg.console.colorful
                         )
                     );
                 }
@@ -409,9 +421,12 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             services.session.rename_current_session(new_name)?;
             println!(
                 "{}",
-                i18n::chat_session_renamed(
-                    services.session.session_name(),
-                    services.session.session_id()
+                render::render_markdown_for_terminal(
+                    &i18n::chat_session_renamed(
+                        services.session.session_name(),
+                        services.session.session_id()
+                    ),
+                    services.cfg.console.colorful
                 )
             );
             continue;
@@ -423,17 +438,32 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             maybe_ensure_chat_environment_profile(services, &system_prompt)?;
             println!(
                 "{}",
-                i18n::chat_session_switched(
-                    services.session.session_id(),
-                    services.session.file_path()
+                render::render_markdown_for_terminal(
+                    &i18n::chat_session_switched(
+                        services.session.session_id(),
+                        services.session.file_path()
+                    ),
+                    services.cfg.console.colorful
                 )
             );
             continue;
         }
         if message.eq_ignore_ascii_case("/clear") {
             clear_terminal()?;
-            println!("{}", i18n::chat_cleared());
-            println!("{}", i18n::chat_hint());
+            println!(
+                "{}",
+                render::render_markdown_for_terminal(
+                    i18n::chat_cleared(),
+                    services.cfg.console.colorful
+                )
+            );
+            println!(
+                "{}",
+                render::render_markdown_for_terminal(
+                    i18n::chat_hint(),
+                    services.cfg.console.colorful
+                )
+            );
             continue;
         }
 
@@ -477,6 +507,8 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         let stream_output = services.cfg.ai.chat.stream_output;
         let show_tips = services.cfg.ai.chat.show_tips;
         let mut printed_round_thinking = false;
+        let mut last_round_thinking = String::new();
+        let mut last_round_content = String::new();
         let mut ai_wait_spinner =
             ActivitySpinner::start(i18n::chat_progress_analyzing().to_string(), colorful);
         let spinner_stop = ai_wait_spinner.stop_signal();
@@ -505,10 +537,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                     spinner_stop.store(true, Ordering::SeqCst);
                     clear_spinner_line();
                 }
-                if !event.has_tool_calls {
-                    return;
-                }
-                if show_tips {
+                if show_tips && event.has_tool_calls {
                     println!(
                         "{}",
                         render::render_chat_notice(
@@ -521,6 +550,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                     && !thinking.trim().is_empty()
                 {
                     printed_round_thinking = true;
+                    last_round_thinking = thinking.trim().to_string();
                     println!(
                         "{}",
                         render::render_chat_thinking(
@@ -531,6 +561,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                     );
                 }
                 if !event.content.trim().is_empty() {
+                    last_round_content = event.content.trim().to_string();
                     println!(
                         "{}",
                         render::render_chat_assistant_reply(
@@ -564,6 +595,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         if !printed_round_thinking
             && let Some(thinking) = response.thinking.as_deref()
             && !thinking.trim().is_empty()
+            && thinking.trim() != last_round_thinking.trim()
         {
             println!(
                 "{}",
@@ -574,21 +606,26 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                 )
             );
         }
-        if stream_output {
-            render::print_chat_assistant_reply_stream(
-                i18n::chat_prompt_assistant(),
-                response.content.trim(),
-                colorful,
-            )?;
-        } else {
-            println!(
-                "{}",
-                render::render_chat_assistant_reply(
+        let final_content = response.content.trim();
+        let final_content_already_printed =
+            !last_round_content.trim().is_empty() && last_round_content.trim() == final_content;
+        if !final_content_already_printed {
+            if stream_output {
+                render::print_chat_assistant_reply_stream(
                     i18n::chat_prompt_assistant(),
-                    response.content.trim(),
-                    colorful
-                )
-            );
+                    final_content,
+                    colorful,
+                )?;
+            } else {
+                println!(
+                    "{}",
+                    render::render_chat_assistant_reply(
+                        i18n::chat_prompt_assistant(),
+                        final_content,
+                        colorful
+                    )
+                );
+            }
         }
         if services.cfg.ai.chat.show_round_metrics && services.cfg.ai.chat.show_tips {
             println!(

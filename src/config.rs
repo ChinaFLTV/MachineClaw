@@ -426,6 +426,21 @@ pub fn read_language_hint(path: &Path) -> Option<String> {
         .map(|value| value.to_string())
 }
 
+pub fn read_console_colorful_hint(path: &Path) -> Option<bool> {
+    if !path.exists() {
+        return None;
+    }
+    let raw = fs::read_to_string(path).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let parsed = toml::from_str::<toml::Value>(&raw).ok()?;
+    parsed
+        .get("console")
+        .and_then(|item| item.get("colorful"))
+        .and_then(|item| item.as_bool())
+}
+
 pub fn config_template_example() -> &'static str {
     r#"# MachineClaw Config Template
 

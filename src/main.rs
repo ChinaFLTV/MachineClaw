@@ -35,8 +35,8 @@ use crate::{
     ai::AiClient,
     cli::{Cli, Commands},
     config::{
-        config_template_example, expand_tilde, read_language_hint, resolve_config_path,
-        validate_config,
+        config_template_example, expand_tilde, read_console_colorful_hint, read_language_hint,
+        resolve_config_path, validate_config,
     },
     config_action::run_config_command,
     context::SessionStore,
@@ -53,12 +53,14 @@ use crate::{
 };
 
 fn main() {
+    let raw_args: Vec<String> = std::env::args().collect();
+    let startup_colorful = resolve_startup_colorful(&raw_args);
     let exit_code = match run() {
         Ok(code) => code,
         Err(err) => {
             let code = err.exit_code();
             let message = mask::mask_sensitive(&localize_error(&err));
-            eprintln!("{}: {message}", i18n::prefix_error());
+            eprintln!("{}", render::render_error_line(&message, startup_colorful));
             logging::error(&format!("program failed: {message}"));
             code
         }
@@ -69,6 +71,7 @@ fn main() {
 fn run() -> Result<ExitCode, AppError> {
     set_language(resolve_language(None));
     let raw_args: Vec<String> = std::env::args().collect();
+    let startup_colorful = resolve_startup_colorful(&raw_args);
     if let Some(conf_path) = cli::extract_conf_path_from_args(&raw_args)
         && let Ok(resolved_path) = resolve_config_path(Some(conf_path))
         && let Some(language_hint) = read_language_hint(&resolved_path)
@@ -76,7 +79,10 @@ fn run() -> Result<ExitCode, AppError> {
         set_language(resolve_language(Some(&language_hint)));
     }
     if let Some(topic) = cli::detect_help_topic(&raw_args) {
-        println!("{}", cli::localized_help(topic));
+        println!(
+            "{}",
+            render::render_markdown_for_terminal(&cli::localized_help(topic), startup_colorful)
+        );
         return Ok(ExitCode::Success);
     }
 
@@ -93,15 +99,18 @@ fn run() -> Result<ExitCode, AppError> {
     if cli.show_config_template {
         println!(
             "{}",
-            render::render_markdown_for_terminal(
-                config_template_example(),
-                render::resolve_colorful_enabled(true),
-            )
+            render::render_markdown_for_terminal(config_template_example(), startup_colorful,)
         );
         return Ok(ExitCode::Success);
     }
     let Some(command) = cli.command else {
-        println!("{}", cli::localized_help(cli::HelpTopic::Global));
+        println!(
+            "{}",
+            render::render_markdown_for_terminal(
+                &cli::localized_help(cli::HelpTopic::Global),
+                startup_colorful,
+            )
+        );
         return Ok(ExitCode::Success);
     };
     let config_path = resolve_config_path(cli.conf.clone())?;
@@ -110,16 +119,22 @@ fn run() -> Result<ExitCode, AppError> {
     }
     if let Commands::Config { command } = &command {
         let outcome = run_config_command(&config_path, command)?;
-        println!("{}", outcome.rendered);
+        println!(
+            "{}",
+            render::render_markdown_for_terminal(&outcome.rendered, startup_colorful)
+        );
         return Ok(outcome.exit_code);
     }
     if let Commands::Test { target } = &command {
         let assets_setup = render::locate_or_init_assets_dir()?;
         for notice in assets_setup.notices {
-            println!("{}: {notice}", i18n::prefix_info());
+            println!("{}", render::render_info_line(&notice, startup_colorful));
         }
         let outcome = run_test_command(&config_path, *target, &assets_setup.path)?;
-        println!("{}", outcome.rendered);
+        println!(
+            "{}",
+            render::render_markdown_for_terminal(&outcome.rendered, startup_colorful)
+        );
         return Ok(outcome.exit_code);
     }
 
@@ -184,7 +199,10 @@ fn run() -> Result<ExitCode, AppError> {
         language_code(selected_language)
     ));
     if let Some(notice) = language_warning {
-        eprintln!("{}: {notice}", i18n::prefix_warn());
+        eprintln!(
+            "{}",
+            render::render_warn_line(&notice, cfg.console.colorful)
+        );
         logging::warn(&notice);
     }
 
@@ -194,7 +212,10 @@ fn run() -> Result<ExitCode, AppError> {
     let assets_dir = assets_setup.path;
     logging::info(&format!("assets directory={}", assets_dir.display()));
     for notice in assets_setup.notices {
-        println!("{}: {notice}", i18n::prefix_info());
+        println!(
+            "{}",
+            render::render_info_line(&notice, cfg.console.colorful)
+        );
         logging::info(&notice);
     }
 
@@ -278,20 +299,20 @@ fn run_preflight_checks(
     logging::info("preflight start");
     let started = Instant::now();
     println!(
-        "{}: {}",
-        i18n::prefix_info(),
-        i18n::preflight_notice_start()
+        "{}",
+        render::render_info_line(i18n::preflight_notice_start(), cfg.console.colorful)
     );
     println!(
-        "{}: {}",
-        i18n::prefix_info(),
-        i18n::preflight_notice_config_check()
+        "{}",
+        render::render_info_line(i18n::preflight_notice_config_check(), cfg.console.colorful)
     );
     validate_config(cfg)?;
     println!(
-        "{}: {}",
-        i18n::prefix_info(),
-        i18n::preflight_notice_permission_check()
+        "{}",
+        render::render_info_line(
+            i18n::preflight_notice_permission_check(),
+            cfg.console.colorful
+        )
     );
     require_elevated_permissions()?;
     if run_ai_connectivity_check {
@@ -304,15 +325,19 @@ fn run_preflight_checks(
         ai_result?;
     } else {
         println!(
-            "{}: {}",
-            i18n::prefix_info(),
-            i18n::preflight_notice_ai_check_skipped()
+            "{}",
+            render::render_info_line(
+                i18n::preflight_notice_ai_check_skipped(),
+                cfg.console.colorful
+            )
         );
     }
     println!(
-        "{}: {}",
-        i18n::prefix_info(),
-        i18n::preflight_notice_done(&i18n::human_duration_ms(started.elapsed().as_millis()))
+        "{}",
+        render::render_info_line(
+            &i18n::preflight_notice_done(&i18n::human_duration_ms(started.elapsed().as_millis())),
+            cfg.console.colorful,
+        )
     );
     logging::info("preflight finished");
     Ok(())
@@ -326,7 +351,7 @@ struct PreflightSpinner {
 impl PreflightSpinner {
     fn start(message: String, colorful: bool) -> Self {
         if !io::stdout().is_terminal() {
-            println!("{}: {}", i18n::prefix_info(), message);
+            println!("{}", render::render_info_line(&message, colorful));
             return Self {
                 stop: Arc::new(AtomicBool::new(true)),
                 handle: None,
@@ -372,4 +397,19 @@ fn clear_preflight_line() {
     }
     print!("\r{: <180}\r", "");
     let _ = io::stdout().flush();
+}
+
+fn resolve_startup_colorful(raw_args: &[String]) -> bool {
+    let mut colorful = true;
+    let config_path = if let Some(conf_path) = cli::extract_conf_path_from_args(raw_args) {
+        resolve_config_path(Some(conf_path)).ok()
+    } else {
+        resolve_config_path(None).ok()
+    };
+    if let Some(path) = config_path
+        && let Some(colorful_hint) = read_console_colorful_hint(&path)
+    {
+        colorful = colorful_hint;
+    }
+    render::resolve_colorful_enabled(colorful)
 }
