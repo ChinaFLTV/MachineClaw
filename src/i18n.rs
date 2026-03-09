@@ -1884,6 +1884,14 @@ fn localize_detail(detail: &str) -> String {
             Language::Ja => "必須設定 ai.model が不足しています".to_string(),
             Language::En => detail.to_string(),
         },
+        "app.env-mode must be one of: prod, test, dev" => match current_language() {
+            Language::ZhCn => "app.env-mode 取值必须是 prod、test、dev".to_string(),
+            Language::ZhTw => "app.env-mode 取值必須是 prod、test、dev".to_string(),
+            Language::Fr => "app.env-mode doit être prod, test ou dev".to_string(),
+            Language::De => "app.env-mode muss prod, test oder dev sein".to_string(),
+            Language::Ja => "app.env-mode は prod / test / dev のいずれかである必要があります".to_string(),
+            Language::En => detail.to_string(),
+        },
         "cmd.command-timeout-seconds must be greater than 0" => match current_language() {
             Language::ZhCn => "cmd.command-timeout-seconds 必须大于 0".to_string(),
             Language::ZhTw => "cmd.command-timeout-seconds 必須大於 0".to_string(),

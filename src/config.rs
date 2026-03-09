@@ -44,6 +44,7 @@ const DEFAULT_LOG_MAX_FILE_SIZE: &str = "50mb";
 const DEFAULT_LOG_MAX_SAVE_TIME: &str = "7d";
 const DEFAULT_CONTEXT_RECENT_MESSAGES: usize = 40;
 const MAX_CONTEXT_MESSAGES: usize = 80;
+const DEFAULT_APP_ENV_MODE: &str = "prod";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -64,10 +65,21 @@ pub struct AppConfig {
     pub session: SessionConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppSection {
     #[serde(default)]
     pub language: Option<String>,
+    #[serde(rename = "env-mode", default = "default_app_env_mode")]
+    pub env_mode: String,
+}
+
+impl Default for AppSection {
+    fn default() -> Self {
+        Self {
+            language: None,
+            env_mode: default_app_env_mode(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -409,6 +421,7 @@ pub fn config_template_example() -> &'static str {
 ```toml
 [app]
 # language = "zh-CN" # optional: zh-CN, zh-TW, en, fr, de, ja
+env-mode = "prod" # optional: prod, test, dev
 
 [ai]
 base-url = "https://api.deepseek.com/v1" # required
@@ -489,6 +502,12 @@ max_messages = 80 # optional, default 80
 }
 
 pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
+    let env_mode = cfg.app.env_mode.trim().to_ascii_lowercase();
+    if !matches!(env_mode.as_str(), "prod" | "test" | "dev") {
+        return Err(AppError::Config(
+            "app.env-mode must be one of: prod, test, dev".to_string(),
+        ));
+    }
     if cfg.ai.base_url.trim().is_empty() {
         return Err(AppError::Config("ai.base-url is required".to_string()));
     }
@@ -848,6 +867,10 @@ fn default_context_recent_messages() -> usize {
 
 fn default_context_max_messages() -> usize {
     MAX_CONTEXT_MESSAGES
+}
+
+fn default_app_env_mode() -> String {
+    DEFAULT_APP_ENV_MODE.to_string()
 }
 
 fn has_file_extension(file_name: &str) -> bool {

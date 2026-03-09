@@ -672,7 +672,9 @@ fn generate_ai_summary(
     key_metrics: &str,
     results: &[CommandResult],
 ) -> Result<String, AppError> {
-    let system_prompt = render::load_prompt_template(services.assets_dir, "system.md")?;
+    let base_system_prompt = render::load_prompt_template(services.assets_dir, "system.md")?;
+    let system_prompt =
+        append_env_mode_prompt(&base_system_prompt, services.cfg.app.env_mode.as_str());
     let user_template = render::load_prompt_template(services.assets_dir, prompt_name)?;
     let command_details = format_command_details(results);
 
@@ -1395,7 +1397,7 @@ fn clear_terminal() -> Result<(), AppError> {
 }
 
 fn build_chat_system_prompt(services: &ActionServices<'_>, base: &str) -> String {
-    let mut prompt = base.trim().to_string();
+    let mut prompt = append_env_mode_prompt(base, services.cfg.app.env_mode.as_str());
     let skills_list = if services.skills.is_empty() {
         "none".to_string()
     } else {
@@ -1408,6 +1410,22 @@ fn build_chat_system_prompt(services: &ActionServices<'_>, base: &str) -> String
         "\n[Runtime Skill Context]\n- skills_enabled={skills_enabled}\n- skills_dir={skills_dir}\n- detected_skills={skills_list}\n"
     ));
     prompt
+}
+
+fn append_env_mode_prompt(base: &str, env_mode_raw: &str) -> String {
+    let env_mode = env_mode_raw.trim().to_ascii_lowercase();
+    let policy = match env_mode.as_str() {
+        "dev" => {
+            "\n[Environment Mode]\n- env_mode=dev\n- You can be more exploratory for diagnostics and performance experiments.\n- Keep strong safety: never run destructive commands (rm -rf, mkfs, fdisk, shutdown, reboot) without explicit user confirmation.\n- For write actions, prefer reversible operations and explain rollback steps.\n- For potentially disruptive commands, scope them narrowly and cap output/time."
+        }
+        "test" => {
+            "\n[Environment Mode]\n- env_mode=test\n- Balanced behavior: validate hypotheses with enough evidence while controlling execution cost.\n- Avoid long full-disk/full-process scans unless required; prefer sampling and staged checks.\n- Any write or service-affecting action must describe impact and require explicit confirmation.\n- Never execute destructive commands by default."
+        }
+        _ => {
+            "\n[Environment Mode]\n- env_mode=prod\n- Conservative-first policy.\n- Prefer low-impact, low-overhead read commands.\n- Avoid high CPU/IO commands by default (e.g. full recursive scans over large paths) unless strictly necessary.\n- Never run destructive commands (especially rm/rm -rf) or service-stop operations without explicit user confirmation and clear safety notes.\n- If risk is high, provide safer alternatives first."
+        }
+    };
+    format!("{}{}", base.trim(), policy)
 }
 
 fn ensure_chat_environment_profile(
