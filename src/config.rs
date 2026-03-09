@@ -445,7 +445,7 @@ pub fn config_template_example() -> &'static str {
     r#"# MachineClaw Config Template
 
 ## Usage
-- Copy this template into `claw.toml`.
+- Copy this template into `claw-sample.toml`.
 - Keep required keys complete: `ai.base-url`, `ai.token`, `ai.model`.
 - Remove comments if you want a cleaner production config.
 
@@ -460,8 +460,8 @@ base-url = "https://api.deepseek.com/v1" # required
 token = "sk-xxxx" # required
 model = "deepseek-chat" # required
 connectivity-check = true # optional, default true (chat startup)
-input-price-per-million = 0 # optional
-output-price-per-million = 0 # optional
+input-price-per-million = 0 # optional, 0 means use built-in known model pricing when available, otherwise cost shows N/A
+output-price-per-million = 0 # optional, 0 means use built-in known model pricing when available, otherwise cost shows N/A
 
 [ai.retry]
 max-retries = 2 # optional, default 2
@@ -695,7 +695,7 @@ pub fn resolve_config_path(conf: Option<PathBuf>) -> Result<PathBuf, AppError> {
     let exe_dir = exe
         .parent()
         .ok_or_else(|| AppError::Runtime("cannot locate executable directory".to_string()))?;
-    Ok(exe_dir.join("claw.toml"))
+    Ok(exe_dir.join("claw-sample.toml"))
 }
 
 pub fn resolve_path(path: PathBuf) -> Result<PathBuf, AppError> {

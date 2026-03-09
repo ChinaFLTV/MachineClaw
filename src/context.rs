@@ -97,6 +97,15 @@ pub struct SessionOverview {
     pub active: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionRoleCounts {
+    pub total: usize,
+    pub user: usize,
+    pub assistant: usize,
+    pub tool: usize,
+    pub system: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct AiCompressionPlan {
     pub candidate_messages: usize,
@@ -234,12 +243,7 @@ impl SessionStore {
         let raw = serde_json::to_string_pretty(&self.state).map_err(|err| {
             AppError::Runtime(format!("failed to serialize session state: {err}"))
         })?;
-        fs::write(&self.path, raw).map_err(|err| {
-            AppError::Runtime(format!(
-                "failed to write session file {}: {err}",
-                self.path.display()
-            ))
-        })
+        write_string_atomically(&self.path, &raw)
     }
 
     pub fn session_file(path: &Path) -> PathBuf {
@@ -304,12 +308,39 @@ impl SessionStore {
         &self.path
     }
 
-    pub fn count_by_role(&self, role: &str) -> usize {
-        self.state
-            .messages
-            .iter()
-            .filter(|msg| msg.role == role)
-            .count()
+    pub fn archived_role_counts(&self) -> SessionRoleCounts {
+        let mut counts = SessionRoleCounts::default();
+        for message in &self.state.messages {
+            counts.total += 1;
+            match message.role.as_str() {
+                "user" => counts.user += 1,
+                "assistant" => counts.assistant += 1,
+                "tool" => counts.tool += 1,
+                "system" => counts.system += 1,
+                _ => {}
+            }
+        }
+        counts
+    }
+
+    pub fn effective_context_role_counts(
+        &self,
+        include_base_system_prompt: bool,
+    ) -> SessionRoleCounts {
+        let mut counts = self.archived_role_counts();
+        if !self.state.summary.trim().is_empty() {
+            counts.total += 1;
+            counts.system += 1;
+        }
+        if !self.compass_snapshot().trim().is_empty() {
+            counts.total += 1;
+            counts.system += 1;
+        }
+        if include_base_system_prompt {
+            counts.total += 1;
+            counts.system += 1;
+        }
+        counts
     }
 
     pub fn context_pressure_warning(
@@ -698,11 +729,77 @@ impl SessionStore {
         let now = now_epoch_ms();
         self.state.session_name =
             normalize_session_name(&self.state.session_id, Some(&self.state.session_name));
+        let persisted_counts = self.archived_role_counts();
+        self.state.compass.total_user_messages = self
+            .state
+            .compass
+            .total_user_messages
+            .max(persisted_counts.user);
+        self.state.compass.total_assistant_messages = self
+            .state
+            .compass
+            .total_assistant_messages
+            .max(persisted_counts.assistant);
+        self.state.compass.total_tool_messages = self
+            .state
+            .compass
+            .total_tool_messages
+            .max(persisted_counts.tool);
+        if self.state.compass.last_user_topic.trim().is_empty()
+            && let Some(message) = self
+                .state
+                .messages
+                .iter()
+                .rev()
+                .find(|msg| msg.role == "user")
+        {
+            self.state.compass.last_user_topic = extract_topic(&message.content);
+        }
+        if self.state.compass.last_action.trim().is_empty()
+            && let Some(message) = self
+                .state
+                .messages
+                .iter()
+                .rev()
+                .find(|msg| msg.role == "user" && msg.content.starts_with("action="))
+        {
+            self.state.compass.last_action = trim_chars(&message.content, 80);
+        }
+        if self.state.compass.last_assistant_focus.trim().is_empty()
+            && let Some(message) = self
+                .state
+                .messages
+                .iter()
+                .rev()
+                .find(|msg| msg.role == "assistant")
+        {
+            self.state.compass.last_assistant_focus = first_sentence(&message.content, 120);
+        }
+        let first_message_ts = self
+            .state
+            .messages
+            .iter()
+            .map(|msg| msg.created_at_epoch_ms)
+            .min()
+            .unwrap_or(now);
+        let last_message_ts = self
+            .state
+            .messages
+            .iter()
+            .map(|msg| msg.created_at_epoch_ms)
+            .max()
+            .unwrap_or(now);
         if self.state.compass.created_at_epoch_ms == 0 {
-            self.state.compass.created_at_epoch_ms = now;
+            self.state.compass.created_at_epoch_ms = first_message_ts;
         }
         if self.state.compass.last_updated_epoch_ms == 0 {
-            self.state.compass.last_updated_epoch_ms = now;
+            self.state.compass.last_updated_epoch_ms = last_message_ts;
+        } else {
+            self.state.compass.last_updated_epoch_ms = self
+                .state
+                .compass
+                .last_updated_epoch_ms
+                .max(last_message_ts);
         }
     }
 
@@ -721,12 +818,7 @@ impl SessionStore {
             .ok()
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_else(|| self.path.to_string_lossy().to_string());
-        fs::write(&pointer_file, pointer_value).map_err(|err| {
-            AppError::Runtime(format!(
-                "failed to write active session pointer {}: {err}",
-                pointer_file.display()
-            ))
-        })
+        write_string_atomically(&pointer_file, &pointer_value)
     }
 
     fn ensure_session_path_in_sessions_dir(&mut self) -> Result<(), AppError> {
@@ -1080,4 +1172,141 @@ fn machineclaw_base_dir_from_session_path(session_path: &Path) -> PathBuf {
 
 fn session_dir_from_session_path(session_path: &Path) -> PathBuf {
     machineclaw_base_dir_from_session_path(session_path).join("sessions")
+}
+
+fn write_string_atomically(path: &Path, content: &str) -> Result<(), AppError> {
+    let parent = path.parent().ok_or_else(|| {
+        AppError::Runtime(format!(
+            "failed to resolve parent directory for {}",
+            path.display()
+        ))
+    })?;
+    fs::create_dir_all(parent).map_err(|err| {
+        AppError::Runtime(format!(
+            "failed to create parent directory {}: {err}",
+            parent.display()
+        ))
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|item| item.to_str())
+        .unwrap_or("session");
+    let temp_path = parent.join(format!(".{}.{}.tmp", file_name, Uuid::new_v4()));
+    fs::write(&temp_path, content).map_err(|err| {
+        AppError::Runtime(format!(
+            "failed to write temporary file {}: {err}",
+            temp_path.display()
+        ))
+    })?;
+    if let Err(err) = fs::rename(&temp_path, path) {
+        if path.exists() {
+            let _ = fs::remove_file(path);
+            fs::rename(&temp_path, path).map_err(|rename_err| {
+                AppError::Runtime(format!(
+                    "failed to replace file {} after rename error {}: {}",
+                    path.display(),
+                    err,
+                    rename_err
+                ))
+            })?;
+        } else {
+            let _ = fs::remove_file(&temp_path);
+            return Err(AppError::Runtime(format!(
+                "failed to move temporary file into place {}: {err}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MessageKind, SessionRoleCounts, SessionState, SessionStore, new_compass};
+    use std::path::PathBuf;
+
+    fn build_store(summary: &str) -> SessionStore {
+        SessionStore {
+            path: PathBuf::from("/tmp/session.json"),
+            state: SessionState {
+                session_id: "session-1".to_string(),
+                session_name: "session-1".to_string(),
+                summary: summary.to_string(),
+                messages: vec![
+                    super::SessionMessage {
+                        role: "user".to_string(),
+                        content: "hello".to_string(),
+                        kind: MessageKind::User,
+                        group_id: None,
+                        created_at_epoch_ms: 1,
+                    },
+                    super::SessionMessage {
+                        role: "assistant".to_string(),
+                        content: "world".to_string(),
+                        kind: MessageKind::Assistant,
+                        group_id: None,
+                        created_at_epoch_ms: 2,
+                    },
+                    super::SessionMessage {
+                        role: "tool".to_string(),
+                        content: "{}".to_string(),
+                        kind: MessageKind::Tool,
+                        group_id: None,
+                        created_at_epoch_ms: 3,
+                    },
+                ],
+                compass: new_compass(),
+            },
+            recent_limit: 40,
+            max_limit: 80,
+            compression_max_history_messages: 40,
+            compression_max_chars_count: 80_000,
+            compression_keep_recent_messages: 20,
+        }
+    }
+
+    #[test]
+    fn archived_role_counts_only_counts_persisted_messages() {
+        let store = build_store("");
+        let counts = store.archived_role_counts();
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.user, 1);
+        assert_eq!(counts.assistant, 1);
+        assert_eq!(counts.tool, 1);
+        assert_eq!(counts.system, 0);
+    }
+
+    #[test]
+    fn effective_context_role_counts_include_ephemeral_system_messages() {
+        let store = build_store("summary");
+        let counts = store.effective_context_role_counts(true);
+        assert_eq!(
+            counts,
+            SessionRoleCounts {
+                total: 6,
+                user: 1,
+                assistant: 1,
+                tool: 1,
+                system: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn repair_compass_backfills_missing_counts_and_topics() {
+        let mut store = build_store("");
+        store.state.compass.total_user_messages = 0;
+        store.state.compass.total_assistant_messages = 0;
+        store.state.compass.total_tool_messages = 0;
+        store.state.compass.last_user_topic.clear();
+        store.state.compass.last_assistant_focus.clear();
+        store.state.compass.last_updated_epoch_ms = 0;
+        store.repair_compass();
+        assert_eq!(store.state.compass.total_user_messages, 1);
+        assert_eq!(store.state.compass.total_assistant_messages, 1);
+        assert_eq!(store.state.compass.total_tool_messages, 1);
+        assert!(!store.state.compass.last_user_topic.is_empty());
+        assert!(!store.state.compass.last_assistant_focus.is_empty());
+        assert_eq!(store.state.compass.last_updated_epoch_ms, 3);
+    }
 }

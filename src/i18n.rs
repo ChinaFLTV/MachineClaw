@@ -1291,7 +1291,8 @@ pub fn chat_session_switched(session_id: &str, session_file: &Path) -> String {
 pub fn chat_stats(
     session_id: &str,
     session_file: &Path,
-    message_count: usize,
+    archived_message_count: usize,
+    effective_message_count: usize,
     summary_len: usize,
     recent_limit: usize,
     max_limit: usize,
@@ -1304,8 +1305,13 @@ pub fn chat_stats(
     assistant_count: usize,
     tool_count: usize,
     system_count: usize,
+    effective_user_count: usize,
+    effective_assistant_count: usize,
+    effective_tool_count: usize,
+    effective_system_count: usize,
 ) -> String {
-    let message_count_fmt = human_count_u128(message_count as u128);
+    let archived_message_count_fmt = human_count_u128(archived_message_count as u128);
+    let effective_message_count_fmt = human_count_u128(effective_message_count as u128);
     let summary_len_fmt = human_count_u128(summary_len as u128);
     let recent_limit_fmt = human_count_u128(recent_limit as u128);
     let max_limit_fmt = human_count_u128(max_limit as u128);
@@ -1315,29 +1321,33 @@ pub fn chat_stats(
     let assistant_count_fmt = human_count_u128(assistant_count as u128);
     let tool_count_fmt = human_count_u128(tool_count as u128);
     let system_count_fmt = human_count_u128(system_count as u128);
+    let effective_user_count_fmt = human_count_u128(effective_user_count as u128);
+    let effective_assistant_count_fmt = human_count_u128(effective_assistant_count as u128);
+    let effective_tool_count_fmt = human_count_u128(effective_tool_count as u128);
+    let effective_system_count_fmt = human_count_u128(effective_system_count as u128);
     match current_language() {
         Language::ZhCn => format!(
-            "会话统计\n会话: {session_id}\n会话文件: {}\n系统/模型: {os_name} / {model}\n消息总数: {message_count_fmt} (用户 {user_count_fmt}, 助手 {assistant_count_fmt}, 工具 {tool_count_fmt}, 系统 {system_count_fmt})\n摘要长度: {summary_len_fmt} 字符\n本次 chat 轮次: {chat_turns_fmt}\n上下文窗口: recent={recent_limit_fmt}, max={max_limit_fmt}\n能力状态: skills={skills_count_fmt}, mcp={mcp_summary}",
+            "会话统计\n会话: {session_id}\n会话文件: {}\n系统/模型: {os_name} / {model}\n会话存档消息: {archived_message_count_fmt} (用户 {user_count_fmt}, 助手 {assistant_count_fmt}, 工具 {tool_count_fmt}, 系统 {system_count_fmt})\n当前送模上下文: {effective_message_count_fmt} (用户 {effective_user_count_fmt}, 助手 {effective_assistant_count_fmt}, 工具 {effective_tool_count_fmt}, 系统 {effective_system_count_fmt})\n摘要长度: {summary_len_fmt} 字符\n本次 chat 轮次: {chat_turns_fmt}\n上下文窗口: recent={recent_limit_fmt}, max={max_limit_fmt}\n能力状态: skills={skills_count_fmt}, mcp={mcp_summary}",
             session_file.display()
         ),
         Language::ZhTw => format!(
-            "會話統計\n會話: {session_id}\n會話檔案: {}\n系統/模型: {os_name} / {model}\n訊息總數: {message_count_fmt} (使用者 {user_count_fmt}, 助手 {assistant_count_fmt}, 工具 {tool_count_fmt}, 系統 {system_count_fmt})\n摘要長度: {summary_len_fmt} 字元\n本次 chat 輪次: {chat_turns_fmt}\n上下文視窗: recent={recent_limit_fmt}, max={max_limit_fmt}\n能力狀態: skills={skills_count_fmt}, mcp={mcp_summary}",
+            "會話統計\n會話: {session_id}\n會話檔案: {}\n系統/模型: {os_name} / {model}\n會話封存訊息: {archived_message_count_fmt} (使用者 {user_count_fmt}, 助手 {assistant_count_fmt}, 工具 {tool_count_fmt}, 系統 {system_count_fmt})\n目前送模上下文: {effective_message_count_fmt} (使用者 {effective_user_count_fmt}, 助手 {effective_assistant_count_fmt}, 工具 {effective_tool_count_fmt}, 系統 {effective_system_count_fmt})\n摘要長度: {summary_len_fmt} 字元\n本次 chat 輪次: {chat_turns_fmt}\n上下文視窗: recent={recent_limit_fmt}, max={max_limit_fmt}\n能力狀態: skills={skills_count_fmt}, mcp={mcp_summary}",
             session_file.display()
         ),
         Language::Fr => format!(
-            "Statistiques de session\nSession: {session_id}\nFichier: {}\nSystème/Modèle: {os_name} / {model}\nMessages: {message_count_fmt} (user {user_count_fmt}, assistant {assistant_count_fmt}, tool {tool_count_fmt}, system {system_count_fmt})\nLongueur du résumé: {summary_len_fmt}\nTours de chat: {chat_turns_fmt}\nFenêtre de contexte: recent={recent_limit_fmt}, max={max_limit_fmt}\nCapacités: skills={skills_count_fmt}, mcp={mcp_summary}",
+            "Statistiques de session\nSession: {session_id}\nFichier: {}\nSystème/Modèle: {os_name} / {model}\nMessages archivés: {archived_message_count_fmt} (user {user_count_fmt}, assistant {assistant_count_fmt}, tool {tool_count_fmt}, system {system_count_fmt})\nContexte envoyé au modèle: {effective_message_count_fmt} (user {effective_user_count_fmt}, assistant {effective_assistant_count_fmt}, tool {effective_tool_count_fmt}, system {effective_system_count_fmt})\nLongueur du résumé: {summary_len_fmt}\nTours de chat: {chat_turns_fmt}\nFenêtre de contexte: recent={recent_limit_fmt}, max={max_limit_fmt}\nCapacités: skills={skills_count_fmt}, mcp={mcp_summary}",
             session_file.display()
         ),
         Language::De => format!(
-            "Sitzungsstatistik\nSitzung: {session_id}\nDatei: {}\nSystem/Modell: {os_name} / {model}\nNachrichten: {message_count_fmt} (user {user_count_fmt}, assistant {assistant_count_fmt}, tool {tool_count_fmt}, system {system_count_fmt})\nZusammenfassungslänge: {summary_len_fmt}\nChat-Runden: {chat_turns_fmt}\nKontextfenster: recent={recent_limit_fmt}, max={max_limit_fmt}\nFähigkeiten: skills={skills_count_fmt}, mcp={mcp_summary}",
+            "Sitzungsstatistik\nSitzung: {session_id}\nDatei: {}\nSystem/Modell: {os_name} / {model}\nArchivierte Nachrichten: {archived_message_count_fmt} (user {user_count_fmt}, assistant {assistant_count_fmt}, tool {tool_count_fmt}, system {system_count_fmt})\nAn Modell gesendeter Kontext: {effective_message_count_fmt} (user {effective_user_count_fmt}, assistant {effective_assistant_count_fmt}, tool {effective_tool_count_fmt}, system {effective_system_count_fmt})\nZusammenfassungslänge: {summary_len_fmt}\nChat-Runden: {chat_turns_fmt}\nKontextfenster: recent={recent_limit_fmt}, max={max_limit_fmt}\nFähigkeiten: skills={skills_count_fmt}, mcp={mcp_summary}",
             session_file.display()
         ),
         Language::Ja => format!(
-            "セッション統計\nセッション: {session_id}\nファイル: {}\nシステム/モデル: {os_name} / {model}\nメッセージ総数: {message_count_fmt} (user {user_count_fmt}, assistant {assistant_count_fmt}, tool {tool_count_fmt}, system {system_count_fmt})\n要約文字数: {summary_len_fmt}\nchat ターン数: {chat_turns_fmt}\nコンテキスト枠: recent={recent_limit_fmt}, max={max_limit_fmt}\n機能: skills={skills_count_fmt}, mcp={mcp_summary}",
+            "セッション統計\nセッション: {session_id}\nファイル: {}\nシステム/モデル: {os_name} / {model}\n保存済みメッセージ: {archived_message_count_fmt} (user {user_count_fmt}, assistant {assistant_count_fmt}, tool {tool_count_fmt}, system {system_count_fmt})\nモデル送信コンテキスト: {effective_message_count_fmt} (user {effective_user_count_fmt}, assistant {effective_assistant_count_fmt}, tool {effective_tool_count_fmt}, system {effective_system_count_fmt})\n要約文字数: {summary_len_fmt}\nchat ターン数: {chat_turns_fmt}\nコンテキスト枠: recent={recent_limit_fmt}, max={max_limit_fmt}\n機能: skills={skills_count_fmt}, mcp={mcp_summary}",
             session_file.display()
         ),
         Language::En => format!(
-            "session stats\nsession: {session_id}\nfile: {}\nos/model: {os_name} / {model}\nmessages: {message_count_fmt} (user {user_count_fmt}, assistant {assistant_count_fmt}, tool {tool_count_fmt}, system {system_count_fmt})\nsummary chars: {summary_len_fmt}\nchat turns: {chat_turns_fmt}\ncontext window: recent={recent_limit_fmt}, max={max_limit_fmt}\ncapability: skills={skills_count_fmt}, mcp={mcp_summary}",
+            "session stats\nsession: {session_id}\nfile: {}\nos/model: {os_name} / {model}\narchived messages: {archived_message_count_fmt} (user {user_count_fmt}, assistant {assistant_count_fmt}, tool {tool_count_fmt}, system {system_count_fmt})\neffective model context: {effective_message_count_fmt} (user {effective_user_count_fmt}, assistant {effective_assistant_count_fmt}, tool {effective_tool_count_fmt}, system {effective_system_count_fmt})\nsummary chars: {summary_len_fmt}\nchat turns: {chat_turns_fmt}\ncontext window: recent={recent_limit_fmt}, max={max_limit_fmt}\ncapability: skills={skills_count_fmt}, mcp={mcp_summary}",
             session_file.display()
         ),
     }
@@ -1785,7 +1795,7 @@ pub fn chat_round_metrics(
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
-    estimated_cost_usd: f64,
+    estimated_cost_usd: Option<f64>,
     show_cost: bool,
 ) -> String {
     let duration = human_duration_ms(api_duration_ms);
@@ -1794,11 +1804,21 @@ pub fn chat_round_metrics(
     let prompt_tokens_fmt = human_count_u64(prompt_tokens);
     let completion_tokens_fmt = human_count_u64(completion_tokens);
     let total_tokens_fmt = human_count_u64(total_tokens);
+    let estimated_cost_text = estimated_cost_usd
+        .map(|value| format!("{value:.6} USD"))
+        .unwrap_or_else(|| match current_language() {
+            Language::ZhCn => "N/A（缺少有效单价）".to_string(),
+            Language::ZhTw => "N/A（缺少有效單價）".to_string(),
+            Language::Fr => "N/A (tarif indisponible)".to_string(),
+            Language::De => "N/A (kein Preis verfügbar)".to_string(),
+            Language::Ja => "N/A（有効な単価なし）".to_string(),
+            Language::En => "N/A (pricing unavailable)".to_string(),
+        });
     match current_language() {
         Language::ZhCn => {
             if show_cost {
                 return format!(
-                    "本轮指标：请求轮次 {api_rounds_fmt}，接口耗时 {duration}（{api_duration_ms_fmt} ms），Token（输入/输出/总计）{prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}，预估费用 {estimated_cost_usd:.6} USD"
+                    "本轮指标：请求轮次 {api_rounds_fmt}，接口耗时 {duration}（{api_duration_ms_fmt} ms），Token（输入/输出/总计）{prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}，预估费用 {estimated_cost_text}"
                 );
             }
             format!(
@@ -1808,7 +1828,7 @@ pub fn chat_round_metrics(
         Language::ZhTw => {
             if show_cost {
                 return format!(
-                    "本輪指標：請求輪次 {api_rounds_fmt}，介面耗時 {duration}（{api_duration_ms_fmt} ms），Token（輸入/輸出/總計）{prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}，預估費用 {estimated_cost_usd:.6} USD"
+                    "本輪指標：請求輪次 {api_rounds_fmt}，介面耗時 {duration}（{api_duration_ms_fmt} ms），Token（輸入/輸出/總計）{prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}，預估費用 {estimated_cost_text}"
                 );
             }
             format!(
@@ -1818,7 +1838,7 @@ pub fn chat_round_metrics(
         Language::Fr => {
             if show_cost {
                 return format!(
-                    "Métriques du tour: cycles {api_rounds_fmt}, durée API {duration} ({api_duration_ms_fmt} ms), tokens (entrée/sortie/total) {prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}, coût estimé {estimated_cost_usd:.6} USD"
+                    "Métriques du tour: cycles {api_rounds_fmt}, durée API {duration} ({api_duration_ms_fmt} ms), tokens (entrée/sortie/total) {prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}, coût estimé {estimated_cost_text}"
                 );
             }
             format!(
@@ -1828,7 +1848,7 @@ pub fn chat_round_metrics(
         Language::De => {
             if show_cost {
                 return format!(
-                    "Rundenmetriken: Durchläufe {api_rounds_fmt}, API-Dauer {duration} ({api_duration_ms_fmt} ms), Tokens (Eingabe/Ausgabe/Gesamt) {prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}, geschätzte Kosten {estimated_cost_usd:.6} USD"
+                    "Rundenmetriken: Durchläufe {api_rounds_fmt}, API-Dauer {duration} ({api_duration_ms_fmt} ms), Tokens (Eingabe/Ausgabe/Gesamt) {prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}, geschätzte Kosten {estimated_cost_text}"
                 );
             }
             format!(
@@ -1838,7 +1858,7 @@ pub fn chat_round_metrics(
         Language::Ja => {
             if show_cost {
                 return format!(
-                    "ラウンド指標: リクエスト回数 {api_rounds_fmt}、API時間 {duration}（{api_duration_ms_fmt} ms）、Token（入力/出力/合計）{prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}、推定コスト {estimated_cost_usd:.6} USD"
+                    "ラウンド指標: リクエスト回数 {api_rounds_fmt}、API時間 {duration}（{api_duration_ms_fmt} ms）、Token（入力/出力/合計）{prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}、推定コスト {estimated_cost_text}"
                 );
             }
             format!(
@@ -1848,7 +1868,7 @@ pub fn chat_round_metrics(
         Language::En => {
             if show_cost {
                 return format!(
-                    "Round metrics: rounds {api_rounds_fmt}, API duration {duration} ({api_duration_ms_fmt} ms), tokens (prompt/completion/total) {prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}, estimated cost {estimated_cost_usd:.6} USD"
+                    "Round metrics: rounds {api_rounds_fmt}, API duration {duration} ({api_duration_ms_fmt} ms), tokens (prompt/completion/total) {prompt_tokens_fmt}/{completion_tokens_fmt}/{total_tokens_fmt}, estimated cost {estimated_cost_text}"
                 );
             }
             format!(

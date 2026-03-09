@@ -290,13 +290,16 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                     );
                 }
                 "stats" if command.arg.is_empty() => {
+                    let archived_counts = services.session.archived_role_counts();
+                    let effective_counts = services.session.effective_context_role_counts(true);
                     println!(
                         "{}",
                         render::render_markdown_for_terminal(
                             &i18n::chat_stats(
                                 services.session.session_id(),
                                 services.session.file_path(),
-                                services.session.message_count(),
+                                archived_counts.total,
+                                effective_counts.total,
                                 services.session.summary_len(),
                                 services.cfg.session.recent_messages,
                                 services.cfg.session.max_messages,
@@ -305,10 +308,14 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                                 &services.cfg.ai.model,
                                 services.skills.len(),
                                 services.mcp_summary.as_str(),
-                                services.session.count_by_role("user"),
-                                services.session.count_by_role("assistant"),
-                                services.session.count_by_role("tool"),
-                                services.session.count_by_role("system")
+                                archived_counts.user,
+                                archived_counts.assistant,
+                                archived_counts.tool,
+                                archived_counts.system,
+                                effective_counts.user,
+                                effective_counts.assistant,
+                                effective_counts.tool,
+                                effective_counts.system,
                             ),
                             services.cfg.console.colorful
                         )
@@ -597,11 +604,11 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                 )
             );
         }
-        last_assistant_reply = response.content.clone();
+        last_assistant_reply = response.archived_content.clone();
 
         services
             .session
-            .add_assistant_message(response.content.clone(), Some(group_id));
+            .add_assistant_message(response.archived_content.clone(), Some(group_id));
         services.session.persist()?;
         if let Some(selected) = maybe_pick_next_option(
             &response.content,
@@ -1568,11 +1575,23 @@ fn build_chat_system_prompt(services: &ActionServices<'_>, base: &str) -> String
     } else {
         services.skills.join(", ")
     };
+    let mcp_tools = services
+        .mcp
+        .external_tool_definitions()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+    let mcp_tools_list = if mcp_tools.is_empty() {
+        "none".to_string()
+    } else {
+        mcp_tools.join(", ")
+    };
     let skills_enabled = services.cfg.skills.enabled;
     let skills_dir = services.cfg.skills.dir.trim();
-    prompt.push_str("\n\n[Skill Workflow]\n- Before complex tasks, scan available skills first.\n- If a matching skill exists, follow its SKILL.md workflow.\n- In responses, explicitly mention which skill is used.\n");
+    prompt.push_str("\n\n[Capability Selection]\n- Shell execution, Skills, and MCP are peer capabilities. Choose the smallest sufficient one; do not systematically bias toward any single category.\n- Prefer Shell for deterministic local inspection, code edits, build/test, log/file/process analysis, and other machine-local operations.\n- Prefer Skills when a detected skill clearly matches the task and provides a reusable workflow or domain guardrails.\n- Prefer MCP when the task needs an integrated external service or dedicated remote capability that Shell/Skill cannot provide cleanly.\n- Avoid both extremes: do not stay text-only when evidence is missing, and do not chain tools endlessly when the evidence is already sufficient.\n- After each tool result, reassess whether you should answer in text now or call another tool.\n- If the model returns user-visible text in any round, preserve it and surface it; do not drop, overwrite, or silently ignore earlier assistant text.\n");
+    prompt.push_str("\n[Skill Workflow]\n- Before complex tasks, scan available skills first.\n- If a matching skill exists, follow its SKILL.md workflow.\n- In responses, explicitly mention which skill is used.\n");
     prompt.push_str(&format!(
-        "\n[Runtime Skill Context]\n- skills_enabled={skills_enabled}\n- skills_dir={skills_dir}\n- detected_skills={skills_list}\n"
+        "\n[Runtime Capability Context]\n- shell_tool=run_shell_command\n- skills_enabled={skills_enabled}\n- skills_dir={skills_dir}\n- detected_skills={skills_list}\n- detected_mcp_tools={mcp_tools_list}\n"
     ));
     prompt
 }

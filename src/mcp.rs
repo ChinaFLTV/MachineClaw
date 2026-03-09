@@ -264,11 +264,7 @@ impl McpManager {
         let Some(connection) = self.connections.get_mut(binding.connection_idx) else {
             return Err(AppError::Runtime("mcp connection not found".to_string()));
         };
-        let args = if raw_arguments.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str::<Value>(raw_arguments).unwrap_or_else(|_| json!({}))
-        };
+        let args = parse_mcp_tool_arguments(raw_arguments)?;
 
         let result = request_mcp(
             &mut connection.transport,
@@ -459,12 +455,23 @@ fn notify_mcp(transport: &mut McpTransport, method: &str, params: Value) -> Resu
                 "method": method,
                 "params": params
             });
-            client
+            let resp = client
                 .client
                 .post(&client.endpoint)
                 .json(&body)
                 .send()
                 .map_err(|err| AppError::Runtime(format!("MCP http notification failed: {err}")))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp
+                    .text()
+                    .unwrap_or_else(|_| "<unreadable body>".to_string());
+                return Err(AppError::Runtime(format!(
+                    "MCP http notification failed: status={}, body={}",
+                    status,
+                    mask_sensitive(&body)
+                )));
+            }
             Ok(())
         }
     }
@@ -538,6 +545,17 @@ fn http_request(
         .send()
         .map_err(|err| AppError::Runtime(format!("MCP http request failed: {err}")));
     let resp = resp?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp
+            .text()
+            .unwrap_or_else(|_| "<unreadable body>".to_string());
+        return Err(AppError::Runtime(format!(
+            "MCP http request failed: status={}, body={}",
+            status,
+            mask_sensitive(&body)
+        )));
+    }
     let body: Value = resp
         .json()
         .map_err(|err| AppError::Runtime(format!("failed to parse MCP response: {err}")))?;
@@ -660,6 +678,29 @@ fn sanitize_tool_name(name: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
+fn parse_mcp_tool_arguments(raw_arguments: &str) -> Result<Value, AppError> {
+    let trimmed = raw_arguments.trim();
+    if trimmed.is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str::<Value>(trimmed).map_err(|err| {
+        AppError::Runtime(format!(
+            "invalid MCP tool arguments JSON: {}, raw={}",
+            err,
+            mask_sensitive(&trim_text_preview(trimmed, 240))
+        ))
+    })
+}
+
+fn trim_text_preview(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let trimmed: String = text.chars().take(max_chars).collect();
+    format!("{}...", trimmed)
+}
+
 fn extract_tool_call_text(result: &Value) -> String {
     if let Some(content) = result.get("content").and_then(|value| value.as_array()) {
         let texts = content
@@ -682,4 +723,21 @@ fn extract_tool_call_text(result: &Value) -> String {
         return value.to_string();
     }
     result.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_mcp_tool_arguments;
+
+    #[test]
+    fn parse_mcp_tool_arguments_accepts_empty_input() {
+        let parsed = parse_mcp_tool_arguments("").expect("empty input should be allowed");
+        assert_eq!(parsed.to_string(), "{}");
+    }
+
+    #[test]
+    fn parse_mcp_tool_arguments_rejects_invalid_json() {
+        let err = parse_mcp_tool_arguments("{not-json").expect_err("invalid json must fail");
+        assert!(err.to_string().contains("invalid MCP tool arguments JSON"));
+    }
 }

@@ -15,7 +15,7 @@
 
 # Local config and secrets
 claw.toml
-/.docs/claw.toml
+/sample/claw-sample.toml
 .env
 .env.*
 *.pem

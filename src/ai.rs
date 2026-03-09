@@ -36,6 +36,7 @@ pub enum ToolUsePolicy {
 #[derive(Debug, Clone)]
 pub struct ChatToolResponse {
     pub content: String,
+    pub archived_content: String,
     pub thinking: Option<String>,
     pub metrics: ChatMetrics,
     pub stop_reason: Option<ChatStopReason>,
@@ -80,7 +81,7 @@ pub struct ChatMetrics {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
-    pub estimated_cost_usd: f64,
+    pub estimated_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +278,7 @@ impl AiClient {
         let mut timeout_tool_counter: HashMap<String, usize> = HashMap::new();
         let mut timeout_total: usize = 0;
         let mut thinking_chunks: Vec<String> = Vec::new();
+        let mut visible_assistant_chunks: Vec<String> = Vec::new();
         let mut metrics = ChatMetrics::default();
         let mut tool_rounds_used: usize = 0;
         let mut forced_continue_hint_rounds: usize = 0;
@@ -345,6 +347,7 @@ impl AiClient {
             let round_thinking = assistant_reasoning_text(&assistant);
             append_unique_thinking_chunk(&mut thinking_chunks, round_thinking.clone());
             let assistant_content = sanitize_assistant_content(&assistant_content_text(&assistant));
+            append_unique_visible_chunk(&mut visible_assistant_chunks, assistant_content.clone());
             let mut tool_calls = assistant.tool_calls.clone();
             if tool_calls.is_empty() {
                 tool_calls =
@@ -478,11 +481,14 @@ impl AiClient {
                     ));
                     return self.finalize_without_tools(
                         messages,
-                        thinking_chunks,
-                        metrics,
+                        FinalizeWithoutToolsState {
+                            thinking_chunks,
+                            visible_assistant_chunks,
+                            metrics,
+                            tool_rounds_used,
+                            total_tool_calls,
+                        },
                         finalize_reason,
-                        tool_rounds_used,
-                        total_tool_calls,
                     );
                 }
                 continue;
@@ -558,10 +564,15 @@ impl AiClient {
 
             if !assistant_content.trim().is_empty() {
                 return Ok(ChatToolResponse {
+                    archived_content: merge_visible_chunks(
+                        &visible_assistant_chunks,
+                        Some(assistant_content.as_str()),
+                    ),
                     content: assistant_content,
                     thinking: merge_thinking_chunks(thinking_chunks),
                     metrics: with_cost(
                         metrics,
+                        &self.model,
                         self.input_price_per_million,
                         self.output_price_per_million,
                     ),
@@ -576,11 +587,14 @@ impl AiClient {
 
         self.finalize_without_tools(
             messages,
-            thinking_chunks,
-            metrics,
+            FinalizeWithoutToolsState {
+                thinking_chunks,
+                visible_assistant_chunks,
+                metrics,
+                tool_rounds_used,
+                total_tool_calls,
+            },
             Some(ChatStopReason::MaxToolRoundsReached),
-            tool_rounds_used,
-            total_tool_calls,
         )
     }
 
@@ -653,11 +667,8 @@ impl AiClient {
     fn finalize_without_tools(
         &self,
         mut messages: Vec<ApiMessage>,
-        mut thinking_chunks: Vec<String>,
-        mut metrics: ChatMetrics,
+        mut state: FinalizeWithoutToolsState,
         stop_reason: Option<ChatStopReason>,
-        tool_rounds_used: usize,
-        total_tool_calls: usize,
     ) -> Result<ChatToolResponse, AppError> {
         messages.push(ApiMessage {
             role: "system".to_string(),
@@ -673,45 +684,73 @@ impl AiClient {
             tools: None,
             tool_choice: None,
         })?;
-        metrics.api_rounds += 1;
-        metrics.api_duration_ms += call.elapsed_ms;
-        metrics.prompt_tokens += call.usage.prompt_tokens;
-        metrics.completion_tokens += call.usage.completion_tokens;
-        metrics.total_tokens += call.usage.total_tokens;
+        state.metrics.api_rounds += 1;
+        state.metrics.api_duration_ms += call.elapsed_ms;
+        state.metrics.prompt_tokens += call.usage.prompt_tokens;
+        state.metrics.completion_tokens += call.usage.completion_tokens;
+        state.metrics.total_tokens += call.usage.total_tokens;
         let assistant = call.assistant;
-        append_unique_thinking_chunk(&mut thinking_chunks, assistant_reasoning_text(&assistant));
+        append_unique_thinking_chunk(
+            &mut state.thinking_chunks,
+            assistant_reasoning_text(&assistant),
+        );
         let raw_content = assistant_content_text(&assistant);
         let content = sanitize_assistant_content(&raw_content);
+        let archived_content =
+            merge_visible_chunks(&state.visible_assistant_chunks, Some(&content));
         if content.trim().is_empty() {
+            if !archived_content.trim().is_empty() {
+                return Ok(ChatToolResponse {
+                    content: archived_content.clone(),
+                    archived_content,
+                    thinking: merge_thinking_chunks(state.thinking_chunks),
+                    metrics: with_cost(
+                        state.metrics,
+                        &self.model,
+                        self.input_price_per_million,
+                        self.output_price_per_million,
+                    ),
+                    stop_reason,
+                    tool_rounds_used: state.tool_rounds_used,
+                    total_tool_calls: state.total_tool_calls,
+                });
+            }
             logging::warn(
                 "AI returned empty content after tool-calling finalization; using local fallback response",
             );
-            let fallback =
-                build_finalization_fallback(stop_reason, tool_rounds_used, total_tool_calls);
+            let fallback = build_finalization_fallback(
+                stop_reason,
+                state.tool_rounds_used,
+                state.total_tool_calls,
+            );
             return Ok(ChatToolResponse {
+                archived_content: fallback.clone(),
                 content: fallback,
-                thinking: merge_thinking_chunks(thinking_chunks),
+                thinking: merge_thinking_chunks(state.thinking_chunks),
                 metrics: with_cost(
-                    metrics,
+                    state.metrics,
+                    &self.model,
                     self.input_price_per_million,
                     self.output_price_per_million,
                 ),
                 stop_reason,
-                tool_rounds_used,
-                total_tool_calls,
+                tool_rounds_used: state.tool_rounds_used,
+                total_tool_calls: state.total_tool_calls,
             });
         }
         Ok(ChatToolResponse {
+            archived_content,
             content,
-            thinking: merge_thinking_chunks(thinking_chunks),
+            thinking: merge_thinking_chunks(state.thinking_chunks),
             metrics: with_cost(
-                metrics,
+                state.metrics,
+                &self.model,
                 self.input_price_per_million,
                 self.output_price_per_million,
             ),
             stop_reason,
-            tool_rounds_used,
-            total_tool_calls,
+            tool_rounds_used: state.tool_rounds_used,
+            total_tool_calls: state.total_tool_calls,
         })
     }
 }
@@ -786,6 +825,14 @@ struct ApiChatCallResult {
     elapsed_ms: u128,
 }
 
+struct FinalizeWithoutToolsState {
+    thinking_chunks: Vec<String>,
+    visible_assistant_chunks: Vec<String>,
+    metrics: ChatMetrics,
+    tool_rounds_used: usize,
+    total_tool_calls: usize,
+}
+
 fn assistant_content_text(message: &AssistantMessage) -> String {
     let Some(content) = message.content.as_ref() else {
         return String::new();
@@ -794,52 +841,38 @@ fn assistant_content_text(message: &AssistantMessage) -> String {
 }
 
 fn extract_text_from_value(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(text) => text.to_string(),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .filter_map(extract_text_like_from_item)
-            .filter(|item| !item.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        serde_json::Value::Object(map) => {
-            if let Some(text) = map.get("text").and_then(|v| v.as_str()) {
-                return text.to_string();
-            }
-            if let Some(text) = map.get("content").and_then(|v| v.as_str()) {
-                return text.to_string();
-            }
-            if let Some(content) = map.get("content") {
-                return extract_text_from_value(content);
-            }
-            String::new()
-        }
-        _ => String::new(),
-    }
+    let mut chunks = Vec::new();
+    collect_visible_text_from_value(value, &mut chunks);
+    merge_visible_chunks(&chunks, None)
 }
 
-fn extract_text_like_from_item(item: &serde_json::Value) -> Option<String> {
-    if let Some(text) = item.as_str() {
-        return Some(text.to_string());
-    }
-    if let Some(obj) = item.as_object() {
-        if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-            return Some(text.to_string());
+fn collect_visible_text_from_value(value: &serde_json::Value, output: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+        serde_json::Value::String(text) => append_unique_visible_chunk(output, text.to_string()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_visible_text_from_value(item, output);
+            }
         }
-        if let Some(text) = obj.get("output_text").and_then(|v| v.as_str()) {
-            return Some(text.to_string());
-        }
-        if let Some(text) = obj.get("content").and_then(|v| v.as_str()) {
-            return Some(text.to_string());
-        }
-        if let Some(content) = obj.get("content") {
-            let nested = extract_text_from_value(content);
-            if !nested.trim().is_empty() {
-                return Some(nested);
+        serde_json::Value::Object(map) => {
+            for key in [
+                "text",
+                "output_text",
+                "content",
+                "message",
+                "value",
+                "input_text",
+                "output",
+                "summary",
+                "refusal",
+            ] {
+                if let Some(value) = map.get(key) {
+                    collect_visible_text_from_value(value, output);
+                }
             }
         }
     }
-    None
 }
 
 fn assistant_reasoning_text(message: &AssistantMessage) -> String {
@@ -917,6 +950,18 @@ fn append_unique_thinking_chunk(chunks: &mut Vec<String>, chunk: String) {
     chunks.push(normalized.to_string());
 }
 
+fn append_unique_visible_chunk(chunks: &mut Vec<String>, chunk: String) {
+    let cleaned_chunk = sanitize_assistant_content(&chunk);
+    let normalized = cleaned_chunk.trim();
+    if normalized.is_empty() {
+        return;
+    }
+    if chunks.iter().any(|existing| existing.trim() == normalized) {
+        return;
+    }
+    chunks.push(normalized.to_string());
+}
+
 fn merge_thinking_chunks(chunks: Vec<String>) -> Option<String> {
     let mut seen = HashSet::new();
     let merged = chunks
@@ -930,6 +975,24 @@ fn merge_thinking_chunks(chunks: Vec<String>) -> Option<String> {
         return None;
     }
     Some(merged)
+}
+
+fn merge_visible_chunks(chunks: &[String], extra: Option<&str>) -> String {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::new();
+    for item in chunks {
+        let trimmed = item.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            merged.push(trimmed.to_string());
+        }
+    }
+    if let Some(extra_item) = extra {
+        let trimmed = extra_item.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            merged.push(trimmed.to_string());
+        }
+    }
+    merged.join("\n\n")
 }
 
 fn build_guard_tool_result(reason: &str) -> String {
@@ -1074,13 +1137,55 @@ fn external_tool_definition(tool: &ExternalToolDefinition) -> ApiTool {
 
 fn with_cost(
     mut metrics: ChatMetrics,
+    model: &str,
     input_price_per_million: f64,
     output_price_per_million: f64,
 ) -> ChatMetrics {
-    let input_cost = (metrics.prompt_tokens as f64 / 1_000_000.0) * input_price_per_million;
-    let output_cost = (metrics.completion_tokens as f64 / 1_000_000.0) * output_price_per_million;
-    metrics.estimated_cost_usd = input_cost + output_cost;
+    let Some((resolved_input_price, resolved_output_price)) =
+        resolve_effective_model_prices(model, input_price_per_million, output_price_per_million)
+    else {
+        metrics.estimated_cost_usd = None;
+        return metrics;
+    };
+    let input_cost = (metrics.prompt_tokens as f64 / 1_000_000.0) * resolved_input_price;
+    let output_cost = (metrics.completion_tokens as f64 / 1_000_000.0) * resolved_output_price;
+    metrics.estimated_cost_usd = Some(input_cost + output_cost);
     metrics
+}
+
+fn resolve_effective_model_prices(
+    model: &str,
+    configured_input_price: f64,
+    configured_output_price: f64,
+) -> Option<(f64, f64)> {
+    let builtin = builtin_model_prices(model);
+    let resolved_input = if configured_input_price > 0.0 {
+        Some(configured_input_price)
+    } else {
+        builtin.map(|(input, _)| input).filter(|price| *price > 0.0)
+    };
+    let resolved_output = if configured_output_price > 0.0 {
+        Some(configured_output_price)
+    } else {
+        builtin
+            .map(|(_, output)| output)
+            .filter(|price| *price > 0.0)
+    };
+    match (resolved_input, resolved_output) {
+        (Some(input), Some(output)) if input > 0.0 || output > 0.0 => Some((input, output)),
+        _ => None,
+    }
+}
+
+fn builtin_model_prices(model: &str) -> Option<(f64, f64)> {
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized.contains("deepseek-chat") || normalized.contains("deepseek-v3") {
+        return Some((0.27, 1.10));
+    }
+    if normalized.contains("deepseek-reasoner") || normalized.contains("deepseek-r1") {
+        return Some((0.55, 2.19));
+    }
+    None
 }
 
 fn optional_content(content: String) -> Option<String> {
@@ -1215,4 +1320,49 @@ fn build_chat_url(base_url: &str) -> String {
         return trimmed.to_string();
     }
     format!("{trimmed}/chat/completions")
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        ChatMetrics, builtin_model_prices, extract_text_from_value, merge_visible_chunks,
+        resolve_effective_model_prices, with_cost,
+    };
+
+    #[test]
+    fn extracts_nested_visible_text_blocks() {
+        let payload = json!([
+            {"type":"text","text":{"value":"first line"}},
+            {"type":"output_text","output_text":"second line"},
+            {"type":"wrapper","content":[{"text":"third line"}]},
+            {"type":"tool_call","arguments":"{\"ignored\":true}"}
+        ]);
+        assert_eq!(
+            extract_text_from_value(&payload),
+            "first line\n\nsecond line\n\nthird line"
+        );
+    }
+
+    #[test]
+    fn merges_visible_chunks_without_duplicates() {
+        let chunks = vec!["alpha".to_string(), "beta".to_string(), "alpha".to_string()];
+        assert_eq!(merge_visible_chunks(&chunks, Some("beta")), "alpha\n\nbeta");
+    }
+
+    #[test]
+    fn resolves_builtin_model_prices_when_config_missing() {
+        assert_eq!(
+            resolve_effective_model_prices("deepseek-chat", 0.0, 0.0),
+            Some((0.27, 1.10))
+        );
+        assert_eq!(builtin_model_prices("unknown-model"), None);
+    }
+
+    #[test]
+    fn cost_is_unavailable_for_unknown_model_without_config() {
+        let metrics = with_cost(ChatMetrics::default(), "unknown-model", 0.0, 0.0);
+        assert_eq!(metrics.estimated_cost_usd, None);
+    }
 }

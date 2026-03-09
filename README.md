@@ -57,19 +57,19 @@ cargo build --release
 
 ```bash
 # 运行前检查
-sudo ./target/release/MachineClaw prepare --conf=./.docs/claw.toml
+sudo ./target/release/MachineClaw prepare --conf=./.docs/claw-sample.toml
 
 # 状态巡检
-sudo ./target/release/MachineClaw inspect all --conf=./.docs/claw.toml
+sudo ./target/release/MachineClaw inspect all --conf=./.docs/claw-sample.toml
 
 # 进入 chat
-sudo ./target/release/MachineClaw chat --conf=./.docs/claw.toml
+sudo ./target/release/MachineClaw chat --conf=./.docs/claw-sample.toml
 
 # 查看当前生效配置快照（脱敏）
-./target/release/MachineClaw show-config --conf=./.docs/claw.toml
+./target/release/MachineClaw show-config --conf=./.docs/claw-sample.toml
 
 # 生成内嵌配置快照的新二进制
-./target/release/MachineClaw snapshot --conf=./.docs/claw.toml -o ./MachineClaw-prod
+./target/release/MachineClaw snapshot --conf=./.docs/claw-sample.toml -o ./MachineClaw-prod
 ```
 
 ## 跨平台构建可执行文件

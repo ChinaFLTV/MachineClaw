@@ -1,4 +1,8 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use toml_edit::{DocumentMut, Item, Table, Value};
 
@@ -126,12 +130,7 @@ fn write_document(path: &Path, doc: &DocumentMut) -> Result<(), AppError> {
             ))
         })?;
     }
-    fs::write(path, doc.to_string()).map_err(|err| {
-        AppError::Config(format!(
-            "failed to write config file {}: {err}",
-            path.display()
-        ))
-    })
+    write_config_atomically(path, &doc.to_string())
 }
 
 fn get_item_by_path(doc: &DocumentMut, key: &str) -> Option<Item> {
@@ -220,6 +219,54 @@ fn display_value(value: &Value) -> String {
         return str_value.to_string();
     }
     value.to_string().trim().to_string()
+}
+
+fn write_config_atomically(path: &Path, content: &str) -> Result<(), AppError> {
+    let parent = path.parent().ok_or_else(|| {
+        AppError::Config(format!(
+            "failed to resolve config parent directory for {}",
+            path.display()
+        ))
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|item| item.to_str())
+        .unwrap_or("config");
+    let temp_path = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name,
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::write(&temp_path, content).map_err(|err| {
+        AppError::Config(format!(
+            "failed to write temporary config file {}: {err}",
+            temp_path.display()
+        ))
+    })?;
+    if let Err(err) = fs::rename(&temp_path, path) {
+        if path.exists() {
+            let _ = fs::remove_file(path);
+            fs::rename(&temp_path, path).map_err(|rename_err| {
+                AppError::Config(format!(
+                    "failed to replace config file {} after rename error {}: {}",
+                    path.display(),
+                    err,
+                    rename_err
+                ))
+            })?;
+        } else {
+            let _ = fs::remove_file(&temp_path);
+            return Err(AppError::Config(format!(
+                "failed to move temporary config file into place {}: {err}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn split_key_path(key: &str) -> Vec<&str> {
