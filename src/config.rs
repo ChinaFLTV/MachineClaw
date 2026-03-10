@@ -21,6 +21,7 @@ const DEFAULT_CONSOLE_COLORFUL: bool = true;
 const DEFAULT_AI_MAX_RETRIES: u32 = 2;
 const DEFAULT_AI_BACKOFF_MILLIS: u64 = 1500;
 const DEFAULT_AI_CONNECTIVITY_CHECK: bool = true;
+const DEFAULT_AI_DEBUG: bool = false;
 const DEFAULT_AI_INPUT_PRICE_PER_MILLION: f64 = 0.0;
 const DEFAULT_AI_OUTPUT_PRICE_PER_MILLION: f64 = 0.0;
 const DEFAULT_CHAT_SHOW_TOOL: bool = false;
@@ -33,6 +34,7 @@ const DEFAULT_CHAT_SHOW_ROUND_METRICS: bool = true;
 const DEFAULT_CHAT_SHOW_TOKEN_COST: bool = true;
 const DEFAULT_CHAT_CONTEXT_WARN_PERCENT: u8 = 80;
 const DEFAULT_CHAT_CONTEXT_CRITICAL_PERCENT: u8 = 95;
+const DEFAULT_CHAT_SKIP_MODEL_PRICE_CHECK: bool = false;
 const DEFAULT_CHAT_STREAM_OUTPUT: bool = false;
 const DEFAULT_CHAT_OUTPUT_MULTILINES: bool = false;
 const DEFAULT_CHAT_SKIP_ENV_PROFILE: bool = true;
@@ -91,6 +93,8 @@ pub struct AiConfig {
     pub base_url: String,
     pub token: String,
     pub model: String,
+    #[serde(default = "default_ai_debug")]
+    pub debug: bool,
     #[serde(
         rename = "connectivity-check",
         default = "default_ai_connectivity_check"
@@ -139,6 +143,11 @@ pub struct AiChatConfig {
     pub show_round_metrics: bool,
     #[serde(rename = "show-token-cost", default = "default_chat_show_token_cost")]
     pub show_token_cost: bool,
+    #[serde(
+        rename = "skip-model-price-check",
+        default = "default_chat_skip_model_price_check"
+    )]
+    pub skip_model_price_check: bool,
     #[serde(
         rename = "context-warn-percent",
         default = "default_chat_context_warn_percent"
@@ -333,6 +342,7 @@ impl Default for AiChatConfig {
             command_cache_ttl_seconds: default_chat_command_cache_ttl_seconds(),
             show_round_metrics: default_chat_show_round_metrics(),
             show_token_cost: default_chat_show_token_cost(),
+            skip_model_price_check: default_chat_skip_model_price_check(),
             context_warn_percent: default_chat_context_warn_percent(),
             context_critical_percent: default_chat_context_critical_percent(),
             stream_output: default_chat_stream_output(),
@@ -459,6 +469,7 @@ env-mode = "prod" # optional: prod, test, dev
 base-url = "https://api.deepseek.com/v1" # required
 token = "sk-xxxx" # required
 model = "deepseek-chat" # required
+debug = false # optional, default false; when true prints masked AI request/response debug details to terminal
 connectivity-check = true # optional, default true (chat startup)
 input-price-per-million = 0 # optional, 0 means use built-in known model pricing when available, otherwise cost shows N/A
 output-price-per-million = 0 # optional, 0 means use built-in known model pricing when available, otherwise cost shows N/A
@@ -476,6 +487,7 @@ show-tips = false # optional
 command-cache-ttl-seconds = 30 # optional
 show-round-metrics = true # optional
 show-token-cost = true # optional
+skip-model-price-check = false # optional, default false; when true skip online model pricing probe and use configured/builtin pricing only
 context-warn-percent = 80 # optional
 context-critical-percent = 95 # optional
 stream-output = false # optional, default false
@@ -838,6 +850,10 @@ fn default_ai_connectivity_check() -> bool {
     DEFAULT_AI_CONNECTIVITY_CHECK
 }
 
+fn default_ai_debug() -> bool {
+    DEFAULT_AI_DEBUG
+}
+
 fn default_ai_input_price_per_million() -> f64 {
     DEFAULT_AI_INPUT_PRICE_PER_MILLION
 }
@@ -876,6 +892,10 @@ fn default_chat_show_round_metrics() -> bool {
 
 fn default_chat_show_token_cost() -> bool {
     DEFAULT_CHAT_SHOW_TOKEN_COST
+}
+
+fn default_chat_skip_model_price_check() -> bool {
+    DEFAULT_CHAT_SKIP_MODEL_PRICE_CHECK
 }
 
 fn default_chat_context_warn_percent() -> u8 {

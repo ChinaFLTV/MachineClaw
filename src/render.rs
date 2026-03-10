@@ -323,7 +323,9 @@ impl ChatStreamPrinter {
                 segment
             };
             if !text.is_empty() {
-                if !text.trim_start().starts_with("```") {
+                if !should_defer_stream_line_output(text, self.in_code_block)
+                    && !is_code_fence_line(text.trim_start())
+                {
                     self.ensure_line_prefix(block)?;
                 }
                 self.active_line_raw.push_str(text);
@@ -383,7 +385,20 @@ impl ChatStreamPrinter {
         preserve_blank_line: bool,
     ) -> Result<(), AppError> {
         let trimmed = self.active_line_raw.trim_start();
-        if trimmed.starts_with("```") {
+        if is_code_fence_line(trimmed) {
+            let rendered_fence =
+                render_stream_line_final(trimmed, self.colorful, self.in_code_block, block);
+            if !rendered_fence.is_empty() {
+                self.flush_rendered_fragment(block, &rendered_fence)?;
+            }
+            if self.line_has_output || preserve_blank_line || !rendered_fence.is_empty() {
+                let mut stdout = std::io::stdout();
+                writeln!(stdout)
+                    .map_err(|err| AppError::Command(format!("failed to commit code fence line: {err}")))?;
+                stdout
+                    .flush()
+                    .map_err(|err| AppError::Command(format!("failed to flush code fence line: {err}")))?;
+            }
             self.in_code_block = !self.in_code_block;
             self.active_line_raw.clear();
             self.line_has_output = false;
@@ -408,6 +423,9 @@ impl ChatStreamPrinter {
     }
 
     fn flush_stable_prefix(&mut self, block: ChatStreamBlockKind) -> Result<(), AppError> {
+        if should_defer_stream_line_output(&self.active_line_raw, self.in_code_block) {
+            return Ok(());
+        }
         loop {
             let stable_len = find_stream_stable_prefix_len(&self.active_line_raw);
             if stable_len == 0 {
@@ -513,6 +531,7 @@ fn render_markdown_blocks(text: &str, colorful: bool) -> String {
         let line = line_refs[idx];
         let trimmed = line.trim_start();
         if is_code_fence_line(trimmed) {
+            lines.push(render_code_fence_line(trimmed, colorful));
             in_code_block = !in_code_block;
             idx += 1;
             continue;
@@ -584,6 +603,12 @@ fn render_markdown_structured_line(line: &str, colorful: bool) -> String {
     let (quote_depth, rest_after_quote) = split_blockquote_prefix(&normalized_line);
     let indent_width = count_indent_width(rest_after_quote);
     let nesting_level = indent_width / 2;
+    if quote_depth == 0
+        && is_indented_code_block_line(rest_after_quote)
+        && !looks_like_nested_markdown(rest_after_quote)
+    {
+        return render_code_block_line(rest_after_quote.trim_start_matches([' ', '\t']), colorful);
+    }
     let trimmed = rest_after_quote.trim_start();
     let block_prefix = render_block_prefix(quote_depth, colorful);
     let nested_indent = "  ".repeat(nesting_level);
@@ -617,9 +642,31 @@ fn render_markdown_structured_line(line: &str, colorful: bool) -> String {
 
 fn render_code_block_line(line: &str, colorful: bool) -> String {
     if colorful {
-        return line.bright_black().to_string();
+        return line.bright_white().to_string();
     }
     line.to_string()
+}
+
+fn render_code_fence_line(line: &str, colorful: bool) -> String {
+    let marker = if line.trim_start().starts_with("~~~") {
+        "~~~"
+    } else {
+        "```"
+    };
+    let language = line
+        .trim_start()
+        .trim_start_matches(marker)
+        .trim()
+        .to_string();
+    let label = if language.is_empty() {
+        "[code]".to_string()
+    } else {
+        format!("[code:{language}]")
+    };
+    if colorful {
+        return label.bright_black().bold().to_string();
+    }
+    label
 }
 
 fn render_heading_text(level: usize, text: &str, colorful: bool) -> String {
@@ -782,6 +829,19 @@ fn parse_list_line(line: &str) -> Option<(MarkdownListKind, String, &str)> {
 fn is_code_fence_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+fn is_indented_code_block_line(line: &str) -> bool {
+    let indent_width = count_indent_width(line);
+    indent_width >= 4 && !line.trim().is_empty()
+}
+
+fn looks_like_nested_markdown(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    parse_list_line(trimmed).is_some()
+        || parse_heading(trimmed).is_some()
+        || trimmed.starts_with('>')
+        || is_horizontal_rule(trimmed)
 }
 
 fn ensure_default_assets(dir: &Path) -> Result<Vec<String>, AppError> {
@@ -972,12 +1032,12 @@ fn render_stream_line_preview(
     if line.is_empty() {
         return String::new();
     }
-    if line.trim_start().starts_with("```") {
-        return String::new();
+    if is_code_fence_line(line.trim_start()) {
+        return render_code_fence_line(line.trim_start(), colorful);
     }
     if in_code_block {
         if supports_color(colorful) {
-            return line.bright_black().to_string();
+            return line.bright_white().to_string();
         }
         return line.to_string();
     }
@@ -999,12 +1059,12 @@ fn render_stream_line_final(
     if line.is_empty() {
         return String::new();
     }
-    if line.trim_start().starts_with("```") {
-        return String::new();
+    if is_code_fence_line(line.trim_start()) {
+        return render_code_fence_line(line.trim_start(), colorful);
     }
     if in_code_block {
         if supports_color(colorful) {
-            return apply_stream_block_style(line.bright_black().to_string(), colorful, block);
+            return apply_stream_block_style(line.bright_white().to_string(), colorful, block);
         }
         return line.to_string();
     }
@@ -1022,11 +1082,15 @@ fn apply_stream_block_style(text: String, colorful: bool, block: ChatStreamBlock
     text
 }
 
+fn should_defer_stream_line_output(line: &str, in_code_block: bool) -> bool {
+    in_code_block && !is_code_fence_line(line.trim_start())
+}
+
 fn find_stream_stable_prefix_len(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    if text.trim_start().starts_with("```") {
+    if is_code_fence_line(text.trim_start()) {
         return 0;
     }
 
@@ -1767,7 +1831,8 @@ mod tests {
     use super::{
         ChatStreamBlockKind, close_unfinished_inline_markdown, find_stream_stable_prefix_len,
         normalize_compact_markdown_line, render_markdown_for_terminal, render_single_markdown_line,
-        render_stream_line_preview, render_stream_prefix,
+        render_stream_line_final, render_stream_line_preview, render_stream_prefix,
+        should_defer_stream_line_output,
     };
     use regex::Regex;
 
@@ -1830,6 +1895,7 @@ mod tests {
             find_stream_stable_prefix_len("**结论** 后续"),
             "**结论** 后续".len()
         );
+        assert_eq!(find_stream_stable_prefix_len("~~~rust"), 0);
     }
 
     #[test]
@@ -1870,5 +1936,62 @@ mod tests {
         let markdown = "| a | b |\n| --- | --- |\n| 1 | 2 |";
         let rendered = render_markdown_for_terminal(markdown, false);
         assert_eq!(rendered, "a | b\n--------------------------------\n1 | 2");
+    }
+
+    #[test]
+    fn preserves_code_fence_and_code_lines_in_plain_mode() {
+        let markdown = "```rust\nfn main() {}\n```";
+        let rendered = render_markdown_for_terminal(markdown, false);
+        assert_eq!(rendered, "[code:rust]\nfn main() {}\n[code]");
+    }
+
+    #[test]
+    fn stream_preview_keeps_code_fence_visible() {
+        let rendered = render_stream_line_preview("```rust", false, false, ChatStreamBlockKind::Assistant);
+        assert_eq!(rendered, "[code:rust]");
+    }
+
+    #[test]
+    fn stream_final_keeps_code_block_content_visible() {
+        let rendered = strip_ansi(&render_stream_line_final(
+            "let x = 1;",
+            true,
+            true,
+            ChatStreamBlockKind::Assistant,
+        ));
+        assert_eq!(rendered, "let x = 1;");
+    }
+
+    #[test]
+    fn preserves_tilde_code_fence_in_plain_mode() {
+        let markdown = "~~~python\nprint(1)\n~~~";
+        let rendered = render_markdown_for_terminal(markdown, false);
+        assert_eq!(rendered, "[code:python]\nprint(1)\n[code]");
+    }
+
+    #[test]
+    fn stream_preview_keeps_tilde_code_fence_visible() {
+        let rendered = render_stream_line_preview("~~~bash", false, false, ChatStreamBlockKind::Assistant);
+        assert_eq!(rendered, "[code:bash]");
+    }
+
+    #[test]
+    fn stream_final_keeps_tilde_code_fence_visible() {
+        let rendered = render_stream_line_final("~~~bash", false, false, ChatStreamBlockKind::Assistant);
+        assert_eq!(rendered, "[code:bash]");
+    }
+
+    #[test]
+    fn defers_streaming_partial_code_lines_until_newline() {
+        assert!(should_defer_stream_line_output("pub fn merge_sort", true));
+        assert!(!should_defer_stream_line_output("```rust", true));
+        assert!(!should_defer_stream_line_output("普通文本", false));
+    }
+
+    #[test]
+    fn preserves_indented_code_block_in_plain_mode() {
+        let markdown = "    let x = 1;\n    println!(\"{}\", x);";
+        let rendered = render_markdown_for_terminal(markdown, false);
+        assert_eq!(rendered, "let x = 1;\nprintln!(\"{}\", x);");
     }
 }

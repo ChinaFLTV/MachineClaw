@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::{
     ai::{
         AiClient, ChatRoundEvent, ChatStreamEvent, ChatStreamEventKind, ExternalToolDefinition,
-        ToolCallRequest, ToolUsePolicy,
+        ModelPriceSource, ToolCallRequest, ToolUsePolicy,
     },
     cli::InspectTarget,
     config::{AppConfig, expand_tilde},
@@ -231,6 +231,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
     let base_system_prompt = render::load_prompt_template(services.assets_dir, "chat_system.md")?;
     let system_prompt = build_chat_system_prompt(services, &base_system_prompt);
     maybe_ensure_chat_environment_profile(services, &system_prompt)?;
+    maybe_prepare_chat_model_price(services);
     let initial_message_count = services.session.message_count();
     let mut chat_turns: usize = 0;
     let mut tool_stats = ChatToolStats::default();
@@ -474,10 +475,9 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         let mut last_round_thinking = String::new();
         let mut last_round_content = String::new();
         let stream_printer = RefCell::new(render::ChatStreamPrinter::new(colorful));
-        let ai_wait_spinner = RefCell::new(Some(ActivitySpinner::start(
-            i18n::chat_progress_analyzing().to_string(),
-            colorful,
-        )));
+        let ai_wait_spinner = RefCell::new((!services.cfg.ai.debug).then(|| {
+            ActivitySpinner::start(i18n::chat_progress_analyzing().to_string(), colorful)
+        }));
         let spinner_first_output = Arc::new(AtomicBool::new(false));
         let spinner_first_output_cloned = spinner_first_output.clone();
         let response = services.ai.chat_with_shell_tool(
@@ -1534,6 +1534,54 @@ fn clear_terminal() -> Result<(), AppError> {
         .map_err(|err| AppError::Command(format!("failed to clear terminal: {err}")))
 }
 
+fn maybe_prepare_chat_model_price(services: &mut ActionServices<'_>) {
+    let colorful = services.cfg.console.colorful;
+    println!(
+        "{}",
+        render::render_chat_custom_tag_event(
+            i18n::chat_tag_model_price(),
+            &i18n::chat_model_price_check_started(&services.cfg.ai.model),
+            colorful,
+        )
+    );
+    let result = services
+        .ai
+        .prepare_model_pricing(services.cfg.ai.chat.skip_model_price_check);
+    let message = match (result.source, result.prices, result.probe_skipped) {
+        (ModelPriceSource::Configured, Some((input, output)), _) => {
+            i18n::chat_model_price_check_configured(input, output)
+        }
+        (ModelPriceSource::LocalCache, Some((input, output)), _) => {
+            i18n::chat_model_price_check_cached(input, output)
+        }
+        (ModelPriceSource::RuntimeProbe, Some((input, output)), _) => {
+            i18n::chat_model_price_check_probed(input, output)
+        }
+        (_, Some((input, output)), true) => {
+            format!(
+                "{}；{}",
+                i18n::chat_model_price_check_skipped(),
+                i18n::chat_model_price_check_builtin(input, output)
+            )
+        }
+        (ModelPriceSource::Builtin, Some((input, output)), _) => {
+            i18n::chat_model_price_check_builtin(input, output)
+        }
+        (_, None, true) => {
+            format!(
+                "{}；{}",
+                i18n::chat_model_price_check_skipped(),
+                i18n::chat_model_price_check_unavailable()
+            )
+        }
+        _ => i18n::chat_model_price_check_unavailable().to_string(),
+    };
+    println!(
+        "{}",
+        render::render_chat_custom_tag_event(i18n::chat_tag_model_price(), &message, colorful)
+    );
+}
+
 fn render_chat_window_header(services: &ActionServices<'_>, after_clear: bool) {
     if after_clear {
         println!(
@@ -2014,8 +2062,6 @@ fn stop_activity_spinner_once(
     }
     if let Some(mut active_spinner) = spinner.borrow_mut().take() {
         active_spinner.stop();
-    } else {
-        clear_spinner_line();
     }
 }
 

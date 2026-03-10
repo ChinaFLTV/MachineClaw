@@ -1,9 +1,12 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error as StdError,
+    fs,
     io::{BufRead, BufReader, Read},
+    path::{Path, PathBuf},
+    sync::RwLock,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use once_cell::sync::Lazy;
@@ -11,9 +14,13 @@ use regex::Regex;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use serde::de::Deserializer;
 use serde_json::json;
 
-use crate::{config::AiConfig, error::AppError, logging, mask::mask_sensitive};
+use crate::{config::AiConfig, error::AppError, i18n, logging, mask::mask_sensitive};
+
+const MODEL_PRICE_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+const MODEL_PRICE_CACHE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -106,16 +113,58 @@ pub struct ExternalToolDefinition {
     pub parameters: serde_json::Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AiClient {
     client: Client,
     base_url: String,
     token: String,
     model: String,
+    model_price_cache_path: PathBuf,
+    debug: bool,
     max_retries: u32,
     backoff_millis: u64,
     input_price_per_million: f64,
     output_price_per_million: f64,
+    runtime_model_prices: RwLock<Option<(f64, f64)>>,
+}
+
+impl Clone for AiClient {
+    fn clone(&self) -> Self {
+        let cached_prices = self
+            .runtime_model_prices
+            .read()
+            .ok()
+            .and_then(|guard| *guard);
+        Self {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            token: self.token.clone(),
+            model: self.model.clone(),
+            model_price_cache_path: self.model_price_cache_path.clone(),
+            debug: self.debug,
+            max_retries: self.max_retries,
+            backoff_millis: self.backoff_millis,
+            input_price_per_million: self.input_price_per_million,
+            output_price_per_million: self.output_price_per_million,
+            runtime_model_prices: RwLock::new(cached_prices),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelPriceSource {
+    Configured,
+    LocalCache,
+    RuntimeProbe,
+    Builtin,
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelPriceCheckResult {
+    pub source: ModelPriceSource,
+    pub prices: Option<(f64, f64)>,
+    pub probe_skipped: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +237,7 @@ struct ChatCompletionResponse {
 struct ChatCompletionStreamResponse {
     #[serde(default)]
     choices: Vec<StreamChoice>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_usage_or_default")]
     usage: Usage,
 }
 
@@ -200,6 +249,13 @@ struct Usage {
     completion_tokens: u64,
     #[serde(default)]
     total_tokens: u64,
+}
+
+fn deserialize_usage_or_default<'de, D>(deserializer: D) -> Result<Usage, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Usage>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,8 +312,23 @@ struct StreamToolFunctionDelta {
     arguments: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct PersistedModelPriceCatalog {
+    #[serde(default = "default_model_price_cache_version")]
+    version: u32,
+    #[serde(default)]
+    models: BTreeMap<String, PersistedModelPriceEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct PersistedModelPriceEntry {
+    input_price_per_million: f64,
+    output_price_per_million: f64,
+    checked_at_epoch_secs: u64,
+}
+
 impl AiClient {
-    pub fn new(cfg: &AiConfig) -> Result<Self, AppError> {
+    pub fn new(cfg: &AiConfig, model_price_cache_path: PathBuf) -> Result<Self, AppError> {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(60))
@@ -268,10 +339,13 @@ impl AiClient {
             base_url: build_chat_url(&cfg.base_url),
             token: cfg.token.clone(),
             model: cfg.model.clone(),
+            model_price_cache_path,
+            debug: cfg.debug,
             max_retries: cfg.retry.max_retries,
             backoff_millis: cfg.retry.backoff_millis,
             input_price_per_million: cfg.input_price_per_million,
             output_price_per_million: cfg.output_price_per_million,
+            runtime_model_prices: RwLock::new(None),
         })
     }
 
@@ -287,6 +361,96 @@ impl AiClient {
         Ok(())
     }
 
+    pub fn prepare_model_pricing(&self, skip_probe: bool) -> ModelPriceCheckResult {
+        if let Some(prices) = configured_model_prices(
+            self.input_price_per_million,
+            self.output_price_per_million,
+        ) {
+            return ModelPriceCheckResult {
+                source: ModelPriceSource::Configured,
+                prices: Some(prices),
+                probe_skipped: true,
+            };
+        }
+        if skip_probe {
+            let prices = builtin_model_prices(&self.model);
+            return ModelPriceCheckResult {
+                source: if prices.is_some() {
+                    ModelPriceSource::Builtin
+                } else {
+                    ModelPriceSource::Unavailable
+                },
+                prices,
+                probe_skipped: true,
+            };
+        }
+        if let Some(prices) = self.cached_runtime_model_prices() {
+            return ModelPriceCheckResult {
+                source: ModelPriceSource::RuntimeProbe,
+                prices: Some(prices),
+                probe_skipped: false,
+            };
+        }
+        if let Some(prices) = self.cached_persisted_model_prices() {
+            self.set_runtime_model_prices(prices);
+            return ModelPriceCheckResult {
+                source: ModelPriceSource::LocalCache,
+                prices: Some(prices),
+                probe_skipped: false,
+            };
+        }
+        match self.probe_model_price_catalog() {
+            Ok(probed_prices) => {
+                if !probed_prices.is_empty()
+                    && let Err(err) = self.persist_model_price_catalog(&probed_prices)
+                {
+                    self.debug_emit(
+                        AiDebugLevel::Warn,
+                        &format!(
+                            "failed to persist model price catalog: {}",
+                            mask_sensitive(&err.to_string())
+                        ),
+                    );
+                }
+                if let Some(prices) = probed_prices.get(&normalize_priced_model_name(&self.model)) {
+                    let prices = *prices;
+                    self.set_runtime_model_prices(prices);
+                    return ModelPriceCheckResult {
+                        source: ModelPriceSource::RuntimeProbe,
+                        prices: Some(prices),
+                        probe_skipped: false,
+                    };
+                }
+                let prices = builtin_model_prices(&self.model);
+                ModelPriceCheckResult {
+                    source: if prices.is_some() {
+                        ModelPriceSource::Builtin
+                    } else {
+                        ModelPriceSource::Unavailable
+                    },
+                    prices,
+                    probe_skipped: false,
+                }
+            }
+            Err(err) => {
+                self.debug_emit(
+                    AiDebugLevel::Warn,
+                    &format!("model pricing probe failed: {}", mask_sensitive(&err.to_string())),
+                );
+                let prices = builtin_model_prices(&self.model);
+                ModelPriceCheckResult {
+                    source: if prices.is_some() {
+                        ModelPriceSource::Builtin
+                    } else {
+                        ModelPriceSource::Unavailable
+                    },
+                    prices,
+                    probe_skipped: false,
+                }
+            }
+        }
+    }
+
     pub fn chat(
         &self,
         history: &[ChatMessage],
@@ -294,14 +458,15 @@ impl AiClient {
         user_prompt: &str,
     ) -> Result<String, AppError> {
         let messages = build_base_messages(history, system_prompt, user_prompt);
-        let call = self.send_chat_completion(&ChatCompletionRequest {
+        let request = ChatCompletionRequest {
             model: self.model.clone(),
             messages,
             temperature: 0.2,
             tools: None,
             tool_choice: None,
             stream: None,
-        })?;
+        };
+        let call = self.send_chat_completion(&request)?;
         let assistant = call.assistant;
 
         let content = assistant_content_text(&assistant);
@@ -647,12 +812,7 @@ impl AiClient {
                     ),
                     content: assistant_content,
                     thinking: merge_thinking_chunks(thinking_chunks),
-                    metrics: with_cost(
-                        metrics,
-                        &self.model,
-                        self.input_price_per_million,
-                        self.output_price_per_million,
-                    ),
+                    metrics: self.attach_cost(metrics),
                     stop_reason: None,
                     tool_rounds_used,
                     total_tool_calls,
@@ -704,6 +864,19 @@ impl AiClient {
         loop {
             attempt += 1;
             logging::info(&format!("AI request started, attempt={attempt}"));
+            self.debug_emit(
+                AiDebugLevel::Info,
+                &format!(
+                    "AI request start: attempt={attempt}, url={}, model={}, stream=false, messages={}",
+                    self.base_url,
+                    body.model,
+                    body.messages.len(),
+                ),
+            );
+            self.debug_emit(
+                AiDebugLevel::Debug,
+                &format!("AI request body: {}", serialize_debug_json(body)),
+            );
             let started = Instant::now();
             let resp = self
                 .client
@@ -721,6 +894,10 @@ impl AiClient {
                             .unwrap_or_else(|_| "<unreadable body>".to_string());
                         let safe_body = mask_sensitive(&body);
                         let err_msg = format!("AI HTTP status={status}, body={safe_body}");
+                        self.debug_emit(
+                            AiDebugLevel::Error,
+                            &format!("AI response error body: {safe_body}"),
+                        );
                         logging::warn(&err_msg);
                         if attempt <= self.max_retries && should_retry_status(status) {
                             thread::sleep(Duration::from_millis(self.backoff_millis));
@@ -729,27 +906,32 @@ impl AiClient {
                         return Err(AppError::Ai(err_msg));
                     }
 
-                    let parsed: ChatCompletionResponse = resp.json().map_err(|err| {
-                        AppError::Ai(format!("failed to parse AI response: {err}"))
+                    let response_text = resp.text().map_err(|err| {
+                        AppError::Ai(format!("failed to read AI response body: {err}"))
                     })?;
-                    if let Some(choice) = parsed.choices.into_iter().next() {
-                        logging::info("AI request finished successfully");
-                        return Ok(ApiChatCallResult {
-                            assistant: choice.message,
-                            usage: parsed.usage,
-                            elapsed_ms: started.elapsed().as_millis(),
-                            streamed_content: false,
-                            streamed_thinking: false,
-                        });
-                    }
-
-                    let err_msg = "AI returned empty choices".to_string();
-                    logging::warn(&err_msg);
-                    if attempt <= self.max_retries {
-                        thread::sleep(Duration::from_millis(self.backoff_millis));
-                        continue;
-                    }
-                    return Err(AppError::Ai(err_msg));
+                    self.debug_emit(
+                        AiDebugLevel::Debug,
+                        &format!("AI response body: {}", mask_sensitive(&response_text)),
+                    );
+                    let parsed = parse_chat_completion_response_text(&response_text)?;
+                    logging::info("AI request finished successfully");
+                    self.debug_emit(
+                        AiDebugLevel::Info,
+                        &format!(
+                            "AI request finished: elapsed_ms={}, prompt_tokens={}, completion_tokens={}, total_tokens={}",
+                            started.elapsed().as_millis(),
+                            parsed.usage.prompt_tokens,
+                            parsed.usage.completion_tokens,
+                            parsed.usage.total_tokens,
+                        ),
+                    );
+                    return Ok(ApiChatCallResult {
+                        assistant: parsed.message,
+                        usage: parsed.usage,
+                        elapsed_ms: started.elapsed().as_millis(),
+                        streamed_content: false,
+                        streamed_thinking: false,
+                    });
                 }
                 Err(err) => {
                     let err_msg = format!("AI request failed: {}", format_reqwest_error(&err));
@@ -783,9 +965,22 @@ impl AiClient {
             logging::info(&format!(
                 "AI streaming request started, attempt={attempt}"
             ));
+            self.debug_emit(
+                AiDebugLevel::Info,
+                &format!(
+                    "AI streaming request start: attempt={attempt}, url={}, model={}, stream=true, messages={}",
+                    self.base_url,
+                    body.model,
+                    body.messages.len(),
+                ),
+            );
             let started = Instant::now();
             let mut stream_body = body.clone();
             stream_body.stream = Some(true);
+            self.debug_emit(
+                AiDebugLevel::Debug,
+                &format!("AI streaming request body: {}", serialize_debug_json(&stream_body)),
+            );
             let resp = self
                 .client
                 .post(&self.base_url)
@@ -801,10 +996,20 @@ impl AiClient {
                             .text()
                             .unwrap_or_else(|_| "<unreadable body>".to_string());
                         let safe_body = mask_sensitive(&response_body);
+                        self.debug_emit(
+                            AiDebugLevel::Error,
+                            &format!("AI streaming response error body: {safe_body}"),
+                        );
                         if should_fallback_to_non_streaming(status, &response_body) {
                             logging::warn(&format!(
                                 "AI streaming unsupported, fallback to non-streaming, status={status}, body={safe_body}"
                             ));
+                            self.debug_emit(
+                                AiDebugLevel::Warn,
+                                &format!(
+                                    "AI streaming fallback to non-streaming triggered: status={status}, body={safe_body}"
+                                ),
+                            );
                             return self.send_chat_completion(body);
                         }
                         let err_msg = format!("AI HTTP status={status}, body={safe_body}");
@@ -816,9 +1021,21 @@ impl AiClient {
                         return Err(AppError::Ai(err_msg));
                     }
 
-                    match parse_streaming_chat_response(resp, on_stream_event) {
+                    match parse_streaming_chat_response(resp, on_stream_event, self.debug) {
                         Ok(parsed) => {
                             logging::info("AI streaming request finished successfully");
+                            self.debug_emit(
+                                AiDebugLevel::Info,
+                                &format!(
+                                    "AI streaming request finished: elapsed_ms={}, streamed_content={}, streamed_thinking={}, prompt_tokens={}, completion_tokens={}, total_tokens={}",
+                                    started.elapsed().as_millis(),
+                                    parsed.streamed_content,
+                                    parsed.streamed_thinking,
+                                    parsed.usage.prompt_tokens,
+                                    parsed.usage.completion_tokens,
+                                    parsed.usage.total_tokens,
+                                ),
+                            );
                             return Ok(ApiChatCallResult {
                                 assistant: parsed.assistant,
                                 usage: parsed.usage,
@@ -831,6 +1048,13 @@ impl AiClient {
                             logging::warn(
                                 "AI streaming response was not SSE; fallback to non-streaming JSON parsing",
                             );
+                            self.debug_emit(
+                                AiDebugLevel::Warn,
+                                &format!(
+                                    "AI streaming response fallback to JSON body: {}",
+                                    mask_sensitive(&body_text)
+                                ),
+                            );
                             let parsed = parse_chat_completion_response_text(&body_text)?;
                             return Ok(ApiChatCallResult {
                                 assistant: parsed.message,
@@ -841,6 +1065,7 @@ impl AiClient {
                             });
                         }
                         Err(StreamParseResult::Retryable(err_msg)) => {
+                            self.debug_emit(AiDebugLevel::Warn, &err_msg);
                             logging::warn(&err_msg);
                             if attempt <= self.max_retries {
                                 thread::sleep(Duration::from_millis(self.backoff_millis));
@@ -849,6 +1074,7 @@ impl AiClient {
                             return Err(AppError::Ai(err_msg));
                         }
                         Err(StreamParseResult::Fatal(err_msg)) => {
+                            self.debug_emit(AiDebugLevel::Error, &err_msg);
                             logging::warn(&err_msg);
                             return Err(AppError::Ai(err_msg));
                         }
@@ -856,6 +1082,7 @@ impl AiClient {
                 }
                 Err(err) => {
                     let err_msg = format!("AI request failed: {}", format_reqwest_error(&err));
+                    self.debug_emit(AiDebugLevel::Error, &err_msg);
                     logging::warn(&err_msg);
                     if attempt <= self.max_retries {
                         thread::sleep(Duration::from_millis(self.backoff_millis));
@@ -916,12 +1143,7 @@ impl AiClient {
             archived_content,
             content,
             thinking: merge_thinking_chunks(state.thinking_chunks),
-            metrics: with_cost(
-                state.metrics,
-                &self.model,
-                self.input_price_per_million,
-                self.output_price_per_million,
-            ),
+            metrics: self.attach_cost(state.metrics),
             stop_reason,
             tool_rounds_used: state.tool_rounds_used,
             total_tool_calls: state.total_tool_calls,
@@ -947,17 +1169,237 @@ impl AiClient {
             },
             content,
             thinking: merge_thinking_chunks(state.thinking_chunks),
-            metrics: with_cost(
-                state.metrics,
-                &self.model,
-                self.input_price_per_million,
-                self.output_price_per_million,
-            ),
+            metrics: self.attach_cost(state.metrics),
             stop_reason,
             tool_rounds_used: state.tool_rounds_used,
             total_tool_calls: state.total_tool_calls,
         }
     }
+
+    fn debug_emit(&self, level: AiDebugLevel, message: &str) {
+        emit_ai_debug(self.debug, level, message);
+    }
+
+    fn attach_cost(&self, metrics: ChatMetrics) -> ChatMetrics {
+        with_cost(
+            metrics,
+            &self.model,
+            self.input_price_per_million,
+            self.output_price_per_million,
+            self.cached_runtime_model_prices(),
+        )
+    }
+
+    fn cached_runtime_model_prices(&self) -> Option<(f64, f64)> {
+        self.runtime_model_prices
+            .read()
+            .ok()
+            .and_then(|guard| *guard)
+    }
+
+    fn set_runtime_model_prices(&self, prices: (f64, f64)) {
+        if let Ok(mut guard) = self.runtime_model_prices.write() {
+            *guard = Some(prices);
+        }
+    }
+
+    fn cached_persisted_model_prices(&self) -> Option<(f64, f64)> {
+        let normalized_model = normalize_priced_model_name(&self.model);
+        let catalog = match self.load_model_price_catalog() {
+            Ok(Some(catalog)) => catalog,
+            Ok(None) => return None,
+            Err(err) => {
+                self.debug_emit(
+                    AiDebugLevel::Warn,
+                    &format!(
+                        "failed to load model price cache: {}",
+                        mask_sensitive(&err.to_string())
+                    ),
+                );
+                return None;
+            }
+        };
+        let prices = fresh_model_price_catalog(&catalog, now_epoch_secs())
+            .get(&normalized_model)
+            .copied();
+        if let Some((input, output)) = prices {
+            self.debug_emit(
+                AiDebugLevel::Info,
+                &format!(
+                    "using persisted model pricing cache for model={} input={} output={}",
+                    normalized_model, input, output
+                ),
+            );
+        }
+        prices
+    }
+
+    fn load_model_price_catalog(&self) -> Result<Option<PersistedModelPriceCatalog>, AppError> {
+        let raw = match fs::read_to_string(&self.model_price_cache_path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(AppError::Runtime(format!(
+                    "failed to read model price cache {}: {err}",
+                    self.model_price_cache_path.display()
+                )));
+            }
+        };
+        let parsed = serde_json::from_str::<PersistedModelPriceCatalog>(&raw).map_err(|err| {
+            AppError::Runtime(format!(
+                "failed to parse model price cache {}: {err}",
+                self.model_price_cache_path.display()
+            ))
+        })?;
+        Ok(Some(parsed))
+    }
+
+    fn persist_model_price_catalog(
+        &self,
+        incoming_prices: &BTreeMap<String, (f64, f64)>,
+    ) -> Result<(), AppError> {
+        if incoming_prices.is_empty() {
+            return Ok(());
+        }
+        let mut catalog = match self.load_model_price_catalog() {
+            Ok(Some(existing)) => existing,
+            Ok(None) => PersistedModelPriceCatalog::default(),
+            Err(err) => {
+                self.debug_emit(
+                    AiDebugLevel::Warn,
+                    &format!(
+                        "failed to load existing model price cache before persist: {}",
+                        mask_sensitive(&err.to_string())
+                    ),
+                );
+                PersistedModelPriceCatalog::default()
+            }
+        };
+        let now = now_epoch_secs();
+        catalog.version = MODEL_PRICE_CACHE_VERSION;
+        catalog.models = retained_fresh_model_price_entries(catalog.models, now);
+        for (model, (input, output)) in incoming_prices {
+            if !is_valid_model_price(*input, *output) {
+                continue;
+            }
+            catalog.models.insert(
+                normalize_priced_model_name(model),
+                PersistedModelPriceEntry {
+                    input_price_per_million: *input,
+                    output_price_per_million: *output,
+                    checked_at_epoch_secs: now,
+                },
+            );
+        }
+        let raw = serde_json::to_string_pretty(&catalog).map_err(|err| {
+            AppError::Runtime(format!("failed to serialize model price cache: {err}"))
+        })?;
+        write_string_atomically(&self.model_price_cache_path, &raw)?;
+        self.debug_emit(
+            AiDebugLevel::Info,
+            &format!(
+                "persisted {} model price entries to {}",
+                catalog.models.len(),
+                self.model_price_cache_path.display()
+            ),
+        );
+        Ok(())
+    }
+
+    fn probe_model_price_catalog(&self) -> Result<BTreeMap<String, (f64, f64)>, AppError> {
+        let candidate_models = price_probe_candidate_models(&self.model);
+        self.debug_emit(
+            AiDebugLevel::Info,
+            &format!(
+                "probing model pricing catalog for model={} candidates={}",
+                self.model,
+                candidate_models.join(",")
+            ),
+        );
+        let request = ChatCompletionRequest {
+            model: self.model.clone(),
+            messages: vec![
+                ApiMessage {
+                    role: "system".to_string(),
+                    content: Some("You are a pricing probe. Return exactly one strict minified JSON object and nothing else.".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                ApiMessage {
+                    role: "user".to_string(),
+                    content: Some(format!(
+                        "Return exactly one minified JSON object whose top-level keys are model ids and whose values are objects in the form {{\"input_price_per_million\":number,\"output_price_per_million\":number}}. Only include models you are confident about from this candidate list: {}. Always include `{}` if you are confident. If a model is uncertain, omit it entirely. Do not include markdown, code fences, explanations, comments, trailing commas, or extra keys.",
+                        serde_json::to_string(&candidate_models).unwrap_or_else(|_| "[]".to_string()),
+                        self.model
+                    )),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+            temperature: 0.0,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let call = self.send_chat_completion(&request)?;
+        let response_text = assistant_content_text(&call.assistant);
+        self.debug_emit(
+            AiDebugLevel::Debug,
+            &format!("model pricing probe raw response: {response_text}"),
+        );
+        Ok(parse_model_price_catalog_response(
+            &response_text,
+            &normalize_priced_model_name(&self.model),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AiDebugLevel {
+    Info,
+    Debug,
+    Warn,
+    Error,
+}
+
+impl AiDebugLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            AiDebugLevel::Info => "info",
+            AiDebugLevel::Debug => "debug",
+            AiDebugLevel::Warn => "warn",
+            AiDebugLevel::Error => "error",
+        }
+    }
+
+    fn localized_tag(self) -> &'static str {
+        match self {
+            AiDebugLevel::Info => i18n::chat_tag_debug_info(),
+            AiDebugLevel::Debug => i18n::chat_tag_debug_debug(),
+            AiDebugLevel::Warn => i18n::chat_tag_debug_warn(),
+            AiDebugLevel::Error => i18n::chat_tag_debug_error(),
+        }
+    }
+}
+
+fn emit_ai_debug(enabled: bool, level: AiDebugLevel, message: &str) {
+    if !enabled {
+        return;
+    }
+    let sanitized = mask_sensitive(message);
+    println!("{} {}", level.localized_tag(), sanitized);
+    let logging_line = format!("ai-debug[{}] {}", level.as_str(), sanitized);
+    match level {
+        AiDebugLevel::Info | AiDebugLevel::Debug => logging::info(&logging_line),
+        AiDebugLevel::Warn => logging::warn(&logging_line),
+        AiDebugLevel::Error => logging::error(&logging_line),
+    }
+}
+
+fn serialize_debug_json<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "<unserializable json>".to_string())
 }
 
 fn format_reqwest_error(err: &reqwest::Error) -> String {
@@ -1081,6 +1523,7 @@ fn parse_chat_completion_response_text(body: &str) -> Result<ParsedChatResponse,
 fn parse_streaming_chat_response<G>(
     response: reqwest::blocking::Response,
     on_stream_event: &mut G,
+    debug_enabled: bool,
 ) -> Result<ParsedStreamingChatResponse, StreamParseResult>
 where
     G: FnMut(ChatStreamEvent),
@@ -1136,8 +1579,18 @@ where
         if payload == "[DONE]" {
             break;
         }
+        emit_ai_debug(
+            debug_enabled,
+            AiDebugLevel::Debug,
+            &format!("AI streaming chunk: {payload}"),
+        );
         let parsed: ChatCompletionStreamResponse =
             serde_json::from_str(payload).map_err(|err| {
+                emit_ai_debug(
+                    debug_enabled,
+                    AiDebugLevel::Error,
+                    &format!("AI streaming chunk parse error: {err}; payload={payload}"),
+                );
                 if streamed_content || streamed_thinking {
                     StreamParseResult::Fatal(format!(
                         "failed to parse AI streaming chunk: {err}"
@@ -1199,7 +1652,7 @@ fn assistant_delta_content_text(message: &AssistantDeltaMessage) -> String {
     let Some(content) = message.content.as_ref() else {
         return String::new();
     };
-    extract_text_from_value(content).trim().to_string()
+    extract_text_delta_from_value(content)
 }
 
 fn assistant_delta_reasoning_text(message: &AssistantDeltaMessage) -> String {
@@ -1228,6 +1681,9 @@ fn merge_text_delta(target: &mut String, incoming: &str) -> String {
         return suffix.to_string();
     }
     if target.ends_with(incoming) {
+        return String::new();
+    }
+    if target.contains(incoming) {
         return String::new();
     }
     target.push_str(incoming);
@@ -1323,13 +1779,19 @@ fn assistant_content_text(message: &AssistantMessage) -> String {
     let Some(content) = message.content.as_ref() else {
         return String::new();
     };
-    extract_text_from_value(content).trim().to_string()
+    trim_blank_line_edges(&extract_text_from_value(content))
 }
 
 fn extract_text_from_value(value: &serde_json::Value) -> String {
     let mut chunks = Vec::new();
     collect_visible_text_from_value(value, &mut chunks);
     merge_visible_chunks(&chunks, None)
+}
+
+fn extract_text_delta_from_value(value: &serde_json::Value) -> String {
+    let mut chunks = Vec::new();
+    collect_visible_text_delta_from_value(value, &mut chunks);
+    chunks.concat()
 }
 
 fn collect_visible_text_from_value(value: &serde_json::Value, output: &mut Vec<String>) {
@@ -1355,6 +1817,35 @@ fn collect_visible_text_from_value(value: &serde_json::Value, output: &mut Vec<S
             ] {
                 if let Some(value) = map.get(key) {
                     collect_visible_text_from_value(value, output);
+                }
+            }
+        }
+    }
+}
+
+fn collect_visible_text_delta_from_value(value: &serde_json::Value, output: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+        serde_json::Value::String(text) => append_visible_delta_chunk(output, text.to_string()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_visible_text_delta_from_value(item, output);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for key in [
+                "text",
+                "output_text",
+                "content",
+                "message",
+                "value",
+                "input_text",
+                "output",
+                "summary",
+                "refusal",
+            ] {
+                if let Some(value) = map.get(key) {
+                    collect_visible_text_delta_from_value(value, output);
                 }
             }
         }
@@ -1438,14 +1929,26 @@ fn append_unique_thinking_chunk(chunks: &mut Vec<String>, chunk: String) {
 
 fn append_unique_visible_chunk(chunks: &mut Vec<String>, chunk: String) {
     let cleaned_chunk = sanitize_assistant_content(&chunk);
-    let normalized = cleaned_chunk.trim();
-    if normalized.is_empty() {
+    let display = normalize_visible_text_for_display(&cleaned_chunk);
+    let compare = normalize_visible_text_for_compare(&display);
+    if compare.is_empty() {
         return;
     }
-    if chunks.iter().any(|existing| existing.trim() == normalized) {
+    if chunks
+        .iter()
+        .any(|existing| normalize_visible_text_for_compare(existing) == compare)
+    {
         return;
     }
-    chunks.push(normalized.to_string());
+    chunks.push(display);
+}
+
+fn append_visible_delta_chunk(chunks: &mut Vec<String>, chunk: String) {
+    let cleaned_chunk = sanitize_assistant_content(&chunk);
+    if cleaned_chunk.is_empty() {
+        return;
+    }
+    chunks.push(normalize_visible_text_for_display(&cleaned_chunk));
 }
 
 fn merge_thinking_chunks(chunks: Vec<String>) -> Option<String> {
@@ -1467,18 +1970,39 @@ fn merge_visible_chunks(chunks: &[String], extra: Option<&str>) -> String {
     let mut seen = HashSet::new();
     let mut merged = Vec::new();
     for item in chunks {
-        let trimmed = item.trim();
-        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
-            merged.push(trimmed.to_string());
+        let compare = normalize_visible_text_for_compare(item);
+        if !compare.is_empty() && seen.insert(compare) {
+            merged.push(trim_blank_line_edges(item));
         }
     }
     if let Some(extra_item) = extra {
-        let trimmed = extra_item.trim();
-        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
-            merged.push(trimmed.to_string());
+        let compare = normalize_visible_text_for_compare(extra_item);
+        if !compare.is_empty() && seen.insert(compare) {
+            merged.push(trim_blank_line_edges(extra_item));
         }
     }
     merged.join("\n\n")
+}
+
+fn normalize_visible_text_for_display(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn normalize_visible_text_for_compare(text: &str) -> String {
+    trim_blank_line_edges(&normalize_visible_text_for_display(text))
+}
+
+fn trim_blank_line_edges(text: &str) -> String {
+    let normalized = normalize_visible_text_for_display(text);
+    let lines = normalized.split('\n').collect::<Vec<_>>();
+    let Some(start) = lines.iter().position(|line| !line.trim().is_empty()) else {
+        return String::new();
+    };
+    let end = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .unwrap_or(start);
+    lines[start..=end].join("\n")
 }
 
 fn build_guard_tool_result(reason: &str) -> String {
@@ -1626,9 +2150,15 @@ fn with_cost(
     model: &str,
     input_price_per_million: f64,
     output_price_per_million: f64,
+    runtime_model_prices: Option<(f64, f64)>,
 ) -> ChatMetrics {
     let Some((resolved_input_price, resolved_output_price)) =
-        resolve_effective_model_prices(model, input_price_per_million, output_price_per_million)
+        resolve_effective_model_prices(
+            model,
+            input_price_per_million,
+            output_price_per_million,
+            runtime_model_prices,
+        )
     else {
         metrics.estimated_cost_usd = None;
         return metrics;
@@ -1643,35 +2173,308 @@ fn resolve_effective_model_prices(
     model: &str,
     configured_input_price: f64,
     configured_output_price: f64,
+    runtime_model_prices: Option<(f64, f64)>,
 ) -> Option<(f64, f64)> {
-    let builtin = builtin_model_prices(model);
-    let resolved_input = if configured_input_price > 0.0 {
-        Some(configured_input_price)
-    } else {
-        builtin.map(|(input, _)| input).filter(|price| *price > 0.0)
-    };
-    let resolved_output = if configured_output_price > 0.0 {
-        Some(configured_output_price)
-    } else {
-        builtin
-            .map(|(_, output)| output)
-            .filter(|price| *price > 0.0)
-    };
-    match (resolved_input, resolved_output) {
-        (Some(input), Some(output)) if input > 0.0 || output > 0.0 => Some((input, output)),
-        _ => None,
+    configured_model_prices(configured_input_price, configured_output_price)
+        .or(runtime_model_prices.filter(|(input, output)| *input > 0.0 && *output > 0.0))
+        .or_else(|| builtin_model_prices(model))
+}
+
+fn configured_model_prices(
+    configured_input_price: f64,
+    configured_output_price: f64,
+) -> Option<(f64, f64)> {
+    if is_valid_model_price(configured_input_price, configured_output_price) {
+        return Some((configured_input_price, configured_output_price));
     }
+    None
 }
 
 fn builtin_model_prices(model: &str) -> Option<(f64, f64)> {
-    let normalized = model.trim().to_ascii_lowercase();
+    let normalized = normalize_priced_model_name(model);
     if normalized.contains("deepseek-chat") || normalized.contains("deepseek-v3") {
         return Some((0.27, 1.10));
     }
     if normalized.contains("deepseek-reasoner") || normalized.contains("deepseek-r1") {
         return Some((0.55, 2.19));
     }
+    match normalized.as_str() {
+        "gpt-5.2" => return Some((1.75, 14.0)),
+        "gpt-5.2-pro" => return Some((21.0, 168.0)),
+        "gpt-5"
+        | "gpt-5.1"
+        | "gpt-5-chat-latest"
+        | "gpt-5.1-chat-latest"
+        | "gpt-5-codex"
+        | "gpt-5.1-codex" => return Some((1.25, 10.0)),
+        "gpt-5-pro" => return Some((15.0, 120.0)),
+        "gpt-5-mini" => return Some((0.25, 2.0)),
+        "gpt-5-nano" => return Some((0.05, 0.4)),
+        "gpt-4.1" => return Some((2.0, 8.0)),
+        "gpt-4.1-mini" => return Some((0.4, 1.6)),
+        "gpt-4.1-nano" => return Some((0.1, 0.4)),
+        "gpt-4o" => return Some((2.5, 10.0)),
+        "gpt-4o-mini" => return Some((0.15, 0.6)),
+        _ => {}
+    }
     None
+}
+
+fn is_valid_model_price(input: f64, output: f64) -> bool {
+    input.is_finite() && output.is_finite() && input > 0.0 && output > 0.0
+}
+
+fn normalize_priced_model_name(model: &str) -> String {
+    let trimmed = model.trim().to_ascii_lowercase();
+    let last_segment = trimmed
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(trimmed.as_str())
+        .trim();
+    last_segment
+        .replace('_', "-")
+        .replace(' ', "-")
+        .trim_matches('-')
+        .to_string()
+}
+
+fn known_priced_models() -> &'static [&'static str] {
+    &[
+        "deepseek-chat",
+        "deepseek-v3",
+        "deepseek-reasoner",
+        "deepseek-r1",
+        "gpt-5.2",
+        "gpt-5.2-pro",
+        "gpt-5",
+        "gpt-5.1",
+        "gpt-5-chat-latest",
+        "gpt-5.1-chat-latest",
+        "gpt-5-codex",
+        "gpt-5.1-codex",
+        "gpt-5-pro",
+        "gpt-5-mini",
+        "gpt-5-nano",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "gpt-4o",
+        "gpt-4o-mini",
+    ]
+}
+
+fn price_probe_candidate_models(model: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    let raw_model = model.trim();
+    if !raw_model.is_empty() && seen.insert(raw_model.to_string()) {
+        candidates.push(raw_model.to_string());
+    }
+    let normalized = normalize_priced_model_name(model);
+    if !normalized.is_empty() && seen.insert(normalized.clone()) {
+        candidates.push(normalized.clone());
+    }
+    let family_prefix = if normalized.starts_with("gpt-5") {
+        Some("gpt-5")
+    } else if normalized.starts_with("gpt-4") {
+        Some("gpt-4")
+    } else if normalized.starts_with("deepseek") {
+        Some("deepseek")
+    } else {
+        None
+    };
+    let Some(family_prefix) = family_prefix else {
+        return candidates;
+    };
+    for candidate in known_priced_models() {
+        if candidate.starts_with(family_prefix) && seen.insert((*candidate).to_string())
+        {
+            candidates.push((*candidate).to_string());
+        }
+    }
+    candidates
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelPriceProbePayload {
+    input_price_per_million: Option<f64>,
+    output_price_per_million: Option<f64>,
+}
+
+fn parse_model_price_probe_response(raw: &str) -> Option<(f64, f64)> {
+    let candidate = strip_code_fence(raw.trim());
+    let json_body = extract_first_json_object(candidate)?;
+    let parsed: ModelPriceProbePayload = serde_json::from_str(json_body).ok()?;
+    let input = parsed.input_price_per_million?;
+    let output = parsed.output_price_per_million?;
+    if !is_valid_model_price(input, output) {
+        return None;
+    }
+    Some((input, output))
+}
+
+fn parse_model_price_catalog_response(
+    raw: &str,
+    current_model: &str,
+) -> BTreeMap<String, (f64, f64)> {
+    let candidate = strip_code_fence(raw.trim());
+    let json_body = match extract_first_json_object(candidate) {
+        Some(json_body) => json_body,
+        None => return BTreeMap::new(),
+    };
+    let parsed = match serde_json::from_str::<serde_json::Value>(json_body) {
+        Ok(parsed) => parsed,
+        Err(_) => return BTreeMap::new(),
+    };
+    let Some(object) = parsed.as_object() else {
+        return BTreeMap::new();
+    };
+    if object.contains_key("input_price_per_million")
+        || object.contains_key("output_price_per_million")
+    {
+        return parse_model_price_probe_response(json_body)
+            .map(|prices| {
+                let mut single = BTreeMap::new();
+                single.insert(normalize_priced_model_name(current_model), prices);
+                single
+            })
+            .unwrap_or_default();
+    }
+    let mut prices = BTreeMap::new();
+    for (model, value) in object {
+        let Some(entry) = parse_model_price_value(value) else {
+            continue;
+        };
+        prices.insert(normalize_priced_model_name(model), entry);
+    }
+    prices
+}
+
+fn parse_model_price_value(value: &serde_json::Value) -> Option<(f64, f64)> {
+    let parsed: ModelPriceProbePayload = serde_json::from_value(value.clone()).ok()?;
+    let input = parsed.input_price_per_million?;
+    let output = parsed.output_price_per_million?;
+    if !is_valid_model_price(input, output) {
+        return None;
+    }
+    Some((input, output))
+}
+
+fn fresh_model_price_catalog(
+    catalog: &PersistedModelPriceCatalog,
+    now_epoch_secs: u64,
+) -> BTreeMap<String, (f64, f64)> {
+    catalog
+        .models
+        .iter()
+        .filter_map(|(model, entry)| {
+            if !is_fresh_model_price_entry(entry, now_epoch_secs) {
+                return None;
+            }
+            Some((
+                normalize_priced_model_name(model),
+                (
+                    entry.input_price_per_million,
+                    entry.output_price_per_million,
+                ),
+            ))
+        })
+        .collect()
+}
+
+fn retained_fresh_model_price_entries(
+    models: BTreeMap<String, PersistedModelPriceEntry>,
+    now_epoch_secs: u64,
+) -> BTreeMap<String, PersistedModelPriceEntry> {
+    models
+        .into_iter()
+        .filter(|(_, entry)| is_fresh_model_price_entry(entry, now_epoch_secs))
+        .collect()
+}
+
+fn is_fresh_model_price_entry(entry: &PersistedModelPriceEntry, now_epoch_secs: u64) -> bool {
+    is_valid_model_price(
+        entry.input_price_per_million,
+        entry.output_price_per_million,
+    ) && now_epoch_secs.saturating_sub(entry.checked_at_epoch_secs) <= MODEL_PRICE_CACHE_TTL_SECS
+}
+
+fn default_model_price_cache_version() -> u32 {
+    MODEL_PRICE_CACHE_VERSION
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn strip_code_fence(text: &str) -> &str {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed;
+    }
+    let without_prefix = trimmed
+        .trim_start_matches("```json")
+        .trim_start_matches("```JSON")
+        .trim_start_matches("```");
+    without_prefix.trim().trim_end_matches("```").trim()
+}
+
+fn extract_first_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    Some(&text[start..=end])
+}
+
+fn write_string_atomically(path: &Path, content: &str) -> Result<(), AppError> {
+    let parent = path.parent().ok_or_else(|| {
+        AppError::Runtime(format!(
+            "failed to resolve parent directory for {}",
+            path.display()
+        ))
+    })?;
+    fs::create_dir_all(parent).map_err(|err| {
+        AppError::Runtime(format!(
+            "failed to create parent directory {}: {err}",
+            parent.display()
+        ))
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|item| item.to_str())
+        .unwrap_or("model-price-cache");
+    let temp_path = parent.join(format!(".{}.{}.tmp", file_name, uuid::Uuid::new_v4()));
+    fs::write(&temp_path, content).map_err(|err| {
+        AppError::Runtime(format!(
+            "failed to write temporary file {}: {err}",
+            temp_path.display()
+        ))
+    })?;
+    if let Err(err) = fs::rename(&temp_path, path) {
+        if path.exists() {
+            let _ = fs::remove_file(path);
+            fs::rename(&temp_path, path).map_err(|rename_err| {
+                AppError::Runtime(format!(
+                    "failed to replace file {} after rename error {}: {}",
+                    path.display(),
+                    err,
+                    rename_err
+                ))
+            })?;
+        } else {
+            let _ = fs::remove_file(&temp_path);
+            return Err(AppError::Runtime(format!(
+                "failed to move temporary file into place {}: {err}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn optional_content(content: String) -> Option<String> {
@@ -1683,7 +2486,7 @@ fn optional_content(content: String) -> Option<String> {
 
 fn sanitize_assistant_content(raw: &str) -> String {
     let cleaned = DSML_FUNCTION_CALLS_BLOCK_RE.replace_all(raw, "");
-    cleaned.trim().to_string()
+    cleaned.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn parse_dsml_tool_calls(raw: &str, round: usize) -> Vec<ToolCallRequest> {
@@ -1813,11 +2616,17 @@ mod tests {
     use reqwest::blocking::Client;
     use reqwest::StatusCode;
     use serde_json::json;
+    use std::{env, fs, sync::RwLock};
 
     use super::{
-        AiClient, ChatMetrics, ChatStopReason, FinalizeWithoutToolsState, builtin_model_prices,
-        extract_text_from_value, merge_text_delta, merge_visible_chunks,
-        resolve_effective_model_prices, should_fallback_to_non_streaming, with_cost,
+        AiClient, ChatCompletionStreamResponse, ChatMetrics, ChatStopReason,
+        FinalizeWithoutToolsState, ModelPriceSource, PersistedModelPriceCatalog,
+        PersistedModelPriceEntry, builtin_model_prices, extract_text_from_value,
+        extract_text_delta_from_value, fresh_model_price_catalog, merge_text_delta,
+        merge_visible_chunks,
+        parse_model_price_catalog_response, parse_model_price_probe_response,
+        price_probe_candidate_models, resolve_effective_model_prices,
+        should_fallback_to_non_streaming, with_cost,
     };
 
     fn test_ai_client() -> AiClient {
@@ -1826,10 +2635,14 @@ mod tests {
             base_url: "https://example.com/chat/completions".to_string(),
             token: "token".to_string(),
             model: "unknown-model".to_string(),
+            model_price_cache_path: env::temp_dir()
+                .join(format!("machineclaw-test-{}.json", uuid::Uuid::new_v4())),
+            debug: false,
             max_retries: 0,
             backoff_millis: 0,
             input_price_per_million: 0.0,
             output_price_per_million: 0.0,
+            runtime_model_prices: RwLock::new(None),
         }
     }
 
@@ -1854,17 +2667,67 @@ mod tests {
     }
 
     #[test]
+    fn preserves_multiline_code_block_text_from_visible_value() {
+        let payload = json!([
+            {"type":"text","text":{"value":"```rust\nfn main() {\n    println!(\"hi\");\n}\n```"}}
+        ]);
+        assert_eq!(
+            extract_text_from_value(&payload),
+            "```rust\nfn main() {\n    println!(\"hi\");\n}\n```"
+        );
+    }
+
+    #[test]
+    fn preserves_stream_delta_newlines_and_indentation() {
+        let payload = json!([
+            {"type":"text","text":{"value":"\nfn main() {\n    println!(\"hi\");\n}"}}
+        ]);
+        assert_eq!(
+            extract_text_delta_from_value(&payload),
+            "\nfn main() {\n    println!(\"hi\");\n}"
+        );
+    }
+
+    #[test]
     fn resolves_builtin_model_prices_when_config_missing() {
         assert_eq!(
-            resolve_effective_model_prices("deepseek-chat", 0.0, 0.0),
+            resolve_effective_model_prices("deepseek-chat", 0.0, 0.0, None),
             Some((0.27, 1.10))
+        );
+        assert_eq!(
+            resolve_effective_model_prices("gpt-5.2", 0.0, 0.0, None),
+            Some((1.75, 14.0))
+        );
+        assert_eq!(
+            resolve_effective_model_prices("openai/gpt-5.2", 0.0, 0.0, None),
+            Some((1.75, 14.0))
+        );
+        assert_eq!(
+            resolve_effective_model_prices("closeai:gpt-5-mini", 0.0, 0.0, None),
+            Some((0.25, 2.0))
         );
         assert_eq!(builtin_model_prices("unknown-model"), None);
     }
 
     #[test]
+    fn configured_model_prices_override_builtin_prices() {
+        assert_eq!(
+            resolve_effective_model_prices("gpt-5.2", 9.9, 19.9, None),
+            Some((9.9, 19.9))
+        );
+    }
+
+    #[test]
+    fn runtime_probed_prices_override_builtin_prices_when_config_missing() {
+        assert_eq!(
+            resolve_effective_model_prices("gpt-5.2", 0.0, 0.0, Some((3.3, 7.7))),
+            Some((3.3, 7.7))
+        );
+    }
+
+    #[test]
     fn cost_is_unavailable_for_unknown_model_without_config() {
-        let metrics = with_cost(ChatMetrics::default(), "unknown-model", 0.0, 0.0);
+        let metrics = with_cost(ChatMetrics::default(), "unknown-model", 0.0, 0.0, None);
         assert_eq!(metrics.estimated_cost_usd, None);
     }
 
@@ -1878,6 +2741,16 @@ mod tests {
     }
 
     #[test]
+    fn keeps_short_stream_delta_overlaps_without_truncating_code() {
+        let mut target = "pub fn ".to_string();
+        assert_eq!(
+            merge_text_delta(&mut target, "fn merge_sort<T: Ord + Clone>() {"),
+            "fn merge_sort<T: Ord + Clone>() {"
+        );
+        assert_eq!(target, "pub fn fn merge_sort<T: Ord + Clone>() {");
+    }
+
+    #[test]
     fn falls_back_when_server_rejects_stream_parameter() {
         assert!(should_fallback_to_non_streaming(
             StatusCode::BAD_REQUEST,
@@ -1887,6 +2760,130 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             "stream is unsupported"
         ));
+    }
+
+    #[test]
+    fn parses_model_price_probe_response_from_plain_json() {
+        assert_eq!(
+            parse_model_price_probe_response(
+                r#"{"input_price_per_million":1.25,"output_price_per_million":10.0}"#
+            ),
+            Some((1.25, 10.0))
+        );
+    }
+
+    #[test]
+    fn parses_model_price_probe_response_from_json_code_fence() {
+        assert_eq!(
+            parse_model_price_probe_response(
+                "```json\n{\"input_price_per_million\":1.25,\"output_price_per_million\":10.0}\n```"
+            ),
+            Some((1.25, 10.0))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_model_price_probe_response() {
+        assert_eq!(
+            parse_model_price_probe_response(
+                r#"{"input_price_per_million":null,"output_price_per_million":10.0}"#
+            ),
+            None
+        );
+        assert_eq!(
+            parse_model_price_probe_response(
+                r#"{"input_price_per_million":-1,"output_price_per_million":10.0}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_model_price_catalog_response_from_mapping_json() {
+        let parsed = parse_model_price_catalog_response(
+            r#"{"gpt-5.2":{"input_price_per_million":1.75,"output_price_per_million":14.0},"gpt-5-mini":{"input_price_per_million":0.25,"output_price_per_million":2.0}}"#,
+            "gpt-5.2",
+        );
+        assert_eq!(parsed.get("gpt-5.2"), Some(&(1.75, 14.0)));
+        assert_eq!(parsed.get("gpt-5-mini"), Some(&(0.25, 2.0)));
+    }
+
+    #[test]
+    fn parses_model_price_catalog_response_from_single_object_fallback() {
+        let parsed = parse_model_price_catalog_response(
+            r#"{"input_price_per_million":1.75,"output_price_per_million":14.0}"#,
+            "openai/gpt-5.2",
+        );
+        assert_eq!(parsed.get("gpt-5.2"), Some(&(1.75, 14.0)));
+    }
+
+    #[test]
+    fn filters_expired_entries_from_persisted_model_price_catalog() {
+        let catalog = PersistedModelPriceCatalog {
+            version: 1,
+            models: [
+                (
+                    "gpt-5.2".to_string(),
+                    PersistedModelPriceEntry {
+                        input_price_per_million: 1.75,
+                        output_price_per_million: 14.0,
+                        checked_at_epoch_secs: 1_700_000_000,
+                    },
+                ),
+                (
+                    "gpt-5-mini".to_string(),
+                    PersistedModelPriceEntry {
+                        input_price_per_million: 0.25,
+                        output_price_per_million: 2.0,
+                        checked_at_epoch_secs: 1_700_000_000 - (8 * 24 * 60 * 60),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let fresh = fresh_model_price_catalog(&catalog, 1_700_000_000);
+        assert_eq!(fresh.get("gpt-5.2"), Some(&(1.75, 14.0)));
+        assert!(!fresh.contains_key("gpt-5-mini"));
+    }
+
+    #[test]
+    fn prepare_model_pricing_uses_fresh_local_cache_before_online_probe() {
+        let mut client = test_ai_client();
+        client.model = "gpt-5.2".to_string();
+        let cache_path = env::temp_dir().join(format!(
+            "machineclaw-model-price-cache-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        client.model_price_cache_path = cache_path.clone();
+        let catalog = PersistedModelPriceCatalog {
+            version: 1,
+            models: [(
+                "gpt-5.2".to_string(),
+                PersistedModelPriceEntry {
+                    input_price_per_million: 1.75,
+                    output_price_per_million: 14.0,
+                    checked_at_epoch_secs: super::now_epoch_secs(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        fs::write(
+            &cache_path,
+            serde_json::to_string_pretty(&catalog).expect("serialize catalog"),
+        )
+        .expect("write cache");
+        let result = client.prepare_model_pricing(false);
+        assert_eq!(result.source, ModelPriceSource::LocalCache);
+        assert_eq!(result.prices, Some((1.75, 14.0)));
+        let _ = fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn unknown_model_price_probe_candidates_do_not_expand_to_all_known_models() {
+        let candidates = price_probe_candidate_models("vendor/custom-model");
+        assert_eq!(candidates, vec!["vendor/custom-model".to_string(), "custom-model".to_string()]);
     }
 
     #[test]
@@ -1924,5 +2921,37 @@ mod tests {
         assert!(response.content.contains("reason=max_tool_rounds_reached"));
         assert_eq!(response.archived_content, response.content);
         assert_eq!(response.thinking.as_deref(), Some("thought"));
+    }
+
+    #[test]
+    fn streaming_chunk_accepts_null_usage() {
+        let parsed: ChatCompletionStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"content":"hello"}}],"usage":null}"#,
+        )
+        .expect("null usage should deserialize");
+        assert_eq!(parsed.usage.prompt_tokens, 0);
+        assert_eq!(parsed.usage.completion_tokens, 0);
+        assert_eq!(parsed.usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn streaming_chunk_accepts_missing_usage() {
+        let parsed: ChatCompletionStreamResponse =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"hello"}}]}"#)
+                .expect("missing usage should deserialize");
+        assert_eq!(parsed.usage.prompt_tokens, 0);
+        assert_eq!(parsed.usage.completion_tokens, 0);
+        assert_eq!(parsed.usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn streaming_chunk_keeps_usage_object_values() {
+        let parsed: ChatCompletionStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"content":"hello"}}],"usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}"#,
+        )
+        .expect("usage object should deserialize");
+        assert_eq!(parsed.usage.prompt_tokens, 12);
+        assert_eq!(parsed.usage.completion_tokens, 34);
+        assert_eq!(parsed.usage.total_tokens, 46);
     }
 }

@@ -303,6 +303,7 @@ fn is_required_key(key: &str) -> bool {
 pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
     match key {
         "app.env-mode" => Some("\"prod\""),
+        "ai.debug" => Some("false"),
         "ai.connectivity-check" => Some("true"),
         "ai.retry.max-retries" => Some("2"),
         "ai.retry.backoff-millis" => Some("1500"),
@@ -314,6 +315,7 @@ pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
         "ai.chat.command-cache-ttl-seconds" => Some("30"),
         "ai.chat.show-round-metrics" => Some("true"),
         "ai.chat.show-token-cost" => Some("true"),
+        "ai.chat.skip-model-price-check" => Some("false"),
         "ai.chat.context-warn-percent" => Some("80"),
         "ai.chat.context-critical-percent" => Some("95"),
         "ai.chat.stream-output" => Some("false"),
@@ -359,6 +361,7 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
         "ai.base-url",
         "ai.token",
         "ai.model",
+        "ai.debug",
         "ai.connectivity-check",
         "ai.retry.max-retries",
         "ai.retry.backoff-millis",
@@ -370,6 +373,7 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
         "ai.chat.command-cache-ttl-seconds",
         "ai.chat.show-round-metrics",
         "ai.chat.show-token-cost",
+        "ai.chat.skip-model-price-check",
         "ai.chat.context-warn-percent",
         "ai.chat.context-critical-percent",
         "ai.chat.stream-output",
