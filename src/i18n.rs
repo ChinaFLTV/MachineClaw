@@ -933,6 +933,28 @@ pub fn chat_ai_recoverable_failure(detail: &str) -> String {
     }
 }
 
+pub fn chat_ai_reconnecting(current: u32, total: u32) -> String {
+    match current_language() {
+        Language::ZhCn => format!("AI 连接异常，正在重连... {current}/{total}"),
+        Language::ZhTw => format!("AI 連線異常，正在重連... {current}/{total}"),
+        Language::Fr => format!("Connexion IA instable, reconnexion... {current}/{total}"),
+        Language::De => format!("KI-Verbindung instabil, erneuter Verbindungsaufbau... {current}/{total}"),
+        Language::Ja => format!("AI 接続が不安定です。再接続中... {current}/{total}"),
+        Language::En => format!("AI connection issue. Reconnecting... {current}/{total}"),
+    }
+}
+
+pub fn chat_ai_reconnecting_after_idle() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "检测到长时间空闲，正在重连 AI 服务...",
+        Language::ZhTw => "偵測到長時間閒置，正在重新連接 AI 服務...",
+        Language::Fr => "Longue inactivité détectée, reconnexion au service IA...",
+        Language::De => "Lange Inaktivität erkannt, KI-Dienst wird neu verbunden...",
+        Language::Ja => "長時間の待機を検出しました。AI サービスに再接続しています...",
+        Language::En => "Long idle detected. Reconnecting to the AI service...",
+    }
+}
+
 pub fn prompt_write_command_edit_title(command: &str) -> String {
     match current_language() {
         Language::ZhCn => format!("准备编辑写命令: {command}"),

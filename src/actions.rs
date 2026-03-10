@@ -33,7 +33,9 @@ use crate::{
     mcp::McpManager,
     platform::OsType,
     render::{self, ActionRenderData},
-    shell::{CommandMode, CommandResult, CommandSpec, ShellExecutor},
+    shell::{
+        CommandMode, CommandResult, CommandSpec, ShellExecutor, note_interactive_input_wait,
+    },
 };
 
 pub struct ActionServices<'a> {
@@ -260,6 +262,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             next_message
         } else {
             let mut input = Vec::<u8>::new();
+            let wait_started = Instant::now();
             let read_count = {
                 let stdin = io::stdin();
                 let mut stdin_lock = stdin.lock();
@@ -267,6 +270,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                     .read_until(b'\n', &mut input)
                     .map_err(|err| AppError::Command(format!("failed to read chat input: {err}")))?
             };
+            note_interactive_input_wait(wait_started);
             if read_count == 0 {
                 break;
             }

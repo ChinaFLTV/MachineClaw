@@ -17,7 +17,9 @@ use crate::{config::CmdConfig, error::AppError, i18n, logging, mask::mask_sensit
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static WRITE_SESSION_APPROVED: AtomicBool = AtomicBool::new(false);
+static INTERACTIVE_INPUT_IDLE_REFRESH_HINT: AtomicBool = AtomicBool::new(false);
 const DETACHED_CAPTURE_JOIN_GRACE: Duration = Duration::from_millis(250);
+const INTERACTIVE_INPUT_IDLE_REFRESH_THRESHOLD: Duration = Duration::from_secs(45);
 
 static DANGEROUS_PATTERNS: Lazy<Vec<&'static str>> = Lazy::new(|| {
     vec![
@@ -632,6 +634,16 @@ impl ShellExecutor {
     }
 }
 
+pub fn note_interactive_input_wait(wait_started: Instant) {
+    if wait_started.elapsed() >= INTERACTIVE_INPUT_IDLE_REFRESH_THRESHOLD {
+        INTERACTIVE_INPUT_IDLE_REFRESH_HINT.store(true, Ordering::SeqCst);
+    }
+}
+
+pub fn take_interactive_input_refresh_hint() -> bool {
+    INTERACTIVE_INPUT_IDLE_REFRESH_HINT.swap(false, Ordering::SeqCst)
+}
+
 fn shell_command(command: &str) -> Command {
     if cfg!(windows) {
         let mut cmd = Command::new("cmd");
@@ -705,9 +717,11 @@ fn prompt_write_decision(
             AppError::Command(format!("failed to flush confirmation prompt: {err}"))
         })?;
         let mut input = String::new();
+        let wait_started = Instant::now();
         io::stdin().read_line(&mut input).map_err(|err| {
             AppError::Command(format!("failed to read confirmation input: {err}"))
         })?;
+        note_interactive_input_wait(wait_started);
         if let Some(decision) = parse_write_decision_input(&input, with_session_allow) {
             return Ok(decision);
         }
@@ -743,9 +757,11 @@ fn prompt_edit_command(original: &str) -> Result<String, AppError> {
         .flush()
         .map_err(|err| AppError::Command(format!("failed to flush edit prompt: {err}")))?;
     let mut input = String::new();
+    let wait_started = Instant::now();
     io::stdin()
         .read_line(&mut input)
         .map_err(|err| AppError::Command(format!("failed to read edited command: {err}")))?;
+    note_interactive_input_wait(wait_started);
     Ok(input.trim().to_string())
 }
 
@@ -857,13 +873,14 @@ fn mode_to_str(mode: CommandMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::config::CmdConfig;
 
     use super::{
         CommandMode, CommandSpec, ShellExecutor, WriteDecision, looks_like_detached_command,
-        parse_write_decision_input,
+        note_interactive_input_wait, parse_write_decision_input,
+        take_interactive_input_refresh_hint,
     };
 
     #[test]
@@ -911,5 +928,20 @@ mod tests {
             Some(WriteDecision::Reject)
         );
         assert_eq!(parse_write_decision_input("m\n", false), None);
+    }
+
+    #[test]
+    fn long_interactive_wait_sets_refresh_hint_once() {
+        let _ = take_interactive_input_refresh_hint();
+        note_interactive_input_wait(Instant::now() - Duration::from_secs(46));
+        assert!(take_interactive_input_refresh_hint());
+        assert!(!take_interactive_input_refresh_hint());
+    }
+
+    #[test]
+    fn short_interactive_wait_does_not_set_refresh_hint() {
+        let _ = take_interactive_input_refresh_hint();
+        note_interactive_input_wait(Instant::now());
+        assert!(!take_interactive_input_refresh_hint());
     }
 }

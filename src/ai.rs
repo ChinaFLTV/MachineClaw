@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     error::Error as StdError,
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, IsTerminal, Read},
     path::{Path, PathBuf},
     sync::RwLock,
     thread,
@@ -18,11 +18,18 @@ use serde::{Deserialize, Serialize};
 use serde::de::Deserializer;
 use serde_json::json;
 
-use crate::{config::AiConfig, error::AppError, i18n, logging, mask::mask_sensitive};
+use crate::{
+    config::AiConfig, error::AppError, i18n, logging, mask::mask_sensitive,
+    shell::take_interactive_input_refresh_hint,
+};
 
 const MODEL_PRICE_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MODEL_PRICE_CACHE_VERSION: u32 = 1;
 const MAX_AUTO_RATE_LIMIT_WAIT_SECS: u64 = 15;
+const AI_HTTP_CONNECT_TIMEOUT_SECS: u64 = 8;
+const AI_HTTP_REQUEST_TIMEOUT_SECS: u64 = 60;
+const AI_HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 30;
+const AI_HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -119,7 +126,7 @@ pub struct ExternalToolDefinition {
 
 #[derive(Debug)]
 pub struct AiClient {
-    client: Client,
+    client: RwLock<Client>,
     base_url: String,
     token: String,
     model: String,
@@ -134,13 +141,18 @@ pub struct AiClient {
 
 impl Clone for AiClient {
     fn clone(&self) -> Self {
+        let client = self
+            .client
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|_| Client::builder().build().expect("fallback AI client clone"));
         let cached_prices = self
             .runtime_model_prices
             .read()
             .ok()
             .and_then(|guard| *guard);
         Self {
-            client: self.client.clone(),
+            client: RwLock::new(client),
             base_url: self.base_url.clone(),
             token: self.token.clone(),
             model: self.model.clone(),
@@ -332,14 +344,20 @@ struct PersistedModelPriceEntry {
 }
 
 impl AiClient {
-    pub fn new(cfg: &AiConfig, model_price_cache_path: PathBuf) -> Result<Self, AppError> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(8))
-            .timeout(Duration::from_secs(60))
+    fn build_http_client() -> Result<Client, AppError> {
+        Client::builder()
+            .connect_timeout(Duration::from_secs(AI_HTTP_CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(AI_HTTP_REQUEST_TIMEOUT_SECS))
+            .pool_idle_timeout(Duration::from_secs(AI_HTTP_POOL_IDLE_TIMEOUT_SECS))
+            .tcp_keepalive(Duration::from_secs(AI_HTTP_TCP_KEEPALIVE_SECS))
             .build()
-            .map_err(|err| AppError::Ai(format!("failed to build AI http client: {err}")))?;
+            .map_err(|err| AppError::Ai(format!("failed to build AI http client: {err}")))
+    }
+
+    pub fn new(cfg: &AiConfig, model_price_cache_path: PathBuf) -> Result<Self, AppError> {
+        let client = Self::build_http_client()?;
         Ok(Self {
-            client,
+            client: RwLock::new(client),
             base_url: build_chat_url(&cfg.base_url),
             token: cfg.token.clone(),
             model: cfg.model.clone(),
@@ -900,6 +918,8 @@ impl AiClient {
     ) -> Result<ApiChatCallResult, AppError> {
         let mut effective_body = normalize_request_for_provider(body, &self.base_url);
         let mut stripped_reasoning_retry_used = false;
+        let mut retry_with_fresh_client = false;
+        let mut refreshed_for_idle_hint = false;
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -917,9 +937,23 @@ impl AiClient {
                 AiDebugLevel::Debug,
                 &format!("AI request body: {}", serialize_debug_json(&effective_body)),
             );
+            if !refreshed_for_idle_hint && take_interactive_input_refresh_hint() {
+                self.reconnect_http_client()?;
+                maybe_print_ai_reconnect_notice(&i18n::chat_ai_reconnecting_after_idle());
+                refreshed_for_idle_hint = true;
+            }
             let started = Instant::now();
-            let resp = self
-                .client
+            let client = if retry_with_fresh_client {
+                self.debug_emit(
+                    AiDebugLevel::Warn,
+                    "AI request retry is using a fresh HTTP client to avoid stale idle connections",
+                );
+                self.reconnect_http_client()?;
+                self.current_http_client()?
+            } else {
+                self.current_http_client()?
+            };
+            let resp = client
                 .post(&self.base_url)
                 .bearer_auth(&self.token)
                 .json(&effective_body)
@@ -1007,6 +1041,15 @@ impl AiClient {
                     let err_msg = format!("AI request failed: {}", format_reqwest_error(&err));
                     logging::warn(&err_msg);
                     if attempt <= self.max_retries {
+                        retry_with_fresh_client = should_refresh_http_client_after_reqwest_error(
+                            &err,
+                        );
+                        if retry_with_fresh_client {
+                            maybe_print_ai_reconnect_notice(&i18n::chat_ai_reconnecting(
+                                attempt,
+                                self.max_retries,
+                            ));
+                        }
                         thread::sleep(Duration::from_millis(self.backoff_millis));
                         continue;
                     }
@@ -1031,6 +1074,8 @@ impl AiClient {
 
         let mut effective_body = normalize_request_for_provider(body, &self.base_url);
         let mut stripped_reasoning_retry_used = false;
+        let mut retry_with_fresh_client = false;
+        let mut refreshed_for_idle_hint = false;
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -1053,8 +1098,22 @@ impl AiClient {
                 AiDebugLevel::Debug,
                 &format!("AI streaming request body: {}", serialize_debug_json(&stream_body)),
             );
-            let resp = self
-                .client
+            if !refreshed_for_idle_hint && take_interactive_input_refresh_hint() {
+                self.reconnect_http_client()?;
+                maybe_print_ai_reconnect_notice(&i18n::chat_ai_reconnecting_after_idle());
+                refreshed_for_idle_hint = true;
+            }
+            let client = if retry_with_fresh_client {
+                self.debug_emit(
+                    AiDebugLevel::Warn,
+                    "AI streaming retry is using a fresh HTTP client to avoid stale idle connections",
+                );
+                self.reconnect_http_client()?;
+                self.current_http_client()?
+            } else {
+                self.current_http_client()?
+            };
+            let resp = client
                 .post(&self.base_url)
                 .bearer_auth(&self.token)
                 .json(&stream_body)
@@ -1170,6 +1229,11 @@ impl AiClient {
                             self.debug_emit(AiDebugLevel::Warn, &err_msg);
                             logging::warn(&err_msg);
                             if attempt <= self.max_retries {
+                                retry_with_fresh_client = true;
+                                maybe_print_ai_reconnect_notice(&i18n::chat_ai_reconnecting(
+                                    attempt,
+                                    self.max_retries,
+                                ));
                                 thread::sleep(Duration::from_millis(self.backoff_millis));
                                 continue;
                             }
@@ -1187,6 +1251,15 @@ impl AiClient {
                     self.debug_emit(AiDebugLevel::Error, &err_msg);
                     logging::warn(&err_msg);
                     if attempt <= self.max_retries {
+                        retry_with_fresh_client = should_refresh_http_client_after_reqwest_error(
+                            &err,
+                        );
+                        if retry_with_fresh_client {
+                            maybe_print_ai_reconnect_notice(&i18n::chat_ai_reconnecting(
+                                attempt,
+                                self.max_retries,
+                            ));
+                        }
                         thread::sleep(Duration::from_millis(self.backoff_millis));
                         continue;
                     }
@@ -1324,6 +1397,27 @@ impl AiClient {
 
     fn debug_emit(&self, level: AiDebugLevel, message: &str) {
         emit_ai_debug(self.debug, level, message);
+    }
+
+    fn current_http_client(&self) -> Result<Client, AppError> {
+        self.client
+            .read()
+            .map(|guard| guard.clone())
+            .map_err(|_| AppError::Ai("failed to read AI http client".to_string()))
+    }
+
+    pub fn reconnect_http_client(&self) -> Result<(), AppError> {
+        let new_client = Self::build_http_client()?;
+        let mut guard = self
+            .client
+            .write()
+            .map_err(|_| AppError::Ai("failed to refresh AI http client".to_string()))?;
+        *guard = new_client;
+        self.debug_emit(
+            AiDebugLevel::Info,
+            "AI http client refreshed to recover from idle/disconnected transport state",
+        );
+        Ok(())
     }
 
     fn attach_cost(&self, metrics: ChatMetrics) -> ChatMetrics {
@@ -2754,6 +2848,26 @@ fn parse_rate_limit_retry_delay(status: StatusCode, retry_after: Option<&str>) -
     Some(Duration::from_secs(seconds))
 }
 
+fn should_refresh_http_client_after_reqwest_error(err: &reqwest::Error) -> bool {
+    if err.is_timeout() || err.is_connect() || err.is_request() {
+        return true;
+    }
+    let lowered = err.to_string().to_ascii_lowercase();
+    lowered.contains("connection reset")
+        || lowered.contains("broken pipe")
+        || lowered.contains("connection closed")
+        || lowered.contains("unexpected eof")
+        || lowered.contains("channel closed")
+        || lowered.contains("tls handshake eof")
+}
+
+fn maybe_print_ai_reconnect_notice(message: &str) {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    println!("{} {}", i18n::chat_tag_info(), message);
+}
+
 fn model_prefers_omit_tool_choice(model: &str) -> bool {
     let normalized = model.trim().to_ascii_lowercase();
     normalized == "deepseek-reasoner"
@@ -2963,6 +3077,7 @@ mod tests {
         price_probe_candidate_models, provider_requires_reasoning_content_omission,
         request_contains_reasoning_content, resolve_effective_model_prices,
         is_rate_limited_error, parse_rate_limit_retry_delay,
+        should_refresh_http_client_after_reqwest_error,
         should_fallback_to_non_streaming, should_retry_without_reasoning_content,
         strip_reasoning_content_from_request, with_cost, ChatCompletionRequest, ApiMessage,
         normalize_stepfun_chat_request, ApiToolCall, ApiToolFunction,
@@ -2971,7 +3086,7 @@ mod tests {
 
     fn test_ai_client() -> AiClient {
         AiClient {
-            client: Client::builder().build().expect("test client"),
+            client: RwLock::new(Client::builder().build().expect("test client")),
             base_url: "https://example.com/chat/completions".to_string(),
             token: "token".to_string(),
             model: "unknown-model".to_string(),
@@ -3385,6 +3500,28 @@ mod tests {
         assert!(!super::is_transient_ai_error(&AppError::Ai(
             "AI HTTP status=400 Bad Request".to_string()
         )));
+    }
+
+    #[test]
+    fn refreshes_http_client_for_transient_transport_errors() {
+        let connect_err = reqwest::blocking::Client::builder()
+            .build()
+            .expect("test client")
+            .get("http://127.0.0.1:1")
+            .send()
+            .expect_err("request should fail");
+        assert!(should_refresh_http_client_after_reqwest_error(&connect_err));
+    }
+
+    #[test]
+    fn does_not_refresh_http_client_for_builder_validation_errors() {
+        let invalid_url_err = reqwest::blocking::Client::builder()
+            .build()
+            .expect("test client")
+            .get("://bad-url")
+            .build()
+            .expect_err("request build should fail");
+        assert!(!should_refresh_http_client_after_reqwest_error(&invalid_url_err));
     }
 
     #[test]
