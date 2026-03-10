@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     error::Error as StdError,
     fs,
     io::{BufRead, BufReader, Read},
@@ -192,7 +192,7 @@ struct ApiMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "option_string_is_blank")]
     reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ApiToolCall>>,
@@ -860,6 +860,8 @@ impl AiClient {
         &self,
         body: &ChatCompletionRequest,
     ) -> Result<ApiChatCallResult, AppError> {
+        let mut effective_body = normalize_request_for_provider(body, &self.base_url);
+        let mut stripped_reasoning_retry_used = false;
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -869,20 +871,20 @@ impl AiClient {
                 &format!(
                     "AI request start: attempt={attempt}, url={}, model={}, stream=false, messages={}",
                     self.base_url,
-                    body.model,
-                    body.messages.len(),
+                    effective_body.model,
+                    effective_body.messages.len(),
                 ),
             );
             self.debug_emit(
                 AiDebugLevel::Debug,
-                &format!("AI request body: {}", serialize_debug_json(body)),
+                &format!("AI request body: {}", serialize_debug_json(&effective_body)),
             );
             let started = Instant::now();
             let resp = self
                 .client
                 .post(&self.base_url)
                 .bearer_auth(&self.token)
-                .json(body)
+                .json(&effective_body)
                 .send();
 
             match resp {
@@ -898,6 +900,23 @@ impl AiClient {
                             AiDebugLevel::Error,
                             &format!("AI response error body: {safe_body}"),
                         );
+                        if !stripped_reasoning_retry_used
+                            && should_retry_without_reasoning_content(status, &body)
+                            && request_contains_reasoning_content(&effective_body)
+                        {
+                            logging::warn(
+                                "AI rejected chat message; retrying once without reasoning_content for compatibility",
+                            );
+                            self.debug_emit(
+                                AiDebugLevel::Warn,
+                                &format!(
+                                    "AI compatibility fallback triggered: retrying without reasoning_content, status={status}, body={safe_body}"
+                                ),
+                            );
+                            strip_reasoning_content_from_request(&mut effective_body);
+                            stripped_reasoning_retry_used = true;
+                            continue;
+                        }
                         logging::warn(&err_msg);
                         if attempt <= self.max_retries && should_retry_status(status) {
                             thread::sleep(Duration::from_millis(self.backoff_millis));
@@ -959,6 +978,8 @@ impl AiClient {
             return self.send_chat_completion(body);
         }
 
+        let mut effective_body = normalize_request_for_provider(body, &self.base_url);
+        let mut stripped_reasoning_retry_used = false;
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -970,12 +991,12 @@ impl AiClient {
                 &format!(
                     "AI streaming request start: attempt={attempt}, url={}, model={}, stream=true, messages={}",
                     self.base_url,
-                    body.model,
-                    body.messages.len(),
+                    effective_body.model,
+                    effective_body.messages.len(),
                 ),
             );
             let started = Instant::now();
-            let mut stream_body = body.clone();
+            let mut stream_body = effective_body.clone();
             stream_body.stream = Some(true);
             self.debug_emit(
                 AiDebugLevel::Debug,
@@ -1000,6 +1021,23 @@ impl AiClient {
                             AiDebugLevel::Error,
                             &format!("AI streaming response error body: {safe_body}"),
                         );
+                        if !stripped_reasoning_retry_used
+                            && should_retry_without_reasoning_content(status, &response_body)
+                            && request_contains_reasoning_content(&effective_body)
+                        {
+                            logging::warn(
+                                "AI streaming request rejected chat message; retrying once without reasoning_content for compatibility",
+                            );
+                            self.debug_emit(
+                                AiDebugLevel::Warn,
+                                &format!(
+                                    "AI streaming compatibility fallback triggered: retrying without reasoning_content, status={status}, body={safe_body}"
+                                ),
+                            );
+                            strip_reasoning_content_from_request(&mut effective_body);
+                            stripped_reasoning_retry_used = true;
+                            continue;
+                        }
                         if should_fallback_to_non_streaming(status, &response_body) {
                             logging::warn(&format!(
                                 "AI streaming unsupported, fallback to non-streaming, status={status}, body={safe_body}"
@@ -1744,6 +1782,10 @@ fn finalize_tool_calls(tool_calls: Vec<PartialToolCall>) -> Vec<ApiToolCall> {
 
 fn optional_json_text(value: String) -> Option<serde_json::Value> {
     optional_text(value).map(serde_json::Value::String)
+}
+
+fn option_string_is_blank(value: &Option<String>) -> bool {
+    value.as_ref().is_none_or(|item| item.trim().is_empty())
 }
 
 fn optional_text(value: String) -> Option<String> {
@@ -2611,6 +2653,142 @@ fn build_chat_url(base_url: &str) -> String {
     format!("{trimmed}/chat/completions")
 }
 
+fn normalize_request_for_provider(
+    body: &ChatCompletionRequest,
+    base_url: &str,
+) -> ChatCompletionRequest {
+    let mut normalized = body.clone();
+    if provider_requires_reasoning_content_omission(base_url) {
+        normalize_stepfun_chat_request(&mut normalized);
+    }
+    normalized
+}
+
+fn normalize_stepfun_chat_request(body: &mut ChatCompletionRequest) {
+    strip_reasoning_content_from_request(body);
+    ensure_assistant_content_is_non_null(body);
+    normalize_tool_call_ids_in_request(body);
+}
+
+fn provider_requires_reasoning_content_omission(base_url: &str) -> bool {
+    let normalized = base_url.trim().to_ascii_lowercase();
+    normalized.contains("stepfun.com")
+}
+
+fn ensure_assistant_content_is_non_null(body: &mut ChatCompletionRequest) {
+    for message in &mut body.messages {
+        if message.role == "assistant" && message.content.is_none() {
+            message.content = Some(String::new());
+        }
+    }
+}
+
+fn request_contains_reasoning_content(body: &ChatCompletionRequest) -> bool {
+    body.messages.iter().any(|message| {
+        message
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
+fn strip_reasoning_content_from_request(body: &mut ChatCompletionRequest) {
+    for message in &mut body.messages {
+        message.reasoning_content = None;
+    }
+}
+
+fn normalize_tool_call_ids_in_request(body: &mut ChatCompletionRequest) {
+    let mut seen_ids = HashSet::new();
+    let mut pending_ids = HashMap::<String, VecDeque<String>>::new();
+    let mut generated_counter: usize = 0;
+
+    for message in &mut body.messages {
+        if message.role == "assistant" {
+            let Some(tool_calls) = message.tool_calls.as_mut() else {
+                continue;
+            };
+            for tool_call in tool_calls {
+                let original_id = tool_call.id.trim().to_string();
+                let normalized_id = if original_id.is_empty() || seen_ids.contains(&original_id) {
+                    generate_unique_tool_call_id(&original_id, &mut seen_ids, &mut generated_counter)
+                } else {
+                    seen_ids.insert(original_id.clone());
+                    original_id.clone()
+                };
+                tool_call.id = normalized_id.clone();
+                pending_ids
+                    .entry(original_id)
+                    .or_default()
+                    .push_back(normalized_id);
+            }
+            continue;
+        }
+
+        if message.role != "tool" {
+            continue;
+        }
+        let Some(tool_call_id) = message.tool_call_id.as_mut() else {
+            continue;
+        };
+        let original_id = tool_call_id.trim().to_string();
+        if original_id.is_empty() {
+            continue;
+        }
+        if let Some(mapped_id) = pending_ids
+            .get_mut(&original_id)
+            .and_then(|queue| queue.pop_front())
+        {
+            *tool_call_id = mapped_id;
+        }
+    }
+}
+
+fn generate_unique_tool_call_id(
+    original_id: &str,
+    seen_ids: &mut HashSet<String>,
+    generated_counter: &mut usize,
+) -> String {
+    let base = sanitize_tool_call_id_base(original_id);
+    loop {
+        *generated_counter += 1;
+        let candidate = format!("{base}_ctx_{}", generated_counter);
+        if seen_ids.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+}
+
+fn sanitize_tool_call_id_base(original_id: &str) -> String {
+    let sanitized = original_id
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if sanitized.is_empty() {
+        return "tool_call".to_string();
+    }
+    sanitized
+}
+
+fn should_retry_without_reasoning_content(status: StatusCode, body: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains("unrecognized chat message")
+        || lowered.contains("reasoning_content")
+        || lowered.contains("reasoning format")
+}
+
 #[cfg(test)]
 mod tests {
     use reqwest::blocking::Client;
@@ -2625,8 +2803,11 @@ mod tests {
         extract_text_delta_from_value, fresh_model_price_catalog, merge_text_delta,
         merge_visible_chunks,
         parse_model_price_catalog_response, parse_model_price_probe_response,
-        price_probe_candidate_models, resolve_effective_model_prices,
-        should_fallback_to_non_streaming, with_cost,
+        price_probe_candidate_models, provider_requires_reasoning_content_omission,
+        request_contains_reasoning_content, resolve_effective_model_prices,
+        should_fallback_to_non_streaming, should_retry_without_reasoning_content,
+        strip_reasoning_content_from_request, with_cost, ChatCompletionRequest, ApiMessage,
+        normalize_stepfun_chat_request, ApiToolCall, ApiToolFunction,
     };
 
     fn test_ai_client() -> AiClient {
@@ -2953,5 +3134,138 @@ mod tests {
         assert_eq!(parsed.usage.prompt_tokens, 12);
         assert_eq!(parsed.usage.completion_tokens, 34);
         assert_eq!(parsed.usage.total_tokens, 46);
+    }
+
+    #[test]
+    fn strips_reasoning_content_from_request_messages() {
+        let mut request = ChatCompletionRequest {
+            model: "step-3.5-flash".to_string(),
+            messages: vec![
+                ApiMessage {
+                    role: "assistant".to_string(),
+                    content: Some("planning".to_string()),
+                    reasoning_content: Some("hidden chain".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                ApiMessage {
+                    role: "tool".to_string(),
+                    content: Some("ok".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                },
+            ],
+            temperature: 0.2,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        assert!(request_contains_reasoning_content(&request));
+        strip_reasoning_content_from_request(&mut request);
+        assert!(!request_contains_reasoning_content(&request));
+    }
+
+    #[test]
+    fn detects_stepfun_reasoning_content_compatibility_mode() {
+        assert!(provider_requires_reasoning_content_omission(
+            "https://api.stepfun.com/v1/chat/completions"
+        ));
+        assert!(!provider_requires_reasoning_content_omission(
+            "https://api.openai.com/v1/chat/completions"
+        ));
+    }
+
+    #[test]
+    fn retries_bad_request_for_unrecognized_chat_message() {
+        assert!(should_retry_without_reasoning_content(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"Unrecognized chat message.","type":"request_params_invalid"}}"#
+        ));
+        assert!(!should_retry_without_reasoning_content(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"invalid api key"}}"#
+        ));
+    }
+
+    #[test]
+    fn stepfun_normalization_fills_empty_assistant_content_and_uniquifies_tool_call_ids() {
+        let mut request = ChatCompletionRequest {
+            model: "step-3.5-flash".to_string(),
+            messages: vec![
+                ApiMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    reasoning_content: Some("hidden".to_string()),
+                    tool_calls: Some(vec![ApiToolCall {
+                        id: "call_1".to_string(),
+                        r#type: "function".to_string(),
+                        function: ApiToolFunction {
+                            name: "run_shell_command".to_string(),
+                            arguments: "{\"command\":\"echo 1\"}".to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                ApiMessage {
+                    role: "tool".to_string(),
+                    content: Some("{\"ok\":true}".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                },
+                ApiMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    reasoning_content: Some("hidden".to_string()),
+                    tool_calls: Some(vec![ApiToolCall {
+                        id: "call_1".to_string(),
+                        r#type: "function".to_string(),
+                        function: ApiToolFunction {
+                            name: "run_shell_command".to_string(),
+                            arguments: "{\"command\":\"echo 2\"}".to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                ApiMessage {
+                    role: "tool".to_string(),
+                    content: Some("{\"ok\":false}".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                },
+            ],
+            temperature: 0.2,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+
+        normalize_stepfun_chat_request(&mut request);
+
+        assert_eq!(request.messages[0].content.as_deref(), Some(""));
+        assert_eq!(request.messages[2].content.as_deref(), Some(""));
+        assert!(request.messages[0].reasoning_content.is_none());
+        assert!(request.messages[2].reasoning_content.is_none());
+
+        let first_id = request.messages[0]
+            .tool_calls
+            .as_ref()
+            .and_then(|calls| calls.first())
+            .map(|call| call.id.clone())
+            .expect("first assistant tool call id");
+        let second_id = request.messages[2]
+            .tool_calls
+            .as_ref()
+            .and_then(|calls| calls.first())
+            .map(|call| call.id.clone())
+            .expect("second assistant tool call id");
+
+        assert_eq!(first_id, "call_1");
+        assert_ne!(second_id, "call_1");
+        assert_ne!(second_id, first_id);
+        assert_eq!(request.messages[1].tool_call_id.as_deref(), Some(first_id.as_str()));
+        assert_eq!(request.messages[3].tool_call_id.as_deref(), Some(second_id.as_str()));
     }
 }
