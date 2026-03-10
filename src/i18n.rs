@@ -899,6 +899,40 @@ pub fn prompt_write_command_proceed_with_session() -> &'static str {
     }
 }
 
+pub fn prompt_write_command_invalid_input() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "输入无效，请重新输入 y 或 n。",
+        Language::ZhTw => "輸入無效，請重新輸入 y 或 n。",
+        Language::Fr => "Entrée invalide, veuillez ressaisir y ou n.",
+        Language::De => "Ungültige Eingabe, bitte y oder n erneut eingeben.",
+        Language::Ja => "入力が無効です。y または n を再入力してください。",
+        Language::En => "Invalid input. Please enter y or n again.",
+    }
+}
+
+pub fn chat_ai_recoverable_failure(detail: &str) -> String {
+    match current_language() {
+        Language::ZhCn => format!(
+            "本轮 AI 请求暂时失败（{detail}）。会话未退出，请直接重试上一条指令或稍后再试。"
+        ),
+        Language::ZhTw => format!(
+            "本輪 AI 請求暫時失敗（{detail}）。會話未退出，請直接重試上一條指令或稍後再試。"
+        ),
+        Language::Fr => format!(
+            "La requête IA de ce tour a échoué temporairement ({detail}). La session reste active ; réessayez directement la commande précédente ou réessayez plus tard."
+        ),
+        Language::De => format!(
+            "Die KI-Anfrage dieser Runde ist vorübergehend fehlgeschlagen ({detail}). Die Sitzung bleibt aktiv; wiederholen Sie die letzte Anweisung direkt oder versuchen Sie es später erneut."
+        ),
+        Language::Ja => format!(
+            "このラウンドの AI リクエストは一時的に失敗しました（{detail}）。セッションは終了していないため、直前の指示をそのまま再試行するか、少し待って再試行してください。"
+        ),
+        Language::En => format!(
+            "The AI request for this round failed temporarily ({detail}). The session stays active; retry the previous instruction directly or try again later."
+        ),
+    }
+}
+
 pub fn prompt_write_command_edit_title(command: &str) -> String {
     match current_language() {
         Language::ZhCn => format!("准备编辑写命令: {command}"),
@@ -1875,6 +1909,14 @@ fn chat_tool_guard_reason_text(reason_code: &str) -> &'static str {
             Language::De => "maximale Anzahl von Tool-Runden erreicht",
             Language::Ja => "ツール呼び出しラウンド数が上限に達しました",
             Language::En => "maximum tool-calling rounds reached",
+        },
+        "rate_limited" => match current_language() {
+            Language::ZhCn => "AI 服务触发限流",
+            Language::ZhTw => "AI 服務觸發限流",
+            Language::Fr => "le service IA a déclenché une limitation de débit",
+            Language::De => "der KI-Dienst hat ein Rate-Limit ausgelöst",
+            Language::Ja => "AI サービスでレート制限が発生しました",
+            Language::En => "AI service rate limit reached",
         },
         _ => match current_language() {
             Language::ZhCn => "触发了保护性收口条件",

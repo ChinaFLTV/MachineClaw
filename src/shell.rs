@@ -1,6 +1,7 @@
 use std::{
     io::{self, IsTerminal, Read, Write},
     process::{Command, Stdio},
+    sync::{Arc, Mutex},
     sync::atomic::{AtomicBool, Ordering},
     sync::mpsc,
     thread,
@@ -16,6 +17,7 @@ use crate::{config::CmdConfig, error::AppError, i18n, logging, mask::mask_sensit
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static WRITE_SESSION_APPROVED: AtomicBool = AtomicBool::new(false);
+const DETACHED_CAPTURE_JOIN_GRACE: Duration = Duration::from_millis(250);
 
 static DANGEROUS_PATTERNS: Lazy<Vec<&'static str>> = Lazy::new(|| {
     vec![
@@ -54,6 +56,10 @@ static WRITE_HINT_PATTERNS: Lazy<Vec<&'static str>> = Lazy::new(|| {
         " sc stop ",
         " net stop ",
     ]
+});
+
+static DETACHED_AMPERSAND_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(^|\s)&(\s|$)").expect("valid detached ampersand regex")
 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +117,17 @@ enum WriteDecision {
     Approve,
     ApproveSession,
     EditAndApprove,
+}
+
+#[derive(Debug, Default)]
+struct CaptureBuffer {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+struct CaptureThread {
+    state: Arc<Mutex<CaptureBuffer>>,
+    handle: thread::JoinHandle<()>,
 }
 
 impl ShellExecutor {
@@ -521,7 +538,9 @@ impl ShellExecutor {
             mask_sensitive(command)
         ));
         let started = Instant::now();
+        let detached_command = looks_like_detached_command(command);
         let mut child = shell_command(command)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -580,21 +599,13 @@ impl ShellExecutor {
                 spec.label
             ))
         })?;
-        let (stdout, stdout_truncated) = stdout_handle.join().map_err(|_| {
-            AppError::Command(format!(
-                "failed to join stdout capture thread for command [{}]",
-                spec.label
-            ))
-        })?;
-        let (stderr, stderr_truncated) = stderr_handle.join().map_err(|_| {
-            AppError::Command(format!(
-                "failed to join stderr capture thread for command [{}]",
-                spec.label
-            ))
-        })?;
+        let (stdout, stdout_truncated, stdout_incomplete) =
+            collect_capture_output(stdout_handle, &spec.label, "stdout", detached_command)?;
+        let (stderr, stderr_truncated, stderr_incomplete) =
+            collect_capture_output(stderr_handle, &spec.label, "stderr", detached_command)?;
         let duration_ms = started.elapsed().as_millis();
-        let stdout = finalize_captured_output(stdout, stdout_truncated);
-        let stderr = finalize_captured_output(stderr, stderr_truncated);
+        let stdout = finalize_captured_output(stdout, stdout_truncated, stdout_incomplete);
+        let stderr = finalize_captured_output(stderr, stderr_truncated, stderr_incomplete);
         let success = status.success() && !timed_out && !interrupted;
 
         logging::info(&format!(
@@ -687,25 +698,38 @@ fn prompt_write_decision(
     } else {
         i18n::prompt_write_command_proceed()
     };
-    print!("{}\n{}", confirm_title, confirm_question);
-    io::stdout()
-        .flush()
-        .map_err(|err| AppError::Command(format!("failed to flush confirmation prompt: {err}")))?;
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .map_err(|err| AppError::Command(format!("failed to read confirmation input: {err}")))?;
-    let normalized = input.trim().to_ascii_lowercase();
-    if normalized == "e" || normalized == "edit" {
-        return Ok(WriteDecision::EditAndApprove);
+    print!("{confirm_title}\n");
+    loop {
+        print!("{confirm_question}");
+        io::stdout().flush().map_err(|err| {
+            AppError::Command(format!("failed to flush confirmation prompt: {err}"))
+        })?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).map_err(|err| {
+            AppError::Command(format!("failed to read confirmation input: {err}"))
+        })?;
+        if let Some(decision) = parse_write_decision_input(&input, with_session_allow) {
+            return Ok(decision);
+        }
+        println!("{}", i18n::prompt_write_command_invalid_input());
     }
-    if with_session_allow && (normalized == "a" || normalized == "all") {
-        return Ok(WriteDecision::ApproveSession);
+}
+
+fn parse_write_decision_input(input: &str, with_session_allow: bool) -> Option<WriteDecision> {
+    let normalized = input.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "n" || normalized == "no" {
+        return Some(WriteDecision::Reject);
     }
     if normalized == "y" || normalized == "yes" {
-        return Ok(WriteDecision::Approve);
+        return Some(WriteDecision::Approve);
     }
-    Ok(WriteDecision::Reject)
+    if with_session_allow && (normalized == "a" || normalized == "all") {
+        return Some(WriteDecision::ApproveSession);
+    }
+    if normalized == "e" || normalized == "edit" {
+        return Some(WriteDecision::EditAndApprove);
+    }
+    None
 }
 
 fn prompt_edit_command(original: &str) -> Result<String, AppError> {
@@ -725,41 +749,86 @@ fn prompt_edit_command(original: &str) -> Result<String, AppError> {
     Ok(input.trim().to_string())
 }
 
-fn spawn_capture_thread<T>(mut reader: T, cap: usize) -> thread::JoinHandle<(Vec<u8>, bool)>
+fn spawn_capture_thread<T>(mut reader: T, cap: usize) -> CaptureThread
 where
     T: Read + Send + 'static,
 {
-    thread::spawn(move || {
-        let mut buf = Vec::<u8>::new();
+    let state = Arc::new(Mutex::new(CaptureBuffer::default()));
+    let thread_state = Arc::clone(&state);
+    let handle = thread::spawn(move || {
         let mut tmp = [0_u8; 4096];
-        let mut truncated = false;
         loop {
             match reader.read(&mut tmp) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let remaining = cap.saturating_sub(buf.len());
+                    let mut guard = match thread_state.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => break,
+                    };
+                    let remaining = cap.saturating_sub(guard.bytes.len());
                     if remaining > 0 {
                         let take = std::cmp::min(remaining, n);
-                        buf.extend_from_slice(&tmp[..take]);
+                        guard.bytes.extend_from_slice(&tmp[..take]);
                     }
-                    if buf.len() >= cap {
-                        truncated = true;
+                    if n > remaining || guard.bytes.len() >= cap {
+                        guard.truncated = true;
                     }
                 }
                 Err(_) => break,
             }
         }
-        (buf, truncated)
-    })
+    });
+    CaptureThread { state, handle }
 }
 
-fn finalize_captured_output(bytes: Vec<u8>, truncated: bool) -> String {
+fn collect_capture_output(
+    capture: CaptureThread,
+    label: &str,
+    stream_name: &str,
+    detached_command: bool,
+) -> Result<(Vec<u8>, bool, bool), AppError> {
+    if detached_command {
+        let deadline = Instant::now() + DETACHED_CAPTURE_JOIN_GRACE;
+        while !capture.handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let incomplete = detached_command && !capture.handle.is_finished();
+    if !incomplete {
+        capture.handle.join().map_err(|_| {
+            AppError::Command(format!(
+                "failed to join {stream_name} capture thread for command [{label}]",
+            ))
+        })?;
+    } else {
+        logging::warn(&format!(
+            "capture thread still active after command exit, command={}, stream={stream_name}",
+            mask_sensitive(label)
+        ));
+    }
+
+    let snapshot = capture.state.lock().map_err(|_| {
+        AppError::Command(format!(
+            "failed to snapshot {stream_name} capture buffer for command [{label}]",
+        ))
+    })?;
+    Ok((snapshot.bytes.clone(), snapshot.truncated, incomplete))
+}
+
+fn finalize_captured_output(bytes: Vec<u8>, truncated: bool, incomplete: bool) -> String {
     let mut text = String::from_utf8_lossy(&bytes).to_string();
     if truncated {
         if !text.ends_with('\n') {
             text.push('\n');
         }
         text.push_str("...[output truncated]");
+    }
+    if incomplete {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("...[output capture incomplete: detached process still holds pipe]");
     }
     text
 }
@@ -770,9 +839,77 @@ fn looks_like_write_command(command_with_padding: &str) -> bool {
         .any(|item| command_with_padding.contains(&item.to_ascii_lowercase()))
 }
 
+fn looks_like_detached_command(command: &str) -> bool {
+    let lowered = command.trim().to_ascii_lowercase();
+    lowered.contains("nohup ")
+        || lowered.contains(" disown")
+        || lowered.contains("setsid ")
+        || lowered.contains("start /b ")
+        || DETACHED_AMPERSAND_RE.is_match(&lowered)
+}
+
 fn mode_to_str(mode: CommandMode) -> &'static str {
     match mode {
         CommandMode::Read => "read",
         CommandMode::Write => "write",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::config::CmdConfig;
+
+    use super::{
+        CommandMode, CommandSpec, ShellExecutor, WriteDecision, looks_like_detached_command,
+        parse_write_decision_input,
+    };
+
+    #[test]
+    fn detects_detached_background_commands_without_false_positive_on_redirects() {
+        assert!(looks_like_detached_command(
+            r#"cd "/tmp" && nohup npm run dev > /tmp/app.log 2>&1 & echo $!"#
+        ));
+        assert!(looks_like_detached_command("sleep 5 & echo ready"));
+        assert!(!looks_like_detached_command("echo 2>&1"));
+        assert!(!looks_like_detached_command("sleep 1 && echo ready"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn background_command_returns_without_waiting_for_pipe_eof() {
+        let executor = ShellExecutor::new(&CmdConfig::default());
+        let result = executor
+            .run_with_timeout(
+                &CommandSpec {
+                    label: "background".to_string(),
+                    command: "sleep 2 & echo ready".to_string(),
+                    mode: CommandMode::Read,
+                },
+                Duration::from_secs(5),
+            )
+            .expect("background command should complete");
+
+        assert!(result.success);
+        assert!(result.duration_ms < 1_500, "duration_ms={}", result.duration_ms);
+        assert!(result.stdout.contains("ready"));
+    }
+
+    #[test]
+    fn parse_write_confirmation_accepts_case_insensitive_yes_no_and_rejects_invalid() {
+        assert_eq!(
+            parse_write_decision_input("Y\n", false),
+            Some(WriteDecision::Approve)
+        );
+        assert_eq!(
+            parse_write_decision_input("n\n", false),
+            Some(WriteDecision::Reject)
+        );
+        assert_eq!(
+            parse_write_decision_input("\n", false),
+            Some(WriteDecision::Reject)
+        );
+        assert_eq!(parse_write_decision_input("m\n", false), None);
     }
 }

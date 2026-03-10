@@ -11,6 +11,7 @@ use std::{
 
 use once_cell::sync::Lazy;
 use regex::Regex;
+use reqwest::header::RETRY_AFTER;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,7 @@ use crate::{config::AiConfig, error::AppError, i18n, logging, mask::mask_sensiti
 
 const MODEL_PRICE_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MODEL_PRICE_CACHE_VERSION: u32 = 1;
+const MAX_AUTO_RATE_LIMIT_WAIT_SECS: u64 = 15;
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -59,6 +61,7 @@ pub enum ChatStopReason {
     RepeatedToolTimeout,
     TooManyToolTimeouts,
     MaxToolRoundsReached,
+    RateLimited,
 }
 
 impl ChatStopReason {
@@ -69,6 +72,7 @@ impl ChatStopReason {
             ChatStopReason::RepeatedToolTimeout => "repeated_tool_timeout",
             ChatStopReason::TooManyToolTimeouts => "too_many_tool_timeouts",
             ChatStopReason::MaxToolRoundsReached => "max_tool_rounds_reached",
+            ChatStopReason::RateLimited => "rate_limited",
         }
     }
 }
@@ -553,6 +557,40 @@ impl AiClient {
             ) {
                 Ok(call) => call,
                 Err(err) => {
+                    if is_rate_limited_error(&err) {
+                        logging::warn(
+                            "AI rate limited during tool-calling round; returning recoverable local fallback",
+                        );
+                        return Ok(self.build_recoverable_chat_response(
+                            FinalizeWithoutToolsState {
+                                thinking_chunks,
+                                visible_assistant_chunks,
+                                metrics,
+                                tool_rounds_used,
+                                total_tool_calls,
+                            },
+                            Some(ChatStopReason::RateLimited),
+                        ));
+                    }
+                    if is_transient_ai_error(&err)
+                        && (total_tool_calls > 0
+                            || !thinking_chunks.is_empty()
+                            || !visible_assistant_chunks.is_empty())
+                    {
+                        logging::warn(
+                            "transient AI failure during tool-calling round; returning recoverable local fallback",
+                        );
+                        return Ok(self.build_transient_ai_failure_chat_response(
+                            FinalizeWithoutToolsState {
+                                thinking_chunks,
+                                visible_assistant_chunks,
+                                metrics,
+                                tool_rounds_used,
+                                total_tool_calls,
+                            },
+                            &err,
+                        ));
+                    }
                     if is_tool_choice_unsupported_error(&err) {
                         match tool_choice_mode {
                             ToolChoiceMode::Policy => {
@@ -891,6 +929,11 @@ impl AiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     if !status.is_success() {
+                        let retry_after = resp
+                            .headers()
+                            .get(RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(|value| value.to_string());
                         let body = resp
                             .text()
                             .unwrap_or_else(|_| "<unreadable body>".to_string());
@@ -918,9 +961,17 @@ impl AiClient {
                             continue;
                         }
                         logging::warn(&err_msg);
-                        if attempt <= self.max_retries && should_retry_status(status) {
-                            thread::sleep(Duration::from_millis(self.backoff_millis));
-                            continue;
+                        if attempt <= self.max_retries {
+                            if let Some(delay) =
+                                parse_rate_limit_retry_delay(status, retry_after.as_deref())
+                            {
+                                thread::sleep(delay);
+                                continue;
+                            }
+                            if should_retry_status(status) {
+                                thread::sleep(Duration::from_millis(self.backoff_millis));
+                                continue;
+                            }
                         }
                         return Err(AppError::Ai(err_msg));
                     }
@@ -1013,6 +1064,11 @@ impl AiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     if !status.is_success() {
+                        let retry_after = resp
+                            .headers()
+                            .get(RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(|value| value.to_string());
                         let response_body = resp
                             .text()
                             .unwrap_or_else(|_| "<unreadable body>".to_string());
@@ -1052,9 +1108,17 @@ impl AiClient {
                         }
                         let err_msg = format!("AI HTTP status={status}, body={safe_body}");
                         logging::warn(&err_msg);
-                        if attempt <= self.max_retries && should_retry_status(status) {
-                            thread::sleep(Duration::from_millis(self.backoff_millis));
-                            continue;
+                        if attempt <= self.max_retries {
+                            if let Some(delay) =
+                                parse_rate_limit_retry_delay(status, retry_after.as_deref())
+                            {
+                                thread::sleep(delay);
+                                continue;
+                            }
+                            if should_retry_status(status) {
+                                thread::sleep(Duration::from_millis(self.backoff_millis));
+                                continue;
+                            }
                         }
                         return Err(AppError::Ai(err_msg));
                     }
@@ -1155,8 +1219,29 @@ impl AiClient {
             tool_choice: None,
             stream: None,
         };
-        let call =
-            self.send_chat_completion_with_optional_streaming(&request, stream_output, on_stream_event)?;
+        let call = match self
+            .send_chat_completion_with_optional_streaming(&request, stream_output, on_stream_event)
+        {
+            Ok(call) => call,
+            Err(err) => {
+                if is_rate_limited_error(&err) {
+                    logging::warn(
+                        "AI rate limited during finalization; returning recoverable local fallback",
+                    );
+                    return Ok(self.build_recoverable_chat_response(
+                        state,
+                        Some(ChatStopReason::RateLimited),
+                    ));
+                }
+                if is_transient_ai_error(&err) {
+                    logging::warn(
+                        "transient AI failure during finalization; returning recoverable local fallback",
+                    );
+                    return Ok(self.build_transient_ai_failure_chat_response(state, &err));
+                }
+                return Err(err);
+            }
+        };
         state.metrics.api_rounds += 1;
         state.metrics.api_duration_ms += call.elapsed_ms;
         state.metrics.prompt_tokens += call.usage.prompt_tokens;
@@ -1209,6 +1294,29 @@ impl AiClient {
             thinking: merge_thinking_chunks(state.thinking_chunks),
             metrics: self.attach_cost(state.metrics),
             stop_reason,
+            tool_rounds_used: state.tool_rounds_used,
+            total_tool_calls: state.total_tool_calls,
+        }
+    }
+
+    fn build_transient_ai_failure_chat_response(
+        &self,
+        state: FinalizeWithoutToolsState,
+        err: &AppError,
+    ) -> ChatToolResponse {
+        let archived_content = merge_visible_chunks(&state.visible_assistant_chunks, None);
+        let fallback = build_transient_ai_failure_fallback(err);
+        let content = if archived_content.trim().is_empty() {
+            fallback.clone()
+        } else {
+            format!("{archived_content}\n\n{fallback}")
+        };
+        ChatToolResponse {
+            archived_content: content.clone(),
+            content,
+            thinking: merge_thinking_chunks(state.thinking_chunks),
+            metrics: self.attach_cost(state.metrics),
+            stop_reason: None,
             tool_rounds_used: state.tool_rounds_used,
             total_tool_calls: state.total_tool_calls,
         }
@@ -2596,12 +2704,54 @@ fn is_tool_choice_unsupported_error(err: &AppError) -> bool {
         || lowered.contains("unsupported tool_choice")
 }
 
+fn is_rate_limited_error(err: &AppError) -> bool {
+    let AppError::Ai(detail) = err else {
+        return false;
+    };
+    let lowered = detail.to_ascii_lowercase();
+    lowered.contains("http status=429")
+        || lowered.contains("too many requests")
+        || lowered.contains("\"type\":\"rate_limited\"")
+        || lowered.contains("rate limited")
+        || lowered.contains("request limited rpm reached")
+}
+
+pub(crate) fn is_transient_ai_error(err: &AppError) -> bool {
+    let AppError::Ai(detail) = err else {
+        return false;
+    };
+    let lowered = detail.to_ascii_lowercase();
+    lowered.contains("kind=timeout")
+        || lowered.contains("kind=connect")
+        || lowered.contains("operation timed out")
+        || lowered.contains("connection timed out")
+        || lowered.contains("timed out")
+        || lowered.contains("temporarily unavailable")
+        || lowered.contains("service unavailable")
+        || lowered.contains("bad gateway")
+        || lowered.contains("gateway timeout")
+        || lowered.contains("http status=502")
+        || lowered.contains("http status=503")
+        || lowered.contains("http status=504")
+}
+
 fn should_retry_status(status: StatusCode) -> bool {
     status.is_server_error()
-        || matches!(
-            status,
-            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
-        )
+        || matches!(status, StatusCode::REQUEST_TIMEOUT)
+}
+
+fn parse_rate_limit_retry_delay(status: StatusCode, retry_after: Option<&str>) -> Option<Duration> {
+    if status != StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    let seconds = retry_after
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())?;
+    if seconds == 0 || seconds > MAX_AUTO_RATE_LIMIT_WAIT_SECS {
+        return None;
+    }
+    Some(Duration::from_secs(seconds))
 }
 
 fn model_prefers_omit_tool_choice(model: &str) -> bool {
@@ -2642,6 +2792,13 @@ fn build_finalization_fallback(
         .unwrap_or_else(|| "unknown".to_string());
     format!(
         "本轮工具调用已结束（reason={reason_text}, rounds={tool_rounds_used}, tool_calls={total_tool_calls}）。AI 在收尾阶段未返回可展示文本。请继续提问（可缩小排查范围或指定目标日志/目录），我会基于当前已收集证据继续分析。"
+    )
+}
+
+fn build_transient_ai_failure_fallback(err: &AppError) -> String {
+    format!(
+        "本轮 AI 请求暂时失败（{}）。会话不会退出；如需继续，请直接重试上一条指令或稍后再试。",
+        mask_sensitive(&err.to_string())
     )
 }
 
@@ -2794,7 +2951,7 @@ mod tests {
     use reqwest::blocking::Client;
     use reqwest::StatusCode;
     use serde_json::json;
-    use std::{env, fs, sync::RwLock};
+    use std::{env, fs, sync::RwLock, time::Duration};
 
     use super::{
         AiClient, ChatCompletionStreamResponse, ChatMetrics, ChatStopReason,
@@ -2805,10 +2962,12 @@ mod tests {
         parse_model_price_catalog_response, parse_model_price_probe_response,
         price_probe_candidate_models, provider_requires_reasoning_content_omission,
         request_contains_reasoning_content, resolve_effective_model_prices,
+        is_rate_limited_error, parse_rate_limit_retry_delay,
         should_fallback_to_non_streaming, should_retry_without_reasoning_content,
         strip_reasoning_content_from_request, with_cost, ChatCompletionRequest, ApiMessage,
         normalize_stepfun_chat_request, ApiToolCall, ApiToolFunction,
     };
+    use crate::error::AppError;
 
     fn test_ai_client() -> AiClient {
         AiClient {
@@ -3186,6 +3345,46 @@ mod tests {
             StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"invalid api key"}}"#
         ));
+    }
+
+    #[test]
+    fn detects_rate_limited_errors() {
+        assert!(is_rate_limited_error(&AppError::Ai(
+            "AI HTTP status=429 Too Many Requests, body={\"error\":{\"type\":\"rate_limited\"}}"
+                .to_string()
+        )));
+        assert!(!is_rate_limited_error(&AppError::Ai(
+            "AI HTTP status=400 Bad Request".to_string()
+        )));
+    }
+
+    #[test]
+    fn parses_short_retry_after_delay_for_rate_limit() {
+        assert_eq!(
+            parse_rate_limit_retry_delay(StatusCode::TOO_MANY_REQUESTS, Some("5")),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            parse_rate_limit_retry_delay(StatusCode::TOO_MANY_REQUESTS, Some("30")),
+            None
+        );
+        assert_eq!(
+            parse_rate_limit_retry_delay(StatusCode::BAD_REQUEST, Some("5")),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_transient_ai_errors() {
+        assert!(super::is_transient_ai_error(&AppError::Ai(
+            "AI request failed: kind=timeout, error=operation timed out".to_string()
+        )));
+        assert!(super::is_transient_ai_error(&AppError::Ai(
+            "AI HTTP status=503 Service Unavailable".to_string()
+        )));
+        assert!(!super::is_transient_ai_error(&AppError::Ai(
+            "AI HTTP status=400 Bad Request".to_string()
+        )));
     }
 
     #[test]

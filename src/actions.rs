@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::{
     ai::{
         AiClient, ChatRoundEvent, ChatStreamEvent, ChatStreamEventKind, ExternalToolDefinition,
-        ModelPriceSource, ToolCallRequest, ToolUsePolicy,
+        ModelPriceSource, ToolCallRequest, ToolUsePolicy, is_transient_ai_error,
     },
     cli::InspectTarget,
     config::{AppConfig, expand_tilde},
@@ -480,7 +480,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         }));
         let spinner_first_output = Arc::new(AtomicBool::new(false));
         let spinner_first_output_cloned = spinner_first_output.clone();
-        let response = services.ai.chat_with_shell_tool(
+        let response = match services.ai.chat_with_shell_tool(
             &history,
             &system_prompt,
             &message,
@@ -559,7 +559,30 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                 };
                 let _ = result;
             },
-        )?;
+        ) {
+            Ok(response) => response,
+            Err(err) => {
+                let _ = stream_printer.borrow_mut().finish();
+                if let Some(mut spinner) = ai_wait_spinner.into_inner() {
+                    spinner.stop();
+                }
+                if is_transient_ai_error(&err) {
+                    let failure_notice =
+                        i18n::chat_ai_recoverable_failure(&mask_sensitive(&i18n::localize_error(&err)));
+                    println!(
+                        "{}",
+                        render::render_chat_warning(&failure_notice, colorful)
+                    );
+                    services
+                        .session
+                        .add_assistant_message(failure_notice.clone(), Some(group_id));
+                    services.session.persist()?;
+                    last_assistant_reply = failure_notice;
+                    continue;
+                }
+                return Err(err);
+            }
+        };
         stream_printer.borrow_mut().finish()?;
         if let Some(mut spinner) = ai_wait_spinner.into_inner() {
             spinner.stop();
