@@ -21,10 +21,11 @@ use uuid::Uuid;
 use crate::{
     ai::{
         AiClient, ChatRoundEvent, ChatStreamEvent, ChatStreamEventKind, ExternalToolDefinition,
-        ModelPriceSource, ToolCallRequest, ToolUsePolicy, is_transient_ai_error,
+        ModelPriceCheckResult, ModelPriceSource, ToolCallRequest, ToolUsePolicy,
+        is_transient_ai_error,
     },
     cli::InspectTarget,
-    config::{AppConfig, expand_tilde},
+    config::{AppConfig, expand_tilde, normalize_chat_model_price_check_mode},
     context::SessionStore,
     error::{AppError, ExitCode},
     i18n, logging,
@@ -1567,10 +1568,42 @@ fn maybe_prepare_chat_model_price(services: &mut ActionServices<'_>) {
             colorful,
         )
     );
-    let result = services
-        .ai
-        .prepare_model_pricing(services.cfg.ai.chat.skip_model_price_check);
-    let message = match (result.source, result.prices, result.probe_skipped) {
+    if services.cfg.ai.chat.skip_model_price_check
+        || normalize_chat_model_price_check_mode(services.cfg.ai.chat.model_price_check_mode.as_str())
+            != "async"
+    {
+        let result = services
+            .ai
+            .prepare_model_pricing(services.cfg.ai.chat.skip_model_price_check);
+        println!(
+            "{}",
+            render::render_chat_custom_tag_event(
+                i18n::chat_tag_model_price(),
+                &format_model_price_check_message(result),
+                colorful
+            )
+        );
+        return;
+    }
+
+    let ai = services.ai.clone();
+    let model = services.cfg.ai.model.clone();
+    thread::spawn(move || {
+        let result = ai.prepare_model_pricing(false);
+        let message = format_model_price_check_message(result);
+        println!(
+            "{}",
+            render::render_chat_custom_tag_event(i18n::chat_tag_model_price(), &message, colorful)
+        );
+        logging::info(&format!(
+            "async model price check finished, model={}, message={}",
+            model, message
+        ));
+    });
+}
+
+fn format_model_price_check_message(result: ModelPriceCheckResult) -> String {
+    match (result.source, result.prices, result.probe_skipped) {
         (ModelPriceSource::Configured, Some((input, output)), _) => {
             i18n::chat_model_price_check_configured(input, output)
         }
@@ -1598,11 +1631,7 @@ fn maybe_prepare_chat_model_price(services: &mut ActionServices<'_>) {
             )
         }
         _ => i18n::chat_model_price_check_unavailable().to_string(),
-    };
-    println!(
-        "{}",
-        render::render_chat_custom_tag_event(i18n::chat_tag_model_price(), &message, colorful)
-    );
+    }
 }
 
 fn render_chat_window_header(services: &ActionServices<'_>, after_clear: bool) {

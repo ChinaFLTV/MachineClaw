@@ -35,6 +35,7 @@ const DEFAULT_CHAT_SHOW_TOKEN_COST: bool = true;
 const DEFAULT_CHAT_CONTEXT_WARN_PERCENT: u8 = 80;
 const DEFAULT_CHAT_CONTEXT_CRITICAL_PERCENT: u8 = 95;
 const DEFAULT_CHAT_SKIP_MODEL_PRICE_CHECK: bool = false;
+const DEFAULT_CHAT_MODEL_PRICE_CHECK_MODE: &str = "sync";
 const DEFAULT_CHAT_STREAM_OUTPUT: bool = false;
 const DEFAULT_CHAT_OUTPUT_MULTILINES: bool = false;
 const DEFAULT_CHAT_SKIP_ENV_PROFILE: bool = true;
@@ -148,6 +149,11 @@ pub struct AiChatConfig {
         default = "default_chat_skip_model_price_check"
     )]
     pub skip_model_price_check: bool,
+    #[serde(
+        rename = "model-price-check-mode",
+        default = "default_chat_model_price_check_mode"
+    )]
+    pub model_price_check_mode: String,
     #[serde(
         rename = "context-warn-percent",
         default = "default_chat_context_warn_percent"
@@ -343,6 +349,7 @@ impl Default for AiChatConfig {
             show_round_metrics: default_chat_show_round_metrics(),
             show_token_cost: default_chat_show_token_cost(),
             skip_model_price_check: default_chat_skip_model_price_check(),
+            model_price_check_mode: default_chat_model_price_check_mode(),
             context_warn_percent: default_chat_context_warn_percent(),
             context_critical_percent: default_chat_context_critical_percent(),
             stream_output: default_chat_stream_output(),
@@ -488,6 +495,7 @@ command-cache-ttl-seconds = 30 # optional
 show-round-metrics = true # optional
 show-token-cost = true # optional
 skip-model-price-check = false # optional, default false; when true skip online model pricing probe and use configured/builtin pricing only
+model-price-check-mode = "sync" # optional, default "sync"; "async" probes model pricing in background when skip-model-price-check=false
 context-warn-percent = 80 # optional
 context-critical-percent = 95 # optional
 stream-output = false # optional, default false
@@ -628,6 +636,13 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
     if cfg.ai.chat.context_warn_percent > cfg.ai.chat.context_critical_percent {
         return Err(AppError::Config(
             "ai.chat context-warn-percent cannot exceed context-critical-percent".to_string(),
+        ));
+    }
+    let model_price_check_mode =
+        normalize_chat_model_price_check_mode(cfg.ai.chat.model_price_check_mode.as_str());
+    if !matches!(model_price_check_mode, "sync" | "async") {
+        return Err(AppError::Config(
+            "ai.chat.model-price-check-mode must be one of: sync, async".to_string(),
         ));
     }
     if cfg.ai.chat.cmd_run_timout == 0 {
@@ -898,6 +913,10 @@ fn default_chat_skip_model_price_check() -> bool {
     DEFAULT_CHAT_SKIP_MODEL_PRICE_CHECK
 }
 
+fn default_chat_model_price_check_mode() -> String {
+    DEFAULT_CHAT_MODEL_PRICE_CHECK_MODE.to_string()
+}
+
 fn default_chat_context_warn_percent() -> u8 {
     DEFAULT_CHAT_CONTEXT_WARN_PERCENT
 }
@@ -950,6 +969,14 @@ fn default_app_env_mode() -> String {
     DEFAULT_APP_ENV_MODE.to_string()
 }
 
+pub(crate) fn normalize_chat_model_price_check_mode(raw: &str) -> &str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "async" => "async",
+        "sync" | "rsync" | "" => "sync",
+        _ => "__invalid__",
+    }
+}
+
 fn has_file_extension(file_name: &str) -> bool {
     let trimmed = file_name.trim();
     if trimmed.is_empty() || trimmed.ends_with('.') {
@@ -959,4 +986,17 @@ fn has_file_extension(file_name: &str) -> bool {
         return idx > 0 && idx < trimmed.len() - 1;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_chat_model_price_check_mode;
+
+    #[test]
+    fn normalize_model_price_check_mode_accepts_sync_async_and_rsync_alias() {
+        assert_eq!(normalize_chat_model_price_check_mode("sync"), "sync");
+        assert_eq!(normalize_chat_model_price_check_mode("async"), "async");
+        assert_eq!(normalize_chat_model_price_check_mode("rsync"), "sync");
+        assert_eq!(normalize_chat_model_price_check_mode("invalid"), "__invalid__");
+    }
 }
