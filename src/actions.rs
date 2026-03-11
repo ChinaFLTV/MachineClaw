@@ -2801,8 +2801,8 @@ mod tests {
         ChatAutosaveSnapshot, flush_chat_autosave_snapshot, normalize_builtin_command_alias,
         normalize_history_content, parse_builtin_command, parse_chat_history_limit,
     };
-    use std::sync::{Arc, Mutex};
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     #[test]

@@ -808,54 +808,108 @@ pub fn chat_model_price_check_skipped() -> &'static str {
     match current_language() {
         Language::ZhCn => "已按配置跳过模型询价（ai.chat.skip-model-price-check=true）",
         Language::ZhTw => "已依設定略過模型詢價（ai.chat.skip-model-price-check=true）",
-        Language::Fr => "Vérification du prix du modèle ignorée par configuration (ai.chat.skip-model-price-check=true)",
-        Language::De => "Modellpreisprüfung per Konfiguration übersprungen (ai.chat.skip-model-price-check=true)",
-        Language::Ja => "設定によりモデル価格確認をスキップしました（ai.chat.skip-model-price-check=true）",
+        Language::Fr => {
+            "Vérification du prix du modèle ignorée par configuration (ai.chat.skip-model-price-check=true)"
+        }
+        Language::De => {
+            "Modellpreisprüfung per Konfiguration übersprungen (ai.chat.skip-model-price-check=true)"
+        }
+        Language::Ja => {
+            "設定によりモデル価格確認をスキップしました（ai.chat.skip-model-price-check=true）"
+        }
         Language::En => "Model price check skipped by config (ai.chat.skip-model-price-check=true)",
     }
 }
 
 pub fn chat_model_price_check_configured(input: f64, output: f64) -> String {
     match current_language() {
-        Language::ZhCn => format!("已使用配置单价：输入 {input:.4} / 输出 {output:.4} USD/百万 tokens"),
-        Language::ZhTw => format!("已使用設定單價：輸入 {input:.4} / 輸出 {output:.4} USD/百萬 tokens"),
-        Language::Fr => format!("Tarif configuré utilisé : entrée {input:.4} / sortie {output:.4} USD par million de tokens"),
-        Language::De => format!("Konfigurierter Preis verwendet: Eingabe {input:.4} / Ausgabe {output:.4} USD pro 1 Mio. Tokens"),
-        Language::Ja => format!("設定済み単価を使用します: 入力 {input:.4} / 出力 {output:.4} USD / 100万 tokens"),
-        Language::En => format!("Using configured pricing: input {input:.4} / output {output:.4} USD per 1M tokens"),
+        Language::ZhCn => {
+            format!("已使用配置单价：输入 {input:.4} / 输出 {output:.4} USD/百万 tokens")
+        }
+        Language::ZhTw => {
+            format!("已使用設定單價：輸入 {input:.4} / 輸出 {output:.4} USD/百萬 tokens")
+        }
+        Language::Fr => format!(
+            "Tarif configuré utilisé : entrée {input:.4} / sortie {output:.4} USD par million de tokens"
+        ),
+        Language::De => format!(
+            "Konfigurierter Preis verwendet: Eingabe {input:.4} / Ausgabe {output:.4} USD pro 1 Mio. Tokens"
+        ),
+        Language::Ja => format!(
+            "設定済み単価を使用します: 入力 {input:.4} / 出力 {output:.4} USD / 100万 tokens"
+        ),
+        Language::En => format!(
+            "Using configured pricing: input {input:.4} / output {output:.4} USD per 1M tokens"
+        ),
     }
 }
 
 pub fn chat_model_price_check_cached(input: f64, output: f64) -> String {
     match current_language() {
-        Language::ZhCn => format!("已命中本地模型价格缓存：输入 {input:.4} / 输出 {output:.4} USD/百万 tokens"),
-        Language::ZhTw => format!("已命中本地模型價格快取：輸入 {input:.4} / 輸出 {output:.4} USD/百萬 tokens"),
-        Language::Fr => format!("Cache local du prix du modèle utilisé : entrée {input:.4} / sortie {output:.4} USD par million de tokens"),
-        Language::De => format!("Lokaler Modellpreis-Cache verwendet: Eingabe {input:.4} / Ausgabe {output:.4} USD pro 1 Mio. Tokens"),
-        Language::Ja => format!("ローカルのモデル価格キャッシュを使用しました: 入力 {input:.4} / 出力 {output:.4} USD / 100万 tokens"),
-        Language::En => format!("Using local model pricing cache: input {input:.4} / output {output:.4} USD per 1M tokens"),
+        Language::ZhCn => {
+            format!("已命中本地模型价格缓存：输入 {input:.4} / 输出 {output:.4} USD/百万 tokens")
+        }
+        Language::ZhTw => {
+            format!("已命中本地模型價格快取：輸入 {input:.4} / 輸出 {output:.4} USD/百萬 tokens")
+        }
+        Language::Fr => format!(
+            "Cache local du prix du modèle utilisé : entrée {input:.4} / sortie {output:.4} USD par million de tokens"
+        ),
+        Language::De => format!(
+            "Lokaler Modellpreis-Cache verwendet: Eingabe {input:.4} / Ausgabe {output:.4} USD pro 1 Mio. Tokens"
+        ),
+        Language::Ja => format!(
+            "ローカルのモデル価格キャッシュを使用しました: 入力 {input:.4} / 出力 {output:.4} USD / 100万 tokens"
+        ),
+        Language::En => format!(
+            "Using local model pricing cache: input {input:.4} / output {output:.4} USD per 1M tokens"
+        ),
     }
 }
 
 pub fn chat_model_price_check_probed(input: f64, output: f64) -> String {
     match current_language() {
-        Language::ZhCn => format!("模型询价成功，并已刷新本地缓存：输入 {input:.4} / 输出 {output:.4} USD/百万 tokens"),
-        Language::ZhTw => format!("模型詢價成功，並已刷新本地快取：輸入 {input:.4} / 輸出 {output:.4} USD/百萬 tokens"),
-        Language::Fr => format!("Tarif du modèle obtenu et cache local rafraîchi : entrée {input:.4} / sortie {output:.4} USD par million de tokens"),
-        Language::De => format!("Modellpreis ermittelt und lokaler Cache aktualisiert: Eingabe {input:.4} / Ausgabe {output:.4} USD pro 1 Mio. Tokens"),
-        Language::Ja => format!("モデル単価を取得し、ローカルキャッシュを更新しました: 入力 {input:.4} / 出力 {output:.4} USD / 100万 tokens"),
-        Language::En => format!("Model pricing resolved and local cache refreshed: input {input:.4} / output {output:.4} USD per 1M tokens"),
+        Language::ZhCn => format!(
+            "模型询价成功，并已刷新本地缓存：输入 {input:.4} / 输出 {output:.4} USD/百万 tokens"
+        ),
+        Language::ZhTw => format!(
+            "模型詢價成功，並已刷新本地快取：輸入 {input:.4} / 輸出 {output:.4} USD/百萬 tokens"
+        ),
+        Language::Fr => format!(
+            "Tarif du modèle obtenu et cache local rafraîchi : entrée {input:.4} / sortie {output:.4} USD par million de tokens"
+        ),
+        Language::De => format!(
+            "Modellpreis ermittelt und lokaler Cache aktualisiert: Eingabe {input:.4} / Ausgabe {output:.4} USD pro 1 Mio. Tokens"
+        ),
+        Language::Ja => format!(
+            "モデル単価を取得し、ローカルキャッシュを更新しました: 入力 {input:.4} / 出力 {output:.4} USD / 100万 tokens"
+        ),
+        Language::En => format!(
+            "Model pricing resolved and local cache refreshed: input {input:.4} / output {output:.4} USD per 1M tokens"
+        ),
     }
 }
 
 pub fn chat_model_price_check_builtin(input: f64, output: f64) -> String {
     match current_language() {
-        Language::ZhCn => format!("未获得在线模型单价，已回退到内置单价：输入 {input:.4} / 输出 {output:.4} USD/百万 tokens"),
-        Language::ZhTw => format!("未取得線上模型單價，已回退到內建單價：輸入 {input:.4} / 輸出 {output:.4} USD/百萬 tokens"),
-        Language::Fr => format!("Tarif en ligne indisponible, repli sur le tarif intégré : entrée {input:.4} / sortie {output:.4} USD par million de tokens"),
-        Language::De => format!("Kein Online-Preis verfügbar, integrierter Preis verwendet: Eingabe {input:.4} / Ausgabe {output:.4} USD pro 1 Mio. Tokens"),
-        Language::Ja => format!("オンライン価格を取得できなかったため内蔵単価にフォールバックしました: 入力 {input:.4} / 出力 {output:.4} USD / 100万 tokens"),
-        Language::En => format!("Online model pricing unavailable, falling back to built-in pricing: input {input:.4} / output {output:.4} USD per 1M tokens"),
+        Language::ZhCn => format!(
+            "未获得在线模型单价，已回退到内置单价：输入 {input:.4} / 输出 {output:.4} USD/百万 tokens"
+        ),
+        Language::ZhTw => format!(
+            "未取得線上模型單價，已回退到內建單價：輸入 {input:.4} / 輸出 {output:.4} USD/百萬 tokens"
+        ),
+        Language::Fr => format!(
+            "Tarif en ligne indisponible, repli sur le tarif intégré : entrée {input:.4} / sortie {output:.4} USD par million de tokens"
+        ),
+        Language::De => format!(
+            "Kein Online-Preis verfügbar, integrierter Preis verwendet: Eingabe {input:.4} / Ausgabe {output:.4} USD pro 1 Mio. Tokens"
+        ),
+        Language::Ja => format!(
+            "オンライン価格を取得できなかったため内蔵単価にフォールバックしました: 入力 {input:.4} / 出力 {output:.4} USD / 100万 tokens"
+        ),
+        Language::En => format!(
+            "Online model pricing unavailable, falling back to built-in pricing: input {input:.4} / output {output:.4} USD per 1M tokens"
+        ),
     }
 }
 
@@ -863,10 +917,18 @@ pub fn chat_model_price_check_unavailable() -> &'static str {
     match current_language() {
         Language::ZhCn => "模型询价失败，且无可用内置单价；本次费用估算可能显示 N/A",
         Language::ZhTw => "模型詢價失敗，且無可用內建單價；本次費用估算可能顯示 N/A",
-        Language::Fr => "Échec de la détection du tarif du modèle et aucun tarif intégré n'est disponible ; le coût estimé peut afficher N/A",
-        Language::De => "Modellpreis konnte nicht ermittelt werden und es ist kein integrierter Preis verfügbar; die Kostenschätzung kann N/A anzeigen",
-        Language::Ja => "モデル価格の取得に失敗し、利用可能な内蔵価格もありません。今回のコスト見積りは N/A になる可能性があります",
-        Language::En => "Model pricing probe failed and no built-in pricing is available; estimated cost may show N/A",
+        Language::Fr => {
+            "Échec de la détection du tarif du modèle et aucun tarif intégré n'est disponible ; le coût estimé peut afficher N/A"
+        }
+        Language::De => {
+            "Modellpreis konnte nicht ermittelt werden und es ist kein integrierter Preis verfügbar; die Kostenschätzung kann N/A anzeigen"
+        }
+        Language::Ja => {
+            "モデル価格の取得に失敗し、利用可能な内蔵価格もありません。今回のコスト見積りは N/A になる可能性があります"
+        }
+        Language::En => {
+            "Model pricing probe failed and no built-in pricing is available; estimated cost may show N/A"
+        }
     }
 }
 

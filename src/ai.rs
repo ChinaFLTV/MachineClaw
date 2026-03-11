@@ -130,6 +130,7 @@ pub struct AiClient {
     base_url: String,
     token: String,
     model: String,
+    colorful: bool,
     model_price_cache_path: PathBuf,
     debug: bool,
     max_retries: u32,
@@ -159,6 +160,7 @@ impl Clone for AiClient {
             base_url: self.base_url.clone(),
             token: self.token.clone(),
             model: self.model.clone(),
+            colorful: self.colorful,
             model_price_cache_path: self.model_price_cache_path.clone(),
             debug: self.debug,
             max_retries: self.max_retries,
@@ -358,13 +360,18 @@ impl AiClient {
             .map_err(|err| AppError::Ai(format!("failed to build AI http client: {err}")))
     }
 
-    pub fn new(cfg: &AiConfig, model_price_cache_path: PathBuf) -> Result<Self, AppError> {
+    pub fn new(
+        cfg: &AiConfig,
+        model_price_cache_path: PathBuf,
+        colorful: bool,
+    ) -> Result<Self, AppError> {
         let client = Self::build_http_client()?;
         Ok(Self {
             client: RwLock::new(client),
             base_url: build_chat_url(&cfg.base_url),
             token: cfg.token.clone(),
             model: cfg.model.clone(),
+            colorful,
             model_price_cache_path,
             debug: cfg.debug,
             max_retries: cfg.retry.max_retries,
@@ -945,7 +952,10 @@ impl AiClient {
             );
             if !refreshed_for_idle_hint && take_interactive_input_refresh_hint() {
                 self.reconnect_http_client()?;
-                maybe_print_ai_reconnect_notice(i18n::chat_ai_reconnecting_after_idle());
+                maybe_print_ai_reconnect_notice(
+                    i18n::chat_ai_reconnecting_after_idle(),
+                    self.colorful,
+                );
                 refreshed_for_idle_hint = true;
             }
             let started = Instant::now();
@@ -1050,10 +1060,10 @@ impl AiClient {
                         retry_with_fresh_client =
                             should_refresh_http_client_after_reqwest_error(&err);
                         if retry_with_fresh_client {
-                            maybe_print_ai_reconnect_notice(&i18n::chat_ai_reconnecting(
-                                attempt,
-                                self.max_retries,
-                            ));
+                            maybe_print_ai_reconnect_notice(
+                                &i18n::chat_ai_reconnecting(attempt, self.max_retries),
+                                self.colorful,
+                            );
                         }
                         thread::sleep(Duration::from_millis(self.backoff_millis));
                         continue;
@@ -1106,7 +1116,10 @@ impl AiClient {
             );
             if !refreshed_for_idle_hint && take_interactive_input_refresh_hint() {
                 self.reconnect_http_client()?;
-                maybe_print_ai_reconnect_notice(i18n::chat_ai_reconnecting_after_idle());
+                maybe_print_ai_reconnect_notice(
+                    i18n::chat_ai_reconnecting_after_idle(),
+                    self.colorful,
+                );
                 refreshed_for_idle_hint = true;
             }
             let client = if retry_with_fresh_client {
@@ -1236,10 +1249,10 @@ impl AiClient {
                             logging::warn(&err_msg);
                             if attempt <= self.max_retries {
                                 retry_with_fresh_client = true;
-                                maybe_print_ai_reconnect_notice(&i18n::chat_ai_reconnecting(
-                                    attempt,
-                                    self.max_retries,
-                                ));
+                                maybe_print_ai_reconnect_notice(
+                                    &i18n::chat_ai_reconnecting(attempt, self.max_retries),
+                                    self.colorful,
+                                );
                                 thread::sleep(Duration::from_millis(self.backoff_millis));
                                 continue;
                             }
@@ -1260,10 +1273,10 @@ impl AiClient {
                         retry_with_fresh_client =
                             should_refresh_http_client_after_reqwest_error(&err);
                         if retry_with_fresh_client {
-                            maybe_print_ai_reconnect_notice(&i18n::chat_ai_reconnecting(
-                                attempt,
-                                self.max_retries,
-                            ));
+                            maybe_print_ai_reconnect_notice(
+                                &i18n::chat_ai_reconnecting(attempt, self.max_retries),
+                                self.colorful,
+                            );
                         }
                         thread::sleep(Duration::from_millis(self.backoff_millis));
                         continue;
@@ -2855,13 +2868,16 @@ fn should_refresh_http_client_after_reqwest_error(err: &reqwest::Error) -> bool 
         || lowered.contains("tls handshake eof")
 }
 
-fn maybe_print_ai_reconnect_notice(message: &str) {
+fn maybe_print_ai_reconnect_notice(message: &str, colorful: bool) {
     if !std::io::stdout().is_terminal() {
         return;
     }
     // Spinner uses carriage-return in-place refresh; clear that line before printing reconnect hint.
     print!("\r{: <220}\r", "");
-    println!("{}", render::render_chat_reconnect_notice(message, false));
+    println!(
+        "{}",
+        render::render_chat_reconnect_notice(message, colorful)
+    );
     let _ = std::io::stdout().flush();
 }
 
@@ -3090,6 +3106,7 @@ mod tests {
             base_url: "https://example.com/chat/completions".to_string(),
             token: "token".to_string(),
             model: "unknown-model".to_string(),
+            colorful: true,
             model_price_cache_path: env::temp_dir()
                 .join(format!("machineclaw-test-{}.json", uuid::Uuid::new_v4())),
             debug: false,

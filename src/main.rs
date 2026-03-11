@@ -223,6 +223,7 @@ fn run() -> Result<ExitCode, AppError> {
     let ai_client = AiClient::new(
         &cfg.ai,
         run_dir.join(".machineclaw").join("model-prices.json"),
+        cfg.console.colorful,
     )?;
     let run_ai_connectivity_check =
         !matches!(&command, Commands::Chat) || cfg.ai.connectivity_check;
