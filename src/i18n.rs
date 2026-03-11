@@ -1217,6 +1217,54 @@ pub fn chat_history_empty_content() -> &'static str {
     }
 }
 
+pub fn chat_history_role(role: &str) -> &'static str {
+    let normalized = role.trim().to_ascii_lowercase();
+    match current_language() {
+        Language::ZhCn => match normalized.as_str() {
+            "user" => "用户",
+            "assistant" => "助手",
+            "tool" => "工具",
+            "system" => "系统",
+            _ => "未知",
+        },
+        Language::ZhTw => match normalized.as_str() {
+            "user" => "使用者",
+            "assistant" => "助手",
+            "tool" => "工具",
+            "system" => "系統",
+            _ => "未知",
+        },
+        Language::Fr => match normalized.as_str() {
+            "user" => "utilisateur",
+            "assistant" => "assistant",
+            "tool" => "outil",
+            "system" => "système",
+            _ => "inconnu",
+        },
+        Language::De => match normalized.as_str() {
+            "user" => "Benutzer",
+            "assistant" => "Assistent",
+            "tool" => "Tool",
+            "system" => "System",
+            _ => "Unbekannt",
+        },
+        Language::Ja => match normalized.as_str() {
+            "user" => "ユーザー",
+            "assistant" => "アシスタント",
+            "tool" => "ツール",
+            "system" => "システム",
+            _ => "不明",
+        },
+        Language::En => match normalized.as_str() {
+            "user" => "user",
+            "assistant" => "assistant",
+            "tool" => "tool",
+            "system" => "system",
+            _ => "unknown",
+        },
+    }
+}
+
 pub fn chat_history_title(shown: usize, requested_limit: usize, total_messages: usize) -> String {
     let shown_fmt = human_count_u128(shown as u128);
     let requested_fmt = human_count_u128(requested_limit as u128);

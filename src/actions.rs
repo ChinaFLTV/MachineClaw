@@ -14,6 +14,7 @@ use std::{
 
 use chrono::{Local, TimeZone};
 use dialoguer::{MultiSelect, theme::ColorfulTheme};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
@@ -71,6 +72,67 @@ struct ToolCallCacheItem {
     created_at_epoch_ms: u128,
     payload: String,
 }
+
+static HISTORY_HTML_ANCHOR_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<a\s+[^>]*?href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#)
+        .expect("valid history html anchor regex")
+});
+static HISTORY_HTML_PRE_CODE_OPEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)<pre[^>]*>\s*<code[^>]*>").expect("valid history html pre code open regex")
+});
+static HISTORY_HTML_CODE_PRE_CLOSE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)</code>\s*</pre>").expect("valid history html code pre close regex")
+});
+static HISTORY_HTML_PRE_OPEN_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<pre[^>]*>").expect("valid history html pre open regex"));
+static HISTORY_HTML_PRE_CLOSE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)</pre>").expect("valid history html pre close regex"));
+static HISTORY_HTML_CODE_OPEN_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<code[^>]*>").expect("valid history html code open regex"));
+static HISTORY_HTML_CODE_CLOSE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)</code>").expect("valid history html code close regex"));
+static HISTORY_HTML_BR_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)<br\s*/?>").expect("valid history html br regex"));
+static HISTORY_HTML_P_OPEN_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<p[^>]*>").expect("valid history html p open regex"));
+static HISTORY_HTML_P_CLOSE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)</p>").expect("valid history html p close regex"));
+static HISTORY_HTML_DIV_OPEN_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<div[^>]*>").expect("valid history html div open regex"));
+static HISTORY_HTML_DIV_CLOSE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)</div>").expect("valid history html div close regex"));
+static HISTORY_HTML_UL_OL_OPEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)<(?:ul|ol)[^>]*>").expect("valid history html ul ol open regex")
+});
+static HISTORY_HTML_UL_OL_CLOSE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)</(?:ul|ol)>").expect("valid history html ul ol close regex"));
+static HISTORY_HTML_LI_OPEN_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<li[^>]*>").expect("valid history html li open regex"));
+static HISTORY_HTML_LI_CLOSE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)</li>").expect("valid history html li close regex"));
+static HISTORY_HTML_BLOCKQUOTE_OPEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)<blockquote[^>]*>").expect("valid history html blockquote open regex")
+});
+static HISTORY_HTML_BLOCKQUOTE_CLOSE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)</blockquote>").expect("valid history html blockquote close regex")
+});
+static HISTORY_HTML_STRONG_OPEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)<(?:strong|b)[^>]*>").expect("valid history html strong open regex")
+});
+static HISTORY_HTML_STRONG_CLOSE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)</(?:strong|b)>").expect("valid history html strong close regex")
+});
+static HISTORY_HTML_EM_OPEN_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<(?:em|i)[^>]*>").expect("valid history html em open regex"));
+static HISTORY_HTML_EM_CLOSE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)</(?:em|i)>").expect("valid history html em close regex"));
+static HISTORY_HTML_HEADING_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)<h([1-6])[^>]*>(.*?)</h[1-6]>").expect("valid history html heading regex")
+});
+static HISTORY_HTML_HR_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<hr[^>]*>").expect("valid history html hr regex"));
+static HISTORY_HTML_TAG_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)</?[a-z][^>]*>").expect("valid history html tag regex"));
 
 pub fn run_prepare(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppError> {
     let started = Instant::now();
@@ -1598,14 +1660,19 @@ fn format_chat_history_markdown(
     lines.push(String::new());
     for (idx, message) in messages.iter().enumerate() {
         let role = normalize_history_role(message.role.as_str());
+        let role_text = i18n::chat_history_role(role);
         let safe_content = normalize_history_content(message.content.as_str());
         lines.push(format!(
-            "{}. [{}] `{}` {}",
+            "- [`{}`] [`{}`] **{}**",
             idx + 1,
             format_local_datetime(message.created_at_epoch_ms),
-            role,
-            safe_content
+            role_text
         ));
+        lines.push(indent_history_content_block(&safe_content, "  "));
+        lines.push(String::new());
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
     }
     lines.join("\n")
 }
@@ -1622,6 +1689,7 @@ fn normalize_history_role(role: &str) -> &'static str {
 }
 
 fn normalize_history_content(raw: &str) -> String {
+    const HISTORY_CONTENT_MAX_LEN: usize = 1200;
     let stripped = strip_terminal_control_sequences(raw);
     let filtered = stripped
         .chars()
@@ -1632,13 +1700,199 @@ fn normalize_history_content(raw: &str) -> String {
             ) && (*ch == '\n' || *ch == '\r' || *ch == '\t' || !ch.is_control())
         })
         .collect::<String>();
-    let collapsed = trim_text(&mask_sensitive(filtered.trim()), 400)
-        .replace('\n', "\\n")
-        .replace('\r', "");
-    if collapsed.is_empty() {
+    let decoded_layout = decode_history_escaped_layout(filtered.trim());
+    let html_normalized = normalize_history_html_to_markdown(&decoded_layout);
+    let entities_decoded = decode_history_html_entities(&html_normalized);
+    let normalized_lines = normalize_history_line_breaks(&entities_decoded);
+    let collapsed = trim_text(
+        &mask_sensitive(normalized_lines.trim()),
+        HISTORY_CONTENT_MAX_LEN,
+    );
+    if collapsed.trim().is_empty() {
         return i18n::chat_history_empty_content().to_string();
     }
     collapsed
+}
+
+fn indent_history_content_block(content: &str, prefix: &str) -> String {
+    content
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                prefix.to_string()
+            } else {
+                format!("{prefix}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn decode_history_escaped_layout(raw: &str) -> String {
+    if raw.contains('\n') {
+        return raw.to_string();
+    }
+    let escaped_newline_count = raw.matches("\\n").count();
+    let escaped_return_count = raw.matches("\\r").count();
+    let escaped_tab_count = raw.matches("\\t").count();
+    let escaped_total = escaped_newline_count + escaped_return_count + escaped_tab_count;
+    if escaped_total == 0
+        || (escaped_total == 1
+            && !raw.contains("\\n\\n")
+            && !raw.contains("\\r\\n")
+            && !raw.contains("\\n\\r"))
+    {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let Some(next) = chars.next() else {
+            out.push('\\');
+            break;
+        };
+        match next {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            _ => {
+                out.push('\\');
+                out.push(next);
+            }
+        }
+    }
+    out
+}
+
+fn normalize_history_html_to_markdown(raw: &str) -> String {
+    if !raw.contains('<') || !raw.contains('>') {
+        return raw.to_string();
+    }
+    let mut out = raw.to_string();
+    out = HISTORY_HTML_ANCHOR_RE
+        .replace_all(&out, |caps: &regex::Captures<'_>| {
+            let href = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
+            let text = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+            let label = strip_history_html_tags(text).trim().to_string();
+            if href.is_empty() {
+                label
+            } else if label.is_empty() {
+                href.to_string()
+            } else {
+                format!("[{label}]({href})")
+            }
+        })
+        .to_string();
+    out = HISTORY_HTML_PRE_CODE_OPEN_RE
+        .replace_all(&out, "\n```")
+        .to_string();
+    out = HISTORY_HTML_CODE_PRE_CLOSE_RE
+        .replace_all(&out, "\n```")
+        .to_string();
+    out = HISTORY_HTML_PRE_OPEN_RE
+        .replace_all(&out, "\n```")
+        .to_string();
+    out = HISTORY_HTML_PRE_CLOSE_RE
+        .replace_all(&out, "\n```")
+        .to_string();
+    out = HISTORY_HTML_HR_RE.replace_all(&out, "\n---\n").to_string();
+    out = HISTORY_HTML_HEADING_RE
+        .replace_all(&out, |caps: &regex::Captures<'_>| {
+            let level = caps
+                .get(1)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 6);
+            let text = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+            let heading_text = strip_history_html_tags(text).trim().to_string();
+            if heading_text.is_empty() {
+                String::new()
+            } else {
+                format!("\n{} {}\n", "#".repeat(level), heading_text)
+            }
+        })
+        .to_string();
+    out = HISTORY_HTML_BR_RE.replace_all(&out, "\n").to_string();
+    out = HISTORY_HTML_P_OPEN_RE.replace_all(&out, "").to_string();
+    out = HISTORY_HTML_P_CLOSE_RE
+        .replace_all(&out, "\n\n")
+        .to_string();
+    out = HISTORY_HTML_DIV_OPEN_RE.replace_all(&out, "").to_string();
+    out = HISTORY_HTML_DIV_CLOSE_RE
+        .replace_all(&out, "\n")
+        .to_string();
+    out = HISTORY_HTML_UL_OL_OPEN_RE
+        .replace_all(&out, "\n")
+        .to_string();
+    out = HISTORY_HTML_UL_OL_CLOSE_RE
+        .replace_all(&out, "\n")
+        .to_string();
+    out = HISTORY_HTML_LI_OPEN_RE
+        .replace_all(&out, "\n- ")
+        .to_string();
+    out = HISTORY_HTML_LI_CLOSE_RE.replace_all(&out, "").to_string();
+    out = HISTORY_HTML_BLOCKQUOTE_OPEN_RE
+        .replace_all(&out, "\n> ")
+        .to_string();
+    out = HISTORY_HTML_BLOCKQUOTE_CLOSE_RE
+        .replace_all(&out, "\n")
+        .to_string();
+    out = HISTORY_HTML_STRONG_OPEN_RE
+        .replace_all(&out, "**")
+        .to_string();
+    out = HISTORY_HTML_STRONG_CLOSE_RE
+        .replace_all(&out, "**")
+        .to_string();
+    out = HISTORY_HTML_EM_OPEN_RE.replace_all(&out, "*").to_string();
+    out = HISTORY_HTML_EM_CLOSE_RE.replace_all(&out, "*").to_string();
+    out = HISTORY_HTML_CODE_OPEN_RE.replace_all(&out, "`").to_string();
+    out = HISTORY_HTML_CODE_CLOSE_RE
+        .replace_all(&out, "`")
+        .to_string();
+    HISTORY_HTML_TAG_RE.replace_all(&out, "").to_string()
+}
+
+fn strip_history_html_tags(raw: &str) -> String {
+    HISTORY_HTML_TAG_RE.replace_all(raw, "").to_string()
+}
+
+fn decode_history_html_entities(raw: &str) -> String {
+    if !raw.contains('&') {
+        return raw.to_string();
+    }
+    raw.replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn normalize_history_line_breaks(raw: &str) -> String {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let mut output = Vec::<String>::new();
+    let mut previous_blank = false;
+    for line in normalized.lines() {
+        let line_trimmed_right = line.trim_end().to_string();
+        if line_trimmed_right.trim().is_empty() {
+            if !previous_blank {
+                output.push(String::new());
+            }
+            previous_blank = true;
+            continue;
+        }
+        output.push(line_trimmed_right);
+        previous_blank = false;
+    }
+    while output.last().is_some_and(|line| line.is_empty()) {
+        output.pop();
+    }
+    output.join("\n")
 }
 
 fn result_timeout_hint(command: &str, stdout: &str, stderr: &str) -> Option<String> {
@@ -2876,9 +3130,24 @@ mod tests {
     #[test]
     fn normalize_history_content_sanitizes_control_and_empty() {
         let cleaned = normalize_history_content("\u{1B}[31mhello\u{1B}[0m\nworld");
-        assert_eq!(cleaned, "hello\\nworld");
+        assert_eq!(cleaned, "hello\nworld");
         let empty = normalize_history_content("\u{200B}\u{0007}");
         assert_eq!(empty, crate::i18n::chat_history_empty_content());
+    }
+
+    #[test]
+    fn normalize_history_content_decodes_escaped_layout_and_html() {
+        let decoded = normalize_history_content("line1\\n\\nline2");
+        assert_eq!(decoded, "line1\n\nline2");
+
+        let html = normalize_history_content(
+            "<h3>Title</h3><p><strong>bold</strong><br><em>line</em></p><ul><li>one</li><li>two</li></ul>",
+        );
+        assert!(html.contains("### Title"));
+        assert!(html.contains("**bold**"));
+        assert!(html.contains("*line*"));
+        assert!(html.contains("- one"));
+        assert!(html.contains("- two"));
     }
 
     #[test]
