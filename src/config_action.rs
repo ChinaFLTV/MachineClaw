@@ -344,6 +344,7 @@ pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
         "skills.enabled" => Some("false"),
         "skills.dir" => Some("\"~/.skills\""),
         "mcp.enabled" => Some("false"),
+        "mcp.mcp-availability-check-mode" => Some("\"rsync\""),
         "mcp.transport" => None,
         "mcp.server-url" => None,
         "mcp.server_url" => None,
@@ -412,6 +413,7 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
         "skills.enabled",
         "skills.dir",
         "mcp.enabled",
+        "mcp.mcp-availability-check-mode",
         "mcp.transport",
         "mcp.server-url",
         "mcp.server_url",
@@ -651,6 +653,7 @@ mod tests {
         assert!(is_known_config_key("mcp.server-url"));
         assert!(is_known_config_key("mcp.server_url"));
         assert!(is_known_config_key("mcp.serverUrl"));
+        assert!(is_known_config_key("mcp.mcp-availability-check-mode"));
         assert!(is_known_config_key("mcp.headers"));
         assert!(is_known_config_key("mcp.auth-type"));
         assert!(is_known_config_key("mcp.auth-token"));

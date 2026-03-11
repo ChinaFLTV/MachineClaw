@@ -1139,22 +1139,22 @@ pub fn chat_welcome(
 pub fn chat_hint() -> &'static str {
     match current_language() {
         Language::ZhCn => {
-            "输入问题开始对话。命令: /help, /stats, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+            "输入问题开始对话。命令: /help, /stats, /skills, /mcps, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
         Language::ZhTw => {
-            "輸入問題開始對話。命令: /help, /stats, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+            "輸入問題開始對話。命令: /help, /stats, /skills, /mcps, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
         Language::Fr => {
-            "Saisissez votre question pour commencer. Commandes: /help, /stats, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+            "Saisissez votre question pour commencer. Commandes: /help, /stats, /skills, /mcps, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
         Language::De => {
-            "Geben Sie eine Frage ein, um zu starten. Befehle: /help, /stats, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+            "Geben Sie eine Frage ein, um zu starten. Befehle: /help, /stats, /skills, /mcps, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
         Language::Ja => {
-            "質問を入力して開始します。コマンド: /help, /stats, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+            "質問を入力して開始します。コマンド: /help, /stats, /skills, /mcps, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
         Language::En => {
-            "Type a question to start. Commands: /help, /stats, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+            "Type a question to start. Commands: /help, /stats, /skills, /mcps, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
     }
 }
@@ -1162,22 +1162,22 @@ pub fn chat_hint() -> &'static str {
 pub fn chat_help_text() -> &'static str {
     match current_language() {
         Language::ZhCn => {
-            "/help 显示帮助, /stats 查看上下文统计, /history [number] 查看最近聊天历史(默认10条), /list 列出会话, /change <id|name> 切换会话, /name <new-name> 重命名当前会话, /new 新建会话, /clear 清屏(不清历史), /exit 退出 chat"
+            "/help 显示帮助, /stats 查看上下文统计, /skills 查看扫描到的 Skills, /mcps 查看 MCP 服务与工具状态, /history [number] 查看最近聊天历史(默认10条), /list 列出会话, /change <id|name> 切换会话, /name <new-name> 重命名当前会话, /new 新建会话, /clear 清屏(不清历史), /exit 退出 chat"
         }
         Language::ZhTw => {
-            "/help 顯示說明, /stats 查看上下文統計, /history [number] 查看最近聊天歷史(預設10筆), /list 列出會話, /change <id|name> 切換會話, /name <new-name> 重新命名目前會話, /new 建立新會話, /clear 清屏(不清歷史), /exit 離開 chat"
+            "/help 顯示說明, /stats 查看上下文統計, /skills 查看掃描到的 Skills, /mcps 查看 MCP 服務與工具狀態, /history [number] 查看最近聊天歷史(預設10筆), /list 列出會話, /change <id|name> 切換會話, /name <new-name> 重新命名目前會話, /new 建立新會話, /clear 清屏(不清歷史), /exit 離開 chat"
         }
         Language::Fr => {
-            "/help aide, /stats statistiques du contexte, /history [number] afficher l'historique récent (10 par défaut), /list lister les sessions, /change <id|name> changer de session, /name <new-name> renommer la session actuelle, /new nouvelle session, /clear effacer l'écran (garde l'historique), /exit quitter chat"
+            "/help aide, /stats statistiques du contexte, /skills afficher les skills détectés, /mcps afficher l'état des services/outils MCP, /history [number] afficher l'historique récent (10 par défaut), /list lister les sessions, /change <id|name> changer de session, /name <new-name> renommer la session actuelle, /new nouvelle session, /clear effacer l'écran (garde l'historique), /exit quitter chat"
         }
         Language::De => {
-            "/help Hilfe, /stats Kontextstatistik, /history [number] letzten Verlauf anzeigen (Standard 10), /list Sitzungen auflisten, /change <id|name> Sitzung wechseln, /name <new-name> aktuelle Sitzung umbenennen, /new neue Sitzung, /clear Bildschirm leeren (Verlauf bleibt), /exit chat beenden"
+            "/help Hilfe, /stats Kontextstatistik, /skills erkannte Skills anzeigen, /mcps MCP-Service/Tool-Status anzeigen, /history [number] letzten Verlauf anzeigen (Standard 10), /list Sitzungen auflisten, /change <id|name> Sitzung wechseln, /name <new-name> aktuelle Sitzung umbenennen, /new neue Sitzung, /clear Bildschirm leeren (Verlauf bleibt), /exit chat beenden"
         }
         Language::Ja => {
-            "/help ヘルプ, /stats コンテキスト統計, /history [number] 直近履歴を表示(既定10件), /list セッション一覧, /change <id|name> セッション切替, /name <new-name> 現在セッション名変更, /new 新規セッション, /clear 画面クリア(履歴保持), /exit chat 終了"
+            "/help ヘルプ, /stats コンテキスト統計, /skills 検出された Skills を表示, /mcps MCP サービス/ツール状態を表示, /history [number] 直近履歴を表示(既定10件), /list セッション一覧, /change <id|name> セッション切替, /name <new-name> 現在セッション名変更, /new 新規セッション, /clear 画面クリア(履歴保持), /exit chat 終了"
         }
         Language::En => {
-            "/help help, /stats context stats, /history [number] show recent chat history (default 10), /list list sessions, /change <id|name> switch session, /name <new-name> rename current session, /new new session, /clear clear screen (keep history), /exit leave chat"
+            "/help help, /stats context stats, /skills show detected skills, /mcps show MCP service/tool status, /history [number] show recent chat history (default 10), /list list sessions, /change <id|name> switch session, /name <new-name> rename current session, /new new session, /clear clear screen (keep history), /exit leave chat"
         }
     }
 }
@@ -1985,6 +1985,95 @@ pub fn chat_mcp_prepare_started(count: usize) -> String {
     }
 }
 
+pub fn chat_mcp_availability_check_started() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "已启用异步 MCP 可用性检查，检查完成后将自动刷新状态。",
+        Language::ZhTw => "已啟用非同步 MCP 可用性檢查，完成後會自動刷新狀態。",
+        Language::Fr => {
+            "Vérification asynchrone de disponibilité MCP lancée; l'état sera mis à jour automatiquement."
+        }
+        Language::De => {
+            "Asynchrone MCP-Verfügbarkeitsprüfung gestartet; der Status wird nach Abschluss automatisch aktualisiert."
+        }
+        Language::Ja => {
+            "MCP 可用性チェック（非同期）を開始しました。完了後に状態を自動更新します。"
+        }
+        Language::En => {
+            "Async MCP availability check started; status will refresh automatically when done."
+        }
+    }
+}
+
+pub fn chat_mcp_availability_check_finished(tool_count: usize, summary: &str) -> String {
+    let count_fmt = human_count_u128(tool_count as u128);
+    match current_language() {
+        Language::ZhCn => format!("MCP 可用性检查完成，可用工具 {count_fmt} 个，摘要: {summary}"),
+        Language::ZhTw => format!("MCP 可用性檢查完成，可用工具 {count_fmt} 個，摘要: {summary}"),
+        Language::Fr => {
+            format!("Vérification MCP terminée, outils disponibles: {count_fmt}, résumé: {summary}")
+        }
+        Language::De => {
+            format!(
+                "MCP-Prüfung abgeschlossen, verfügbare Tools: {count_fmt}, Zusammenfassung: {summary}"
+            )
+        }
+        Language::Ja => {
+            format!("MCP 可用性チェック完了。利用可能ツール: {count_fmt}、概要: {summary}")
+        }
+        Language::En => {
+            format!(
+                "MCP availability check finished, available tools: {count_fmt}, summary: {summary}"
+            )
+        }
+    }
+}
+
+pub fn chat_mcp_availability_check_channel_closed() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "MCP 异步可用性检查通道已关闭，状态保持当前值。",
+        Language::ZhTw => "MCP 非同步可用性檢查通道已關閉，狀態維持目前值。",
+        Language::Fr => "Canal de vérification asynchrone MCP fermé, état inchangé.",
+        Language::De => "Asynchroner MCP-Prüfkanal geschlossen, Status bleibt unverändert.",
+        Language::Ja => "MCP 非同期チェックのチャネルが閉じられました。状態は現状維持です。",
+        Language::En => "Async MCP availability channel closed; keeping current status.",
+    }
+}
+
+pub fn chat_mcp_startup_failure_notice(detail: &str) -> String {
+    match current_language() {
+        Language::ZhCn => format!("MCP 服务加载失败，已降级跳过：{detail}"),
+        Language::ZhTw => format!("MCP 服務載入失敗，已降級略過：{detail}"),
+        Language::Fr => format!("Échec du chargement MCP, mode dégradé activé : {detail}"),
+        Language::De => format!("MCP-Laden fehlgeschlagen, degradierter Modus aktiv: {detail}"),
+        Language::Ja => format!("MCP の読み込みに失敗したため、縮退モードで継続します: {detail}"),
+        Language::En => format!("MCP load failed, running in degraded mode: {detail}"),
+    }
+}
+
+pub fn chat_mcp_startup_failure_more(remaining: usize) -> String {
+    let count_fmt = human_count_u128(remaining as u128);
+    match current_language() {
+        Language::ZhCn => {
+            format!("其余 {count_fmt} 项 MCP 失败详情已省略，可执行 /mcps 查看完整状态。")
+        }
+        Language::ZhTw => {
+            format!("其餘 {count_fmt} 項 MCP 失敗詳情已省略，可執行 /mcps 查看完整狀態。")
+        }
+        Language::Fr => {
+            format!("{count_fmt} autres erreurs MCP omises, utilisez /mcps pour l'état complet.")
+        }
+        Language::De => {
+            format!("{count_fmt} weitere MCP-Fehler ausgeblendet, vollständiger Status via /mcps.")
+        }
+        Language::Ja => {
+            format!("残り {count_fmt} 件の MCP 失敗詳細は省略しました。/mcps で確認できます。")
+        }
+        Language::En => {
+            format!("{count_fmt} more MCP failures omitted, run /mcps for full status.")
+        }
+    }
+}
+
 pub fn chat_round_received(round: usize, tool_calls: usize) -> String {
     let round_fmt = human_count_u128(round as u128);
     let tool_calls_fmt = human_count_u128(tool_calls as u128);
@@ -2758,6 +2847,27 @@ fn localize_detail(detail: &str) -> String {
             }
             Language::En => detail.to_string(),
         },
+        "mcp.mcp-availability-check-mode must be one of: rsync, async" => {
+            match current_language() {
+                Language::ZhCn => {
+                    "mcp.mcp-availability-check-mode 仅支持 rsync 或 async".to_string()
+                }
+                Language::ZhTw => {
+                    "mcp.mcp-availability-check-mode 僅支援 rsync 或 async".to_string()
+                }
+                Language::Fr => {
+                    "mcp.mcp-availability-check-mode doit être rsync ou async".to_string()
+                }
+                Language::De => {
+                    "mcp.mcp-availability-check-mode muss rsync oder async sein".to_string()
+                }
+                Language::Ja => {
+                    "mcp.mcp-availability-check-mode は rsync または async を指定してください"
+                        .to_string()
+                }
+                Language::En => detail.to_string(),
+            }
+        }
         _ if detail.starts_with("cmd.allow-cmd-list has invalid regex '") => {
             match current_language() {
                 Language::ZhCn => format!("cmd.allow-cmd-list 包含非法正则: {detail}"),

@@ -36,8 +36,8 @@ use crate::{
     ai::AiClient,
     cli::{Cli, Commands},
     config::{
-        config_template_example, expand_tilde, read_console_colorful_hint, read_language_hint,
-        resolve_config_path, validate_config,
+        config_template_example, expand_tilde, normalize_mcp_availability_check_mode,
+        read_console_colorful_hint, read_language_hint, resolve_config_path, validate_config,
     },
     config_action::run_config_command,
     context::SessionStore,
@@ -243,7 +243,16 @@ fn run() -> Result<ExitCode, AppError> {
     ));
 
     let shell = ShellExecutor::new(&cfg.cmd);
-    let mut mcp_manager = mcp::McpManager::connect(&cfg.mcp)?;
+    let use_async_mcp_availability_check = matches!(&command, Commands::Chat)
+        && cfg.mcp.enabled
+        && normalize_mcp_availability_check_mode(cfg.mcp.mcp_availability_check_mode.as_str())
+            == "async";
+    let mut mcp_manager = if use_async_mcp_availability_check {
+        let pending_summary = format!("{}, availability=checking(async)", mcp_summary(&cfg.mcp));
+        mcp::McpManager::pending(pending_summary)
+    } else {
+        mcp::McpManager::connect(&cfg.mcp)?
+    };
 
     let os_type = current_os();
     let os_name = os_name();

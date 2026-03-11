@@ -7,6 +7,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -27,7 +28,10 @@ use crate::{
         is_transient_ai_error,
     },
     cli::InspectTarget,
-    config::{AppConfig, expand_tilde, normalize_chat_model_price_check_mode},
+    config::{
+        AppConfig, expand_tilde, normalize_chat_model_price_check_mode,
+        normalize_mcp_availability_check_mode,
+    },
     context::{SessionMessage, SessionStore},
     error::{AppError, ExitCode},
     i18n, logging,
@@ -297,6 +301,8 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
     maybe_ensure_chat_environment_profile(services, &system_prompt)?;
     let chat_input_waiting = Arc::new(AtomicBool::new(false));
     maybe_prepare_chat_model_price(services, chat_input_waiting.clone());
+    let mut async_mcp_connect_rx =
+        maybe_prepare_chat_mcp_availability(services, chat_input_waiting.clone());
     let initial_message_count = services.session.message_count();
     let mut chat_turns: usize = 0;
     let mut tool_stats = ChatToolStats::default();
@@ -304,11 +310,20 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
     let mut pending_message: Option<String> = None;
     let mut tool_call_cache = HashMap::<String, ToolCallCacheItem>::new();
     let command_cache_ttl_ms = services.cfg.ai.chat.command_cache_ttl_seconds as u128 * 1000;
-    let external_mcp_tools: Vec<ExternalToolDefinition> = services.mcp.external_tool_definitions();
     let mut autosave_worker = ChatAutosaveWorker::start(services.session, Duration::from_secs(3));
     render_chat_window_header(services, false);
+    apply_async_mcp_connect_result(
+        services,
+        &mut async_mcp_connect_rx,
+        chat_input_waiting.as_ref(),
+    );
 
     loop {
+        apply_async_mcp_connect_result(
+            services,
+            &mut async_mcp_connect_rx,
+            chat_input_waiting.as_ref(),
+        );
         chat_input_waiting.store(true, Ordering::SeqCst);
         print!(
             "{}",
@@ -353,6 +368,11 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         if is_noise_message(&message) {
             continue;
         }
+        apply_async_mcp_connect_result(
+            services,
+            &mut async_mcp_connect_rx,
+            chat_input_waiting.as_ref(),
+        );
 
         if let Some(command) = parse_builtin_command(&message) {
             match command.name.as_str() {
@@ -394,6 +414,28 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                                 effective_counts.tool,
                                 effective_counts.system,
                             ),
+                            services.cfg.console.colorful
+                        )
+                    );
+                }
+                "skills" if command.arg.is_empty() => {
+                    let markdown =
+                        format_chat_skills_markdown(services.cfg.skills.enabled, services.skills);
+                    println!(
+                        "{}",
+                        render::render_markdown_for_terminal(
+                            &markdown,
+                            services.cfg.console.colorful
+                        )
+                    );
+                }
+                "mcps" if command.arg.is_empty() => {
+                    let markdown =
+                        format_chat_mcps_markdown(services.cfg.mcp.enabled, services.mcp);
+                    println!(
+                        "{}",
+                        render::render_markdown_for_terminal(
+                            &markdown,
                             services.cfg.console.colorful
                         )
                     );
@@ -576,8 +618,15 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             );
         }
 
+        apply_async_mcp_connect_result(
+            services,
+            &mut async_mcp_connect_rx,
+            chat_input_waiting.as_ref(),
+        );
         logging::info("AI chat start");
         let history = services.session.build_chat_history();
+        let external_mcp_tools: Vec<ExternalToolDefinition> =
+            services.mcp.external_tool_definitions();
         let policy = if should_require_tool_call(&message) {
             ToolUsePolicy::RequireAtLeastOne
         } else {
@@ -1463,7 +1512,8 @@ fn parse_builtin_command(message: &str) -> Option<BuiltinCommand> {
     }
     let name = trimmed.get(1..end)?.to_ascii_lowercase();
     let known = [
-        "help", "stats", "list", "change", "name", "new", "clear", "history", "exit", "quit",
+        "help", "stats", "skills", "mcps", "list", "change", "name", "new", "clear", "history",
+        "exit", "quit",
     ];
     if !known.contains(&name.as_str()) {
         return None;
@@ -1511,7 +1561,9 @@ fn normalize_builtin_command_alias(message: String) -> String {
     let first = parts.next().unwrap_or_default();
     let rest = parts.next().unwrap_or_default().trim();
     let first_lower = first.to_ascii_lowercase();
-    let alias_noarg = ["help", "stats", "list", "new", "clear", "exit", "quit"];
+    let alias_noarg = [
+        "help", "stats", "skills", "mcps", "list", "new", "clear", "exit", "quit",
+    ];
     if alias_noarg.contains(&first_lower.as_str()) && rest.is_empty() {
         return format!("/{first_lower}");
     }
@@ -1580,18 +1632,7 @@ fn format_chat_session_list_markdown(sessions: &[crate::context::SessionOverview
         i18n::chat_session_list_title(sessions.len())
     ));
     lines.push(String::new());
-    lines.push(format!(
-        "| {} | {} | {} | {} | {} | {} | {} | {} |",
-        i18n::chat_session_list_header_active(),
-        i18n::chat_session_list_header_name(),
-        i18n::chat_session_list_header_id(),
-        i18n::chat_session_list_header_messages(),
-        i18n::chat_session_list_header_summary(),
-        i18n::chat_session_list_header_created(),
-        i18n::chat_session_list_header_updated(),
-        i18n::chat_session_list_header_file(),
-    ));
-    lines.push("|---|---|---|---|---|---|---|---|".to_string());
+    let mut rows = Vec::<Vec<String>>::new();
     for item in sessions {
         let active = if item.active {
             i18n::chat_session_list_active_yes()
@@ -1610,17 +1651,225 @@ fn format_chat_session_list_markdown(sessions: &[crate::context::SessionOverview
         let created = format_local_datetime(item.created_at_epoch_ms);
         let updated = format_local_datetime(item.last_updated_epoch_ms);
         let short_id = trim_text(&item.session_id, 16);
-        lines.push(format!(
-            "| {} | {} | `{}` | {} | {} | {} | {} | `{}` |",
-            active,
-            item.session_name.replace('|', "\\|"),
+        rows.push(vec![
+            active.to_string(),
+            item.session_name.clone(),
             short_id,
             counts,
             summary,
             created,
             updated,
-            item.file_path.display()
+            item.file_path.display().to_string(),
+        ]);
+    }
+    lines.extend(format_fixed_table(
+        &[
+            i18n::chat_session_list_header_active(),
+            i18n::chat_session_list_header_name(),
+            i18n::chat_session_list_header_id(),
+            i18n::chat_session_list_header_messages(),
+            i18n::chat_session_list_header_summary(),
+            i18n::chat_session_list_header_created(),
+            i18n::chat_session_list_header_updated(),
+            i18n::chat_session_list_header_file(),
+        ],
+        &rows,
+    ));
+    lines.join("\n")
+}
+
+fn availability_badge(available: bool) -> &'static str {
+    if available {
+        "🟢 available"
+    } else {
+        "🔴 unavailable"
+    }
+}
+
+fn display_width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(strip_ansi_escape_sequences(text).as_str())
+}
+
+fn strip_ansi_escape_sequences(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek().copied() == Some('[') {
+                let _ = chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        cleaned.push(ch);
+    }
+    cleaned
+}
+
+fn pad_cell(text: &str, width: usize) -> String {
+    let current = display_width(text);
+    if current >= width {
+        return text.to_string();
+    }
+    format!("{text}{}", " ".repeat(width - current))
+}
+
+fn format_fixed_table(headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {
+    if headers.is_empty() {
+        return Vec::new();
+    }
+    let mut widths = headers
+        .iter()
+        .map(|value| display_width(value))
+        .collect::<Vec<_>>();
+    for row in rows {
+        for (idx, value) in row.iter().enumerate() {
+            if idx >= widths.len() {
+                widths.push(display_width(value));
+            } else {
+                widths[idx] = widths[idx].max(display_width(value));
+            }
+        }
+    }
+    let border = format!(
+        "+{}+",
+        widths
+            .iter()
+            .map(|width| "-".repeat(width + 2))
+            .collect::<Vec<_>>()
+            .join("+")
+    );
+    let mut lines = Vec::<String>::new();
+    lines.push(border.clone());
+    lines.push(format!(
+        "| {} |",
+        headers
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| pad_cell(value, widths[idx]))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    ));
+    lines.push(border.clone());
+    for row in rows {
+        let mut padded = Vec::<String>::new();
+        for (idx, width) in widths.iter().enumerate() {
+            let value = row.get(idx).cloned().unwrap_or_default();
+            padded.push(pad_cell(&value, *width));
+        }
+        lines.push(format!("| {} |", padded.join(" | ")));
+    }
+    lines.push(border);
+    lines
+}
+
+fn format_chat_skills_markdown(enabled: bool, skills: &[String]) -> String {
+    let mut sorted = skills.to_vec();
+    sorted.sort();
+    let mut lines = Vec::<String>::new();
+    lines.push("### Skills".to_string());
+    lines.push(String::new());
+    lines.push(format!(
+        "- 扫描状态: {} {}",
+        if enabled { "🟢" } else { "🔴" },
+        if enabled { "enabled" } else { "disabled" }
+    ));
+    lines.push(format!(
+        "- 扫描数量: {}",
+        i18n::human_count_u128(sorted.len() as u128)
+    ));
+    if sorted.is_empty() {
+        lines.push("- 结果: (empty)".to_string());
+        return lines.join("\n");
+    }
+    lines.push(String::new());
+    let rows = sorted
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            vec![
+                format!("{}", idx + 1),
+                name.replace('|', "\\|"),
+                availability_badge(enabled).to_string(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    lines.extend(format_fixed_table(&["#", "Skill", "可用性"], &rows));
+    lines.join("\n")
+}
+
+fn format_chat_mcps_markdown(enabled: bool, mcp: &McpManager) -> String {
+    let services = mcp.service_statuses();
+    let mut tools = mcp.tool_statuses();
+    tools.sort_by(|left, right| {
+        left.server_name
+            .cmp(&right.server_name)
+            .then(left.remote_name.cmp(&right.remote_name))
+    });
+    let mut lines = Vec::<String>::new();
+    lines.push("### MCP Services".to_string());
+    lines.push(String::new());
+    lines.push(format!(
+        "- MCP 状态: {} {}",
+        if enabled { "🟢" } else { "🔴" },
+        if enabled { "enabled" } else { "disabled" }
+    ));
+    lines.push(format!("- MCP 摘要: `{}`", mcp.summary()));
+    lines.push(format!(
+        "- 服务数量: {}",
+        i18n::human_count_u128(services.len() as u128)
+    ));
+    lines.push(format!(
+        "- 工具数量: {}",
+        i18n::human_count_u128(tools.len() as u128)
+    ));
+    if !services.is_empty() {
+        lines.push(String::new());
+        lines.push("#### 服务明细".to_string());
+        lines.push(String::new());
+        let service_rows = services
+            .iter()
+            .map(|item| {
+                vec![
+                    item.name.replace('|', "\\|"),
+                    item.transport.replace('|', "\\|"),
+                    availability_badge(item.available).to_string(),
+                    i18n::human_count_u128(item.tool_count as u128),
+                    item.error.as_deref().unwrap_or("-").replace('|', "\\|"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        lines.extend(format_fixed_table(
+            &["服务", "传输", "可用性", "工具数", "详情"],
+            &service_rows,
         ));
+    }
+    if !tools.is_empty() {
+        lines.push(String::new());
+        lines.push("#### 工具明细".to_string());
+        lines.push(String::new());
+        let tool_rows = tools
+            .iter()
+            .map(|item| {
+                vec![
+                    item.server_name.replace('|', "\\|"),
+                    item.remote_name.replace('|', "\\|"),
+                    item.ai_name.replace('|', "\\|"),
+                    availability_badge(item.available).to_string(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        lines.extend(format_fixed_table(
+            &["服务", "MCP工具", "AI工具名", "可用性"],
+            &tool_rows,
+        ));
+    }
+    if services.is_empty() && tools.is_empty() {
+        lines.push("- 结果: (empty)".to_string());
     }
     lines.join("\n")
 }
@@ -2001,6 +2250,106 @@ fn maybe_prepare_chat_model_price(
     });
 }
 
+fn maybe_prepare_chat_mcp_availability(
+    services: &mut ActionServices<'_>,
+    chat_input_waiting: Arc<AtomicBool>,
+) -> Option<Receiver<Result<McpManager, String>>> {
+    if !services.cfg.mcp.enabled
+        || normalize_mcp_availability_check_mode(
+            services.cfg.mcp.mcp_availability_check_mode.as_str(),
+        ) != "async"
+    {
+        return None;
+    }
+    let colorful = services.cfg.console.colorful;
+    print_async_chat_notice(
+        i18n::chat_tag_mcp(),
+        i18n::chat_mcp_availability_check_started(),
+        colorful,
+        chat_input_waiting.as_ref(),
+    );
+    let mcp_cfg = services.cfg.mcp.clone();
+    let (sender, receiver) = mpsc::channel::<Result<McpManager, String>>();
+    let chat_input_waiting_cloned = chat_input_waiting.clone();
+    thread::spawn(move || {
+        let result = match McpManager::connect(&mcp_cfg) {
+            Ok(manager) => {
+                let summary = manager.summary();
+                let tool_count = manager.external_tool_definitions().len();
+                print_async_chat_notice(
+                    i18n::chat_tag_mcp(),
+                    &i18n::chat_mcp_availability_check_finished(tool_count, &summary),
+                    colorful,
+                    chat_input_waiting_cloned.as_ref(),
+                );
+                let startup_failures = manager.startup_failures();
+                for detail in startup_failures.iter().take(3) {
+                    print_async_chat_notice(
+                        i18n::chat_tag_mcp(),
+                        &i18n::chat_mcp_startup_failure_notice(detail),
+                        colorful,
+                        chat_input_waiting_cloned.as_ref(),
+                    );
+                }
+                if startup_failures.len() > 3 {
+                    print_async_chat_notice(
+                        i18n::chat_tag_mcp(),
+                        &i18n::chat_mcp_startup_failure_more(startup_failures.len() - 3),
+                        colorful,
+                        chat_input_waiting_cloned.as_ref(),
+                    );
+                }
+                Ok(manager)
+            }
+            Err(err) => {
+                let detail = mask_sensitive(&err.to_string());
+                print_async_chat_notice(
+                    i18n::chat_tag_mcp(),
+                    &i18n::chat_mcp_startup_failure_notice(&detail),
+                    colorful,
+                    chat_input_waiting_cloned.as_ref(),
+                );
+                Err(detail)
+            }
+        };
+        let _ = sender.send(result);
+    });
+    Some(receiver)
+}
+
+fn apply_async_mcp_connect_result(
+    services: &mut ActionServices<'_>,
+    async_mcp_connect_rx: &mut Option<Receiver<Result<McpManager, String>>>,
+    _chat_input_waiting: &AtomicBool,
+) {
+    let Some(receiver) = async_mcp_connect_rx.as_ref() else {
+        return;
+    };
+    let outcome = match receiver.try_recv() {
+        Ok(value) => Some(value),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => Some(Err(
+            i18n::chat_mcp_availability_check_channel_closed().to_string(),
+        )),
+    };
+    let Some(result) = outcome else {
+        return;
+    };
+    *async_mcp_connect_rx = None;
+    match result {
+        Ok(manager) => {
+            services.mcp_summary = manager.summary();
+            *services.mcp = manager;
+        }
+        Err(detail) => {
+            logging::warn(&format!(
+                "async MCP availability check failed: {}",
+                mask_sensitive(&detail)
+            ));
+        }
+    }
+}
+
 fn format_model_price_check_message(result: ModelPriceCheckResult) -> String {
     match (result.source, result.prices, result.probe_skipped) {
         (ModelPriceSource::Configured, Some((input, output)), _) => {
@@ -2123,6 +2472,27 @@ fn render_chat_window_header(services: &ActionServices<'_>, after_clear: bool) {
                 services.cfg.console.colorful
             )
         );
+        let startup_failures = services.mcp.startup_failures();
+        for detail in startup_failures.iter().take(3) {
+            println!(
+                "{}",
+                render::render_chat_custom_tag_event(
+                    i18n::chat_tag_mcp(),
+                    &i18n::chat_mcp_startup_failure_notice(detail),
+                    services.cfg.console.colorful
+                )
+            );
+        }
+        if startup_failures.len() > 3 {
+            println!(
+                "{}",
+                render::render_chat_custom_tag_event(
+                    i18n::chat_tag_mcp(),
+                    &i18n::chat_mcp_startup_failure_more(startup_failures.len() - 3),
+                    services.cfg.console.colorful
+                )
+            );
+        }
     }
 }
 
@@ -3110,12 +3480,15 @@ fn read_cmd(label: &str, command: &str) -> CommandSpec {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatAutosaveSnapshot, flush_chat_autosave_snapshot, normalize_builtin_command_alias,
+        ChatAutosaveSnapshot, flush_chat_autosave_snapshot, format_chat_session_list_markdown,
+        format_chat_skills_markdown, format_fixed_table, normalize_builtin_command_alias,
         normalize_history_content, parse_builtin_command, parse_chat_history_limit,
-        render_async_chat_notice_output,
+        render_async_chat_notice_output, strip_ansi_escape_sequences,
     };
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+    use unicode_width::UnicodeWidthStr;
     use uuid::Uuid;
 
     #[test]
@@ -3126,6 +3499,10 @@ mod tests {
         let cmd_noarg = parse_builtin_command("/history").expect("history no-arg should parse");
         assert_eq!(cmd_noarg.name, "history");
         assert!(cmd_noarg.arg.is_empty());
+        let skills = parse_builtin_command("/skills").expect("skills should parse");
+        assert_eq!(skills.name, "skills");
+        let mcps = parse_builtin_command("/mcps").expect("mcps should parse");
+        assert_eq!(mcps.name, "mcps");
     }
 
     #[test]
@@ -3138,6 +3515,11 @@ mod tests {
             normalize_builtin_command_alias("history 25".to_string()),
             "/history 25"
         );
+        assert_eq!(
+            normalize_builtin_command_alias("skills".to_string()),
+            "/skills"
+        );
+        assert_eq!(normalize_builtin_command_alias("mcps".to_string()), "/mcps");
     }
 
     #[test]
@@ -3198,5 +3580,55 @@ mod tests {
     fn async_chat_notice_output_does_not_append_prompt_by_default() {
         let output = render_async_chat_notice_output("[tag]", "done", false, false);
         assert_eq!(output, "[tag] done\n");
+    }
+
+    #[test]
+    fn fixed_table_keeps_consistent_width_with_ansi_and_cjk() {
+        let rows = vec![
+            vec![
+                "\u{1b}[33mskill-one\u{1b}[0m".to_string(),
+                "🟢 available".to_string(),
+            ],
+            vec!["中文技能".to_string(), "🔴 unavailable".to_string()],
+        ];
+        let lines = format_fixed_table(&["Skill", "可用性"], &rows);
+        assert!(lines.len() >= 4);
+        let expected_width =
+            UnicodeWidthStr::width(strip_ansi_escape_sequences(&lines[0]).as_str());
+        for line in lines {
+            assert_eq!(
+                UnicodeWidthStr::width(strip_ansi_escape_sequences(&line).as_str()),
+                expected_width
+            );
+        }
+    }
+
+    #[test]
+    fn skills_output_uses_availability_header() {
+        let output = format_chat_skills_markdown(true, &["doc".to_string()]);
+        assert!(output.contains("可用性"));
+        assert!(!output.contains("指示灯"));
+    }
+
+    #[test]
+    fn session_list_output_uses_fixed_table_layout() {
+        let sessions = vec![crate::context::SessionOverview {
+            session_id: "1234567890abcdef".to_string(),
+            session_name: "dev-chat".to_string(),
+            file_path: PathBuf::from("/tmp/dev-chat.json"),
+            message_count: 12,
+            summary_len: 200,
+            user_count: 4,
+            assistant_count: 5,
+            tool_count: 2,
+            system_count: 1,
+            created_at_epoch_ms: 0,
+            last_updated_epoch_ms: 0,
+            active: true,
+        }];
+        let output = format_chat_session_list_markdown(&sessions);
+        assert!(output.contains("+"));
+        assert!(output.contains("|"));
+        assert!(!output.contains("|---|---|"));
     }
 }

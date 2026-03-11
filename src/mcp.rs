@@ -1,8 +1,9 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    time::Duration,
+    thread::sleep,
+    time::{Duration, Instant},
 };
 
 use reqwest::{
@@ -20,6 +21,7 @@ use crate::{
 };
 
 const DEFAULT_MCP_TIMEOUT_SECONDS: u64 = 10;
+const MCP_STDIO_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone)]
 struct NormalizedServerConfig {
@@ -105,9 +107,27 @@ pub fn mcp_summary(cfg: &McpConfig) -> String {
 #[derive(Debug, Clone)]
 struct McpToolInfo {
     ai_name: String,
+    server_name: String,
     remote_name: String,
     description: String,
     parameters: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServiceStatus {
+    pub name: String,
+    pub transport: String,
+    pub available: bool,
+    pub tool_count: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpToolStatus {
+    pub server_name: String,
+    pub ai_name: String,
+    pub remote_name: String,
+    pub available: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +145,8 @@ struct McpConnection {
 pub struct McpManager {
     enabled: bool,
     tools: Vec<McpToolInfo>,
+    tool_statuses: Vec<McpToolStatus>,
+    service_statuses: Vec<McpServiceStatus>,
     tool_index: HashMap<String, ToolBinding>,
     connections: Vec<McpConnection>,
     summary: String,
@@ -151,11 +173,25 @@ struct HttpMcpClient {
 }
 
 impl McpManager {
+    pub fn pending(summary: String) -> Self {
+        Self {
+            enabled: true,
+            tools: Vec::new(),
+            tool_statuses: Vec::new(),
+            service_statuses: Vec::new(),
+            tool_index: HashMap::new(),
+            connections: Vec::new(),
+            summary,
+        }
+    }
+
     pub fn connect(cfg: &McpConfig) -> Result<Self, AppError> {
         if !cfg.enabled {
             return Ok(Self {
                 enabled: false,
                 tools: Vec::new(),
+                tool_statuses: Vec::new(),
+                service_statuses: Vec::new(),
                 tool_index: HashMap::new(),
                 connections: Vec::new(),
                 summary: "disabled".to_string(),
@@ -167,6 +203,8 @@ impl McpManager {
             return Ok(Self {
                 enabled: true,
                 tools: Vec::new(),
+                tool_statuses: Vec::new(),
+                service_statuses: Vec::new(),
                 tool_index: HashMap::new(),
                 connections: Vec::new(),
                 summary: "enabled, servers=0".to_string(),
@@ -176,6 +214,8 @@ impl McpManager {
         let total_servers = server_configs.len();
         let mut connections = Vec::<McpConnection>::new();
         let mut tools = Vec::<McpToolInfo>::new();
+        let mut tool_statuses = Vec::<McpToolStatus>::new();
+        let mut service_statuses = Vec::<McpServiceStatus>::new();
         let mut tool_index = HashMap::<String, ToolBinding>::new();
         let mut errors = Vec::<String>::new();
 
@@ -184,17 +224,30 @@ impl McpManager {
             let (transport, initialize_result, tools_result) = match connect_outcome {
                 Ok(value) => value,
                 Err(err) => {
-                    errors.push(format!(
-                        "{}: {}",
-                        server.name,
-                        mask_sensitive(&err.to_string())
-                    ));
+                    let masked_error = mask_sensitive(&err.to_string());
+                    errors.push(format!("{}: {}", server.name, masked_error));
+                    service_statuses.push(McpServiceStatus {
+                        name: server.name.clone(),
+                        transport: transport_mode_name(server.transport).to_string(),
+                        available: false,
+                        tool_count: 0,
+                        error: Some(masked_error),
+                    });
                     continue;
                 }
             };
 
             let connection_idx = connections.len();
             let server_tools = extract_tools(&server.name, &tools_result);
+            let server_tool_count = server_tools.len();
+            for tool in &server_tools {
+                tool_statuses.push(McpToolStatus {
+                    server_name: tool.server_name.clone(),
+                    ai_name: tool.ai_name.clone(),
+                    remote_name: tool.remote_name.clone(),
+                    available: true,
+                });
+            }
             for tool in &server_tools {
                 tool_index.insert(
                     tool.ai_name.clone(),
@@ -205,6 +258,13 @@ impl McpManager {
                 );
             }
             tools.extend(server_tools);
+            service_statuses.push(McpServiceStatus {
+                name: server.name.clone(),
+                transport: transport_mode_name(server.transport).to_string(),
+                available: true,
+                tool_count: server_tool_count,
+                error: None,
+            });
             connections.push(McpConnection {
                 name: server.name.clone(),
                 timeout: server.timeout,
@@ -215,12 +275,20 @@ impl McpManager {
         }
 
         if connections.is_empty() {
-            let reason = if errors.is_empty() {
-                "no MCP server available".to_string()
+            let summary = if errors.is_empty() {
+                "enabled, servers=0".to_string()
             } else {
-                format!("no MCP server available: {}", errors.join(" | "))
+                format!("enabled, servers=0, unavailable: {}", errors.join(" | "))
             };
-            return Err(AppError::Runtime(reason));
+            return Ok(Self {
+                enabled: true,
+                tools: Vec::new(),
+                tool_statuses,
+                service_statuses,
+                tool_index: HashMap::new(),
+                connections: Vec::new(),
+                summary,
+            });
         }
 
         let mut detail = connections
@@ -251,6 +319,8 @@ impl McpManager {
         Ok(Self {
             enabled: true,
             tools,
+            tool_statuses,
+            service_statuses,
             tool_index,
             connections,
             summary,
@@ -268,6 +338,29 @@ impl McpManager {
                 name: tool.ai_name.clone(),
                 description: tool.description.clone(),
                 parameters: tool.parameters.clone(),
+            })
+            .collect()
+    }
+
+    pub fn service_statuses(&self) -> Vec<McpServiceStatus> {
+        self.service_statuses.clone()
+    }
+
+    pub fn tool_statuses(&self) -> Vec<McpToolStatus> {
+        self.tool_statuses.clone()
+    }
+
+    pub fn startup_failures(&self) -> Vec<String> {
+        self.service_statuses
+            .iter()
+            .filter(|item| !item.available)
+            .filter_map(|item| {
+                item.error.as_ref().map(|detail| {
+                    format!(
+                        "server={}, transport={}, error={detail}",
+                        item.name, item.transport
+                    )
+                })
             })
             .collect()
     }
@@ -314,8 +407,7 @@ impl Drop for McpManager {
     fn drop(&mut self) {
         for connection in &mut self.connections {
             if let McpTransport::Stdio(client) = &mut connection.transport {
-                let _ = client.child.kill();
-                let _ = client.child.wait();
+                terminate_mcp_child(&mut client.child);
             }
         }
     }
@@ -349,12 +441,19 @@ impl StdioMcpClient {
             .stdout
             .take()
             .ok_or_else(|| AppError::Runtime("failed to open MCP stdout".to_string()))?;
+        set_stdio_nonblocking(&stdout)?;
         Ok(Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
         })
+    }
+}
+
+impl Drop for StdioMcpClient {
+    fn drop(&mut self) {
+        terminate_mcp_child(&mut self.child);
     }
 }
 
@@ -580,14 +679,20 @@ fn stdio_request(
     });
     write_mcp_frame(&mut client.stdin, &payload)?;
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     loop {
         if started.elapsed() > timeout {
             return Err(AppError::Runtime(format!(
                 "MCP request timeout: method={method}"
             )));
         }
-        let frame = read_mcp_frame(&mut client.stdout)?;
+        let frame = read_mcp_frame(
+            &mut client.stdout,
+            &mut client.child,
+            method,
+            timeout,
+            started,
+        )?;
         if let Some(resp_id) = frame.get("id")
             && resp_id == &json!(id)
         {
@@ -761,17 +866,55 @@ fn write_mcp_frame(writer: &mut ChildStdin, payload: &Value) -> Result<(), AppEr
         .map_err(|err| AppError::Runtime(format!("failed to write MCP frame: {err}")))
 }
 
-fn read_mcp_frame(reader: &mut BufReader<ChildStdout>) -> Result<Value, AppError> {
+fn read_mcp_frame(
+    reader: &mut BufReader<ChildStdout>,
+    child: &mut Child,
+    method: &str,
+    timeout: Duration,
+    started: Instant,
+) -> Result<Value, AppError> {
+    let timeout_error = || AppError::Runtime(format!("MCP request timeout: method={method}"));
     let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|err| AppError::Runtime(format!("failed to read MCP header: {err}")))?;
+        let n = loop {
+            if started.elapsed() > timeout {
+                return Err(timeout_error());
+            }
+            match reader.read_line(&mut line) {
+                Ok(n) => break n,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    if let Some(status) = child.try_wait().map_err(|e| {
+                        AppError::Runtime(format!("failed to inspect MCP process state: {e}"))
+                    })? {
+                        return Err(AppError::Runtime(format!(
+                            "MCP process exited before responding: method={}, status={}",
+                            method, status
+                        )));
+                    }
+                    sleep(MCP_STDIO_POLL_INTERVAL);
+                }
+                Err(err) => {
+                    return Err(AppError::Runtime(format!(
+                        "failed to read MCP header: {err}"
+                    )));
+                }
+            }
+        };
         if n == 0 {
-            return Err(AppError::Runtime(
-                "MCP stdout closed unexpectedly".to_string(),
-            ));
+            if let Some(status) = child.try_wait().map_err(|e| {
+                AppError::Runtime(format!("failed to inspect MCP process state: {e}"))
+            })? {
+                return Err(AppError::Runtime(format!(
+                    "MCP process exited before responding: method={}, status={}",
+                    method, status
+                )));
+            }
+            if started.elapsed() > timeout {
+                return Err(timeout_error());
+            }
+            sleep(MCP_STDIO_POLL_INTERVAL);
+            continue;
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -790,12 +933,77 @@ fn read_mcp_frame(reader: &mut BufReader<ChildStdout>) -> Result<Value, AppError
         ));
     }
     let mut body = vec![0_u8; content_length];
-    reader
-        .read_exact(&mut body)
-        .map_err(|err| AppError::Runtime(format!("failed to read MCP body: {err}")))?;
+    let mut offset = 0;
+    while offset < body.len() {
+        if started.elapsed() > timeout {
+            return Err(timeout_error());
+        }
+        match reader.read(&mut body[offset..]) {
+            Ok(0) => {
+                if let Some(status) = child.try_wait().map_err(|e| {
+                    AppError::Runtime(format!("failed to inspect MCP process state: {e}"))
+                })? {
+                    return Err(AppError::Runtime(format!(
+                        "MCP process exited before full response body: method={}, status={}",
+                        method, status
+                    )));
+                }
+                sleep(MCP_STDIO_POLL_INTERVAL);
+            }
+            Ok(n) => {
+                offset += n;
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                if let Some(status) = child.try_wait().map_err(|e| {
+                    AppError::Runtime(format!("failed to inspect MCP process state: {e}"))
+                })? {
+                    return Err(AppError::Runtime(format!(
+                        "MCP process exited before full response body: method={}, status={}",
+                        method, status
+                    )));
+                }
+                sleep(MCP_STDIO_POLL_INTERVAL);
+            }
+            Err(err) => {
+                return Err(AppError::Runtime(format!("failed to read MCP body: {err}")));
+            }
+        }
+    }
     let value = serde_json::from_slice::<Value>(&body)
         .map_err(|err| AppError::Runtime(format!("failed to parse MCP json: {err}")))?;
     Ok(value)
+}
+
+fn terminate_mcp_child(child: &mut Child) {
+    if let Ok(None) = child.try_wait() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn set_stdio_nonblocking(stdout: &ChildStdout) -> Result<(), AppError> {
+    use std::os::fd::AsRawFd;
+    let fd = stdout.as_raw_fd();
+    // Non-blocking stdout allows timeout-seconds to actually take effect for stdio MCP.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(AppError::Runtime(
+            "failed to get MCP stdout flags for nonblocking mode".to_string(),
+        ));
+    }
+    let set_result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if set_result < 0 {
+        return Err(AppError::Runtime(
+            "failed to set MCP stdout nonblocking mode".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_stdio_nonblocking(_stdout: &ChildStdout) -> Result<(), AppError> {
+    Ok(())
 }
 
 fn non_empty_trimmed(raw: Option<&str>) -> Option<String> {
@@ -945,6 +1153,7 @@ fn extract_tools(server_name: &str, result: &Value) -> Vec<McpToolInfo> {
         let sanitized_tool = sanitize_tool_name(remote_name);
         output.push(McpToolInfo {
             ai_name: format!("mcp__{sanitized_server}__{sanitized_tool}"),
+            server_name: server_name.to_string(),
             remote_name: remote_name.to_string(),
             description: format!("MCP[{server_name}] tool {remote_name}: {description}"),
             parameters: params,
@@ -957,6 +1166,13 @@ fn transport_name(transport: &McpTransport) -> &'static str {
     match transport {
         McpTransport::Stdio(_) => "stdio",
         McpTransport::Http(_) => "http",
+    }
+}
+
+fn transport_mode_name(mode: McpTransportMode) -> &'static str {
+    match mode {
+        McpTransportMode::Stdio => "stdio",
+        McpTransportMode::Http => "http",
     }
 }
 
@@ -1131,6 +1347,7 @@ mod tests {
         );
         let cfg = McpConfig {
             enabled: true,
+            mcp_availability_check_mode: "rsync".to_string(),
             transport: None,
             server_url: None,
             endpoint: None,
@@ -1165,6 +1382,41 @@ mod tests {
         };
         let manager = McpManager::connect(&cfg).expect("connect should allow empty mcp server set");
         assert_eq!(manager.summary(), "enabled, servers=0");
+        assert!(manager.external_tool_definitions().is_empty());
+    }
+
+    #[test]
+    fn connect_degrades_when_all_servers_are_unavailable() {
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "broken".to_string(),
+            McpServerConfig {
+                enabled: true,
+                transport: Some("stdio".to_string()),
+                server_url: None,
+                endpoint: None,
+                command: Some("__machineclaw_missing_mcp_command__".to_string()),
+                args: vec![],
+                env: BTreeMap::new(),
+                headers: BTreeMap::new(),
+                auth_type: None,
+                auth_token: None,
+                timeout_seconds: Some(1),
+            },
+        );
+        let cfg = McpConfig {
+            enabled: true,
+            servers,
+            ..McpConfig::default()
+        };
+        let manager = McpManager::connect(&cfg)
+            .expect("all unavailable servers should not block chat startup");
+        assert!(
+            manager
+                .summary()
+                .contains("enabled, servers=0, unavailable:")
+        );
+        assert_eq!(manager.startup_failures().len(), 1);
         assert!(manager.external_tool_definitions().is_empty());
     }
 

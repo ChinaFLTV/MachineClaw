@@ -51,6 +51,7 @@ const DEFAULT_LOG_MAX_SAVE_TIME: &str = "7d";
 const DEFAULT_CONTEXT_RECENT_MESSAGES: usize = 40;
 const MAX_CONTEXT_MESSAGES: usize = 80;
 const DEFAULT_APP_ENV_MODE: &str = "prod";
+const DEFAULT_MCP_AVAILABILITY_CHECK_MODE: &str = "rsync";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -270,6 +271,11 @@ pub struct SkillsConfig {
 pub struct McpConfig {
     #[serde(default = "default_mcp_enabled")]
     pub enabled: bool,
+    #[serde(
+        rename = "mcp-availability-check-mode",
+        default = "default_mcp_availability_check_mode"
+    )]
+    pub mcp_availability_check_mode: String,
     #[serde(default)]
     pub transport: Option<String>,
     #[serde(
@@ -556,6 +562,7 @@ dir = "~/.skills" # optional
 
 [mcp]
 enabled = false # optional
+mcp-availability-check-mode = "rsync" # optional, default "rsync"; "async" runs MCP availability check in background so chat can start sooner
 # transport = "http" # optional: http, stdio; omitted = auto detect by endpoint/command
 # server-url = "http://127.0.0.1:8080/mcp" # optional, same as endpoint
 # auth-type = "bearer" # optional, default bearer when auth-token is set
@@ -686,6 +693,13 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
     if !matches!(model_price_check_mode, "sync" | "async") {
         return Err(AppError::Config(
             "ai.chat.model-price-check-mode must be one of: sync, async".to_string(),
+        ));
+    }
+    let mcp_availability_check_mode =
+        normalize_mcp_availability_check_mode(cfg.mcp.mcp_availability_check_mode.as_str());
+    if !matches!(mcp_availability_check_mode, "rsync" | "async") {
+        return Err(AppError::Config(
+            "mcp.mcp-availability-check-mode must be one of: rsync, async".to_string(),
         ));
     }
     if cfg.ai.chat.cmd_run_timout == 0 {
@@ -872,6 +886,10 @@ fn default_mcp_enabled() -> bool {
     false
 }
 
+fn default_mcp_availability_check_mode() -> String {
+    DEFAULT_MCP_AVAILABILITY_CHECK_MODE.to_string()
+}
+
 fn default_mcp_server_enabled() -> bool {
     true
 }
@@ -1020,6 +1038,14 @@ pub(crate) fn normalize_chat_model_price_check_mode(raw: &str) -> &str {
     }
 }
 
+pub(crate) fn normalize_mcp_availability_check_mode(raw: &str) -> &str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "async" => "async",
+        "rsync" | "sync" | "" => "rsync",
+        _ => "__invalid__",
+    }
+}
+
 fn has_file_extension(file_name: &str) -> bool {
     let trimmed = file_name.trim();
     if trimmed.is_empty() || trimmed.ends_with('.') {
@@ -1033,7 +1059,10 @@ fn has_file_extension(file_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_chat_model_price_check_mode, resolve_config_path};
+    use super::{
+        normalize_chat_model_price_check_mode, normalize_mcp_availability_check_mode,
+        resolve_config_path,
+    };
 
     #[test]
     fn normalize_model_price_check_mode_accepts_sync_async_and_rsync_alias() {
@@ -1042,6 +1071,18 @@ mod tests {
         assert_eq!(normalize_chat_model_price_check_mode("rsync"), "sync");
         assert_eq!(
             normalize_chat_model_price_check_mode("invalid"),
+            "__invalid__"
+        );
+    }
+
+    #[test]
+    fn normalize_mcp_availability_check_mode_accepts_rsync_async_and_sync_alias() {
+        assert_eq!(normalize_mcp_availability_check_mode("rsync"), "rsync");
+        assert_eq!(normalize_mcp_availability_check_mode("async"), "async");
+        assert_eq!(normalize_mcp_availability_check_mode("sync"), "rsync");
+        assert_eq!(normalize_mcp_availability_check_mode(""), "rsync");
+        assert_eq!(
+            normalize_mcp_availability_check_mode("invalid"),
             "__invalid__"
         );
     }
