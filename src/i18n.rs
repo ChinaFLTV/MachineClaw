@@ -782,6 +782,17 @@ pub fn chat_tag_model_price() -> &'static str {
     }
 }
 
+pub fn chat_tag_reconnect() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "[断线重连]",
+        Language::ZhTw => "[斷線重連]",
+        Language::Fr => "[reconnexion]",
+        Language::De => "[neuverbinden]",
+        Language::Ja => "[再接続]",
+        Language::En => "[reconnect]",
+    }
+}
+
 pub fn chat_model_price_check_started(model: &str) -> String {
     match current_language() {
         Language::ZhCn => format!("正在准备当前模型单价信息，model={model}"),

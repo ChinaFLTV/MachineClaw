@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     error::Error as StdError,
     fs,
-    io::{BufRead, BufReader, IsTerminal, Read},
+    io::{BufRead, BufReader, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     sync::RwLock,
     thread,
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    config::AiConfig, error::AppError, i18n, logging, mask::mask_sensitive,
+    config::AiConfig, error::AppError, i18n, logging, mask::mask_sensitive, render,
     shell::take_interactive_input_refresh_hint, tls::ensure_rustls_crypto_provider,
 };
 
@@ -2859,7 +2859,10 @@ fn maybe_print_ai_reconnect_notice(message: &str) {
     if !std::io::stdout().is_terminal() {
         return;
     }
-    println!("{} {}", i18n::chat_tag_info(), message);
+    // Spinner uses carriage-return in-place refresh; clear that line before printing reconnect hint.
+    print!("\r{: <220}\r", "");
+    println!("{}", render::render_chat_reconnect_notice(message, false));
+    let _ = std::io::stdout().flush();
 }
 
 fn model_prefers_omit_tool_choice(model: &str) -> bool {

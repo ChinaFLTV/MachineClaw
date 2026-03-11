@@ -173,6 +173,21 @@ pub fn render_chat_notice(text: &str, colorful: bool) -> String {
     )
 }
 
+pub fn render_chat_reconnect_notice(text: &str, colorful: bool) -> String {
+    let multiline = text.contains('\n');
+    let tag = i18n::chat_tag_reconnect();
+    if !supports_color(colorful) {
+        if multiline {
+            return format!("{tag}\n{text}");
+        }
+        return format!("{tag} {text}");
+    }
+    if multiline {
+        return format!("{}\n{}", tag.bright_magenta().bold(), text.bright_yellow());
+    }
+    format!("{} {}", tag.bright_magenta().bold(), text.bright_yellow())
+}
+
 pub fn render_info_line(text: &str, colorful: bool) -> String {
     if !supports_color(colorful) {
         return format!("{}: {text}", i18n::prefix_info());
@@ -1844,9 +1859,9 @@ fn swap_extension(name: &str) -> Option<String> {
 mod tests {
     use super::{
         ChatStreamBlockKind, close_unfinished_inline_markdown, find_stream_stable_prefix_len,
-        normalize_compact_markdown_line, render_markdown_for_terminal, render_single_markdown_line,
-        render_stream_line_final, render_stream_line_preview, render_stream_prefix,
-        should_defer_stream_line_output,
+        normalize_compact_markdown_line, render_chat_reconnect_notice,
+        render_markdown_for_terminal, render_single_markdown_line, render_stream_line_final,
+        render_stream_line_preview, render_stream_prefix, should_defer_stream_line_output,
     };
     use regex::Regex;
 
@@ -2010,6 +2025,24 @@ mod tests {
         let rendered =
             render_stream_line_final("~~~bash", false, false, ChatStreamBlockKind::Assistant);
         assert_eq!(rendered, "[code:bash]");
+    }
+
+    #[test]
+    fn reconnect_notice_uses_dedicated_tag_in_plain_mode() {
+        let rendered = render_chat_reconnect_notice("AI connection issue", false);
+        assert_eq!(
+            rendered,
+            format!("{} AI connection issue", crate::i18n::chat_tag_reconnect())
+        );
+    }
+
+    #[test]
+    fn reconnect_notice_puts_multiline_text_on_separate_line() {
+        let rendered = render_chat_reconnect_notice("line1\nline2", false);
+        assert_eq!(
+            rendered,
+            format!("{}\nline1\nline2", crate::i18n::chat_tag_reconnect())
+        );
     }
 
     #[test]
