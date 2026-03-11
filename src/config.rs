@@ -271,6 +271,15 @@ pub struct McpConfig {
     #[serde(default = "default_mcp_enabled")]
     pub enabled: bool,
     #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(
+        rename = "server-url",
+        alias = "server_url",
+        alias = "serverUrl",
+        default
+    )]
+    pub server_url: Option<String>,
+    #[serde(default)]
     pub endpoint: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
@@ -278,6 +287,12 @@ pub struct McpConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(rename = "auth-type", alias = "auth_type", default)]
+    pub auth_type: Option<String>,
+    #[serde(rename = "auth-token", alias = "auth_token", default)]
+    pub auth_token: Option<String>,
     #[serde(default)]
     #[serde(rename = "timeout-seconds")]
     pub timeout_seconds: Option<u64>,
@@ -290,6 +305,15 @@ pub struct McpServerConfig {
     #[serde(default = "default_mcp_server_enabled")]
     pub enabled: bool,
     #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(
+        rename = "server-url",
+        alias = "server_url",
+        alias = "serverUrl",
+        default
+    )]
+    pub server_url: Option<String>,
+    #[serde(default)]
     pub endpoint: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
@@ -297,6 +321,12 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(rename = "auth-type", alias = "auth_type", default)]
+    pub auth_type: Option<String>,
+    #[serde(rename = "auth-token", alias = "auth_token", default)]
+    pub auth_token: Option<String>,
     #[serde(default)]
     #[serde(rename = "timeout-seconds")]
     pub timeout_seconds: Option<u64>,
@@ -526,15 +556,28 @@ dir = "~/.skills" # optional
 
 [mcp]
 enabled = false # optional
+# transport = "http" # optional: http, stdio; omitted = auto detect by endpoint/command
+# server-url = "http://127.0.0.1:8080/mcp" # optional, same as endpoint
+# auth-type = "bearer" # optional, default bearer when auth-token is set
+# auth-token = "<token>" # optional
+[mcp.headers]
+# Authorization = "Bearer <token>"
 
 [mcp.servers.local]
 enabled = true # optional, default true
-# endpoint = "http://127.0.0.1:8080/mcp" # optional
+# transport = "http" # optional: http, stdio
+# server-url = "http://127.0.0.1:8080/mcp" # optional, same as endpoint
+# endpoint = "http://127.0.0.1:8080/mcp" # optional (legacy alias)
 # command = "python3" # optional
+# auth-type = "bearer" # optional, default bearer when auth-token is set
+# auth-token = "<token>" # optional
 args = [] # optional
 # timeout-seconds = 10 # optional
 [mcp.servers.local.env]
 # KEY = "VALUE"
+[mcp.servers.local.headers]
+# Authorization = "Bearer <token>"
+# X-API-Key = "<key>"
 
 [console]
 colorful = true # optional, default true

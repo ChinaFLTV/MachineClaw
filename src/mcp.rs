@@ -5,7 +5,10 @@ use std::{
     time::Duration,
 };
 
-use reqwest::blocking::Client;
+use reqwest::{
+    blocking::{Client, Response},
+    header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
+};
 use serde_json::{Value, json};
 
 use crate::{
@@ -16,34 +19,40 @@ use crate::{
     tls::ensure_rustls_crypto_provider,
 };
 
+const DEFAULT_MCP_TIMEOUT_SECONDS: u64 = 10;
+
 #[derive(Debug, Clone)]
 struct NormalizedServerConfig {
     name: String,
+    transport: McpTransportMode,
     endpoint: Option<String>,
     command: Option<String>,
     args: Vec<String>,
     env: BTreeMap<String, String>,
+    headers: BTreeMap<String, String>,
     timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpTransportMode {
+    Stdio,
+    Http,
+}
+
+#[derive(Debug, Clone)]
+struct McpGlobalDefaults {
+    transport: Option<String>,
+    timeout_seconds: Option<u64>,
+    headers: BTreeMap<String, String>,
+    auth_type: Option<String>,
+    auth_token: Option<String>,
 }
 
 pub fn validate_mcp_config(cfg: &McpConfig) -> Result<(), AppError> {
     if !cfg.enabled {
         return Ok(());
     }
-    let servers = normalized_server_configs(cfg);
-    if servers.is_empty() {
-        return Err(AppError::Config(
-            "mcp.enabled=true requires at least one configured server".to_string(),
-        ));
-    }
-    for server in servers {
-        if server.endpoint.is_none() && server.command.is_none() {
-            return Err(AppError::Config(format!(
-                "mcp server '{}' requires endpoint or command",
-                server.name
-            )));
-        }
-    }
+    let _ = normalized_server_configs(cfg)?;
     Ok(())
 }
 
@@ -51,21 +60,36 @@ pub fn mcp_summary(cfg: &McpConfig) -> String {
     if !cfg.enabled {
         return "disabled".to_string();
     }
-    let servers = normalized_server_configs(cfg);
+    let servers = match normalized_server_configs(cfg) {
+        Ok(servers) => servers,
+        Err(err) => {
+            return format!(
+                "enabled, invalid config: {}",
+                mask_sensitive(&err.to_string())
+            );
+        }
+    };
     if servers.is_empty() {
         return "enabled, servers=0".to_string();
     }
     let mut previews = Vec::new();
     for server in servers.iter().take(3) {
-        if let Some(endpoint) = server.endpoint.as_deref() {
-            previews.push(format!("{}:http={}", server.name, mask_sensitive(endpoint)));
-        } else if let Some(command) = server.command.as_deref() {
-            previews.push(format!(
-                "{}:stdio={} args={}",
-                server.name,
-                mask_sensitive(command),
-                server.args.len()
-            ));
+        match server.transport {
+            McpTransportMode::Http => {
+                if let Some(endpoint) = server.endpoint.as_deref() {
+                    previews.push(format!("{}:http={}", server.name, mask_sensitive(endpoint)));
+                }
+            }
+            McpTransportMode::Stdio => {
+                if let Some(command) = server.command.as_deref() {
+                    previews.push(format!(
+                        "{}:stdio={} args={}",
+                        server.name,
+                        mask_sensitive(command),
+                        server.args.len()
+                    ));
+                }
+            }
         }
     }
     if previews.is_empty() {
@@ -121,6 +145,8 @@ struct StdioMcpClient {
 struct HttpMcpClient {
     client: Client,
     endpoint: String,
+    headers: HeaderMap,
+    session_id: Option<String>,
     next_id: u64,
 }
 
@@ -136,11 +162,15 @@ impl McpManager {
             });
         }
 
-        let server_configs = normalized_server_configs(cfg);
+        let server_configs = normalized_server_configs(cfg)?;
         if server_configs.is_empty() {
-            return Err(AppError::Config(
-                "mcp.enabled=true requires at least one configured server".to_string(),
-            ));
+            return Ok(Self {
+                enabled: true,
+                tools: Vec::new(),
+                tool_index: HashMap::new(),
+                connections: Vec::new(),
+                summary: "enabled, servers=0".to_string(),
+            });
         }
 
         let total_servers = server_configs.len();
@@ -329,92 +359,162 @@ impl StdioMcpClient {
 }
 
 impl HttpMcpClient {
-    fn new(endpoint: &str, timeout: Duration) -> Result<Self, AppError> {
+    fn new(
+        endpoint: &str,
+        headers: &BTreeMap<String, String>,
+        timeout: Duration,
+    ) -> Result<Self, AppError> {
         ensure_rustls_crypto_provider();
         let client = Client::builder()
             .timeout(timeout)
             .build()
             .map_err(|err| AppError::Runtime(format!("failed to build MCP http client: {err}")))?;
+        let headers = parse_http_headers(headers)?;
         Ok(Self {
             client,
             endpoint: endpoint.to_string(),
+            headers,
+            session_id: None,
             next_id: 1,
         })
     }
 }
 
-fn normalized_server_configs(cfg: &McpConfig) -> Vec<NormalizedServerConfig> {
+fn normalized_server_configs(cfg: &McpConfig) -> Result<Vec<NormalizedServerConfig>, AppError> {
+    let defaults = McpGlobalDefaults {
+        transport: cfg.transport.clone(),
+        timeout_seconds: cfg.timeout_seconds,
+        headers: cfg.headers.clone(),
+        auth_type: cfg.auth_type.clone(),
+        auth_token: cfg.auth_token.clone(),
+    };
     if !cfg.servers.is_empty() {
         let mut keys = cfg.servers.keys().cloned().collect::<Vec<_>>();
         keys.sort();
-        return keys
-            .into_iter()
-            .filter_map(|name| {
-                let item = cfg.servers.get(&name)?;
-                normalize_server(name, item, cfg.timeout_seconds)
-            })
-            .collect();
+        let mut out = Vec::new();
+        for name in keys {
+            let Some(item) = cfg.servers.get(&name) else {
+                continue;
+            };
+            if let Some(server) = normalize_server(name, item, &defaults)? {
+                out.push(server);
+            }
+        }
+        return Ok(out);
+    }
+
+    let has_legacy_target = non_empty_trimmed(cfg.server_url.as_deref()).is_some()
+        || non_empty_trimmed(cfg.endpoint.as_deref()).is_some()
+        || non_empty_trimmed(cfg.command.as_deref()).is_some();
+    if !has_legacy_target {
+        return Ok(Vec::new());
     }
 
     let legacy = McpServerConfig {
         enabled: true,
+        transport: cfg.transport.clone(),
+        server_url: cfg.server_url.clone(),
         endpoint: cfg.endpoint.clone(),
         command: cfg.command.clone(),
         args: cfg.args.clone(),
         env: cfg.env.clone(),
+        headers: cfg.headers.clone(),
+        auth_type: cfg.auth_type.clone(),
+        auth_token: cfg.auth_token.clone(),
         timeout_seconds: cfg.timeout_seconds,
     };
-    normalize_server("default".to_string(), &legacy, cfg.timeout_seconds)
-        .map(|item| vec![item])
-        .unwrap_or_default()
+    Ok(
+        match normalize_server("root".to_string(), &legacy, &defaults)? {
+            Some(item) => vec![item],
+            None => Vec::new(),
+        },
+    )
 }
 
 fn normalize_server(
     name: String,
     server: &McpServerConfig,
-    global_timeout: Option<u64>,
-) -> Option<NormalizedServerConfig> {
+    defaults: &McpGlobalDefaults,
+) -> Result<Option<NormalizedServerConfig>, AppError> {
     if !server.enabled {
-        return None;
+        return Ok(None);
     }
-    let endpoint = server
-        .endpoint
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
-    let command = server
-        .command
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
-    if endpoint.is_none() && command.is_none() {
-        return None;
+    let endpoint = non_empty_trimmed(server.server_url.as_deref())
+        .or_else(|| non_empty_trimmed(server.endpoint.as_deref()));
+    let command = non_empty_trimmed(server.command.as_deref());
+    let transport = resolve_transport_mode(
+        &name,
+        server
+            .transport
+            .as_deref()
+            .or(defaults.transport.as_deref()),
+        endpoint.is_some(),
+        command.is_some(),
+    )?;
+    let timeout_seconds = server
+        .timeout_seconds
+        .or(defaults.timeout_seconds)
+        .unwrap_or(DEFAULT_MCP_TIMEOUT_SECONDS);
+    if timeout_seconds == 0 {
+        return Err(AppError::Config(format!(
+            "mcp server '{}' timeout-seconds must be greater than 0",
+            name
+        )));
     }
-    let timeout = server.timeout_seconds.or(global_timeout).unwrap_or(10);
-    Some(NormalizedServerConfig {
+    let mut headers = defaults.headers.clone();
+    headers.extend(server.headers.clone());
+    if transport == McpTransportMode::Http {
+        apply_auth_to_headers(
+            &name,
+            &mut headers,
+            server
+                .auth_type
+                .as_deref()
+                .or(defaults.auth_type.as_deref()),
+            server
+                .auth_token
+                .as_deref()
+                .or(defaults.auth_token.as_deref()),
+        )?;
+    }
+    Ok(Some(NormalizedServerConfig {
         name,
+        transport,
         endpoint,
         command,
         args: server.args.clone(),
         env: server.env.clone(),
-        timeout: Duration::from_secs(timeout),
-    })
+        headers,
+        timeout: Duration::from_secs(timeout_seconds),
+    }))
 }
 
 fn connect_one_server(
     server: &NormalizedServerConfig,
 ) -> Result<(McpTransport, Value, Value), AppError> {
-    let mut transport = if let Some(command) = server.command.as_deref() {
-        McpTransport::Stdio(StdioMcpClient::start(command, &server.args, &server.env)?)
-    } else if let Some(endpoint) = server.endpoint.as_deref() {
-        McpTransport::Http(HttpMcpClient::new(endpoint, server.timeout)?)
-    } else {
-        return Err(AppError::Config(format!(
-            "mcp server '{}' requires endpoint or command",
-            server.name
-        )));
+    let mut transport = match server.transport {
+        McpTransportMode::Stdio => {
+            let Some(command) = server.command.as_deref() else {
+                return Err(AppError::Config(format!(
+                    "mcp server '{}' transport=stdio requires command",
+                    server.name
+                )));
+            };
+            McpTransport::Stdio(StdioMcpClient::start(command, &server.args, &server.env)?)
+        }
+        McpTransportMode::Http => {
+            let Some(endpoint) = server.endpoint.as_deref() else {
+                return Err(AppError::Config(format!(
+                    "mcp server '{}' transport=http requires endpoint or server-url",
+                    server.name
+                )));
+            };
+            McpTransport::Http(HttpMcpClient::new(
+                endpoint,
+                &server.headers,
+                server.timeout,
+            )?)
+        }
     };
 
     let initialize_result = request_mcp(
@@ -457,23 +557,8 @@ fn notify_mcp(transport: &mut McpTransport, method: &str, params: Value) -> Resu
                 "method": method,
                 "params": params
             });
-            let resp = client
-                .client
-                .post(&client.endpoint)
-                .json(&body)
-                .send()
-                .map_err(|err| AppError::Runtime(format!("MCP http notification failed: {err}")))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp
-                    .text()
-                    .unwrap_or_else(|_| "<unreadable body>".to_string());
-                return Err(AppError::Runtime(format!(
-                    "MCP http notification failed: status={}, body={}",
-                    status,
-                    mask_sensitive(&body)
-                )));
-            }
+            let resp = send_http_request(client, &body, "notification", false)?;
+            update_http_session_id(client, resp.headers());
             Ok(())
         }
     }
@@ -540,27 +625,10 @@ fn http_request(
         "method": method,
         "params": params
     });
-    let resp = client
-        .client
-        .post(&client.endpoint)
-        .json(&payload)
-        .send()
-        .map_err(|err| AppError::Runtime(format!("MCP http request failed: {err}")));
-    let resp = resp?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp
-            .text()
-            .unwrap_or_else(|_| "<unreadable body>".to_string());
-        return Err(AppError::Runtime(format!(
-            "MCP http request failed: status={}, body={}",
-            status,
-            mask_sensitive(&body)
-        )));
-    }
-    let body: Value = resp
-        .json()
-        .map_err(|err| AppError::Runtime(format!("failed to parse MCP response: {err}")))?;
+    let resp = send_http_request(client, &payload, method, true)?;
+    let headers = resp.headers().clone();
+    let body = parse_mcp_http_response(resp)?;
+    update_http_session_id(client, &headers);
     if let Some(err) = body.get("error") {
         return Err(AppError::Runtime(format!(
             "MCP returned error for method {}: {}",
@@ -569,6 +637,118 @@ fn http_request(
         )));
     }
     Ok(body.get("result").cloned().unwrap_or_else(|| json!({})))
+}
+
+fn send_http_request(
+    client: &HttpMcpClient,
+    payload: &Value,
+    method: &str,
+    expect_response: bool,
+) -> Result<Response, AppError> {
+    let mut request_builder = client.client.post(&client.endpoint).json(payload);
+    request_builder = request_builder.headers(client.headers.clone());
+    if let Some(session_id) = client.session_id.as_deref() {
+        request_builder = request_builder.header("Mcp-Session-Id", session_id);
+    }
+    let response = request_builder
+        .send()
+        .map_err(|err| AppError::Runtime(format!("MCP http request failed: {err}")))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .unwrap_or_else(|_| "<unreadable body>".to_string());
+        return Err(AppError::Runtime(format!(
+            "MCP http request failed: status={}, body={}, method={}",
+            status,
+            mask_sensitive(&trim_text_preview(&body, 1200)),
+            method
+        )));
+    }
+    if !expect_response {
+        return Ok(response);
+    }
+    Ok(response)
+}
+
+fn update_http_session_id(client: &mut HttpMcpClient, headers: &HeaderMap) {
+    if let Some(value) = headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        client.session_id = Some(value.to_string());
+    }
+}
+
+fn parse_mcp_http_response(resp: Response) -> Result<Value, AppError> {
+    let content_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let body = resp
+        .text()
+        .map_err(|err| AppError::Runtime(format!("failed to read MCP response body: {err}")))?;
+    if body.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    if content_type.contains("text/event-stream") {
+        return parse_sse_jsonrpc_payload(&body);
+    }
+    serde_json::from_str::<Value>(&body)
+        .map_err(|err| AppError::Runtime(format!("failed to parse MCP response: {err}")))
+}
+
+fn parse_sse_jsonrpc_payload(raw: &str) -> Result<Value, AppError> {
+    let mut data_lines: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed.is_empty() {
+            if let Some(value) = parse_sse_data_block(&data_lines) {
+                return Ok(value);
+            }
+            data_lines.clear();
+            continue;
+        }
+        if trimmed.starts_with(':') {
+            continue;
+        }
+        if let Some(data) = trimmed.strip_prefix("data:") {
+            data_lines.push(data.trim_start().to_string());
+        }
+    }
+    if let Some(value) = parse_sse_data_block(&data_lines) {
+        return Ok(value);
+    }
+    Err(AppError::Runtime(
+        "failed to parse MCP SSE response: no valid JSON-RPC payload".to_string(),
+    ))
+}
+
+fn parse_sse_data_block(data_lines: &[String]) -> Option<Value> {
+    if data_lines.is_empty() {
+        return None;
+    }
+    let payload = data_lines.join("\n");
+    let trimmed = payload.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return None;
+    }
+    let parsed = serde_json::from_str::<Value>(trimmed).ok()?;
+    if parsed.get("result").is_some() || parsed.get("error").is_some() {
+        return Some(parsed);
+    }
+    let nested = parsed
+        .get("data")
+        .and_then(|value| value.as_object())
+        .and_then(|_| parsed.get("data").cloned())?;
+    if nested.get("result").is_some() || nested.get("error").is_some() {
+        return Some(nested);
+    }
+    None
 }
 
 fn write_mcp_frame(writer: &mut ChildStdin, payload: &Value) -> Result<(), AppError> {
@@ -616,6 +796,121 @@ fn read_mcp_frame(reader: &mut BufReader<ChildStdout>) -> Result<Value, AppError
     let value = serde_json::from_slice::<Value>(&body)
         .map_err(|err| AppError::Runtime(format!("failed to parse MCP json: {err}")))?;
     Ok(value)
+}
+
+fn non_empty_trimmed(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn resolve_transport_mode(
+    server_name: &str,
+    transport_raw: Option<&str>,
+    has_endpoint: bool,
+    has_command: bool,
+) -> Result<McpTransportMode, AppError> {
+    if let Some(raw) = non_empty_trimmed(transport_raw) {
+        let normalized = raw.to_ascii_lowercase();
+        return match normalized.as_str() {
+            "http" => {
+                if has_endpoint {
+                    Ok(McpTransportMode::Http)
+                } else {
+                    Err(AppError::Config(format!(
+                        "mcp server '{}' transport=http requires endpoint or server-url",
+                        server_name
+                    )))
+                }
+            }
+            "stdio" => {
+                if has_command {
+                    Ok(McpTransportMode::Stdio)
+                } else {
+                    Err(AppError::Config(format!(
+                        "mcp server '{}' transport=stdio requires command",
+                        server_name
+                    )))
+                }
+            }
+            _ => Err(AppError::Config(format!(
+                "mcp server '{}' has invalid transport '{}', expected one of: http, stdio",
+                server_name, raw
+            ))),
+        };
+    }
+    if has_command {
+        return Ok(McpTransportMode::Stdio);
+    }
+    if has_endpoint {
+        return Ok(McpTransportMode::Http);
+    }
+    Err(AppError::Config(format!(
+        "mcp server '{}' requires endpoint or command",
+        server_name
+    )))
+}
+
+fn apply_auth_to_headers(
+    server_name: &str,
+    headers: &mut BTreeMap<String, String>,
+    auth_type: Option<&str>,
+    auth_token: Option<&str>,
+) -> Result<(), AppError> {
+    let normalized_auth_type = non_empty_trimmed(auth_type).map(|value| value.to_ascii_lowercase());
+    if let Some(auth_type_value) = normalized_auth_type.as_deref()
+        && auth_type_value != "bearer"
+    {
+        return Err(AppError::Config(format!(
+            "mcp server '{}' has invalid auth-type '{}', expected: bearer",
+            server_name, auth_type_value
+        )));
+    }
+    let token = non_empty_trimmed(auth_token);
+    if token.is_none() {
+        return Ok(());
+    }
+    if headers
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("authorization"))
+    {
+        return Ok(());
+    }
+    let token = token.unwrap_or_default();
+    let auth_value = if token.to_ascii_lowercase().starts_with("bearer ") {
+        token
+    } else {
+        format!("Bearer {token}")
+    };
+    headers.insert("Authorization".to_string(), auth_value);
+    Ok(())
+}
+
+fn parse_http_headers(raw_headers: &BTreeMap<String, String>) -> Result<HeaderMap, AppError> {
+    let mut headers = HeaderMap::new();
+    for (raw_key, raw_value) in raw_headers {
+        let key = raw_key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value = raw_value.trim();
+        let header_name = HeaderName::from_bytes(key.as_bytes())
+            .map_err(|err| AppError::Config(format!("invalid MCP header name '{}': {err}", key)))?;
+        let header_value = HeaderValue::from_str(value).map_err(|err| {
+            AppError::Config(format!("invalid MCP header value for '{}': {err}", key))
+        })?;
+        headers.insert(header_name, header_value);
+    }
+    if !headers.contains_key(ACCEPT) {
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/json, text/event-stream"),
+        );
+    }
+    if !headers.contains_key(CONTENT_TYPE) {
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
+    Ok(headers)
 }
 
 fn extract_tools(server_name: &str, result: &Value) -> Vec<McpToolInfo> {
@@ -677,7 +972,11 @@ fn sanitize_tool_name(name: &str) -> String {
     while out.contains("__") {
         out = out.replace("__", "_");
     }
-    out.trim_matches('_').to_string()
+    let normalized = out.trim_matches('_').to_string();
+    if normalized.is_empty() {
+        return "tool".to_string();
+    }
+    normalized
 }
 
 fn parse_mcp_tool_arguments(raw_arguments: &str) -> Result<Value, AppError> {
@@ -685,13 +984,19 @@ fn parse_mcp_tool_arguments(raw_arguments: &str) -> Result<Value, AppError> {
     if trimmed.is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_str::<Value>(trimmed).map_err(|err| {
+    let parsed = serde_json::from_str::<Value>(trimmed).map_err(|err| {
         AppError::Runtime(format!(
             "invalid MCP tool arguments JSON: {}, raw={}",
             err,
             mask_sensitive(&trim_text_preview(trimmed, 240))
         ))
-    })
+    })?;
+    if !parsed.is_object() {
+        return Err(AppError::Runtime(
+            "invalid MCP tool arguments JSON: expected a JSON object".to_string(),
+        ));
+    }
+    Ok(parsed)
 }
 
 fn trim_text_preview(text: &str, max_chars: usize) -> String {
@@ -729,7 +1034,13 @@ fn extract_tool_call_text(result: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_mcp_tool_arguments;
+    use std::collections::BTreeMap;
+
+    use super::{
+        McpGlobalDefaults, McpManager, McpTransportMode, mcp_summary, non_empty_trimmed,
+        normalize_server, parse_mcp_tool_arguments, resolve_transport_mode, validate_mcp_config,
+    };
+    use crate::config::{McpConfig, McpServerConfig};
 
     #[test]
     fn parse_mcp_tool_arguments_accepts_empty_input() {
@@ -741,5 +1052,140 @@ mod tests {
     fn parse_mcp_tool_arguments_rejects_invalid_json() {
         let err = parse_mcp_tool_arguments("{not-json").expect_err("invalid json must fail");
         assert!(err.to_string().contains("invalid MCP tool arguments JSON"));
+    }
+
+    #[test]
+    fn parse_mcp_tool_arguments_rejects_non_object_json() {
+        let err = parse_mcp_tool_arguments("[1,2,3]").expect_err("non-object json must fail");
+        assert!(
+            err.to_string()
+                .contains("invalid MCP tool arguments JSON: expected a JSON object")
+        );
+    }
+
+    #[test]
+    fn normalize_server_supports_server_url_and_bearer_auth() {
+        let server = McpServerConfig {
+            enabled: true,
+            transport: Some("http".to_string()),
+            server_url: Some("https://example.com/mcp".to_string()),
+            endpoint: None,
+            command: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            headers: BTreeMap::from([("X-Trace-Id".to_string(), "abc".to_string())]),
+            auth_type: None,
+            auth_token: Some("token-value".to_string()),
+            timeout_seconds: Some(12),
+        };
+        let defaults = McpGlobalDefaults {
+            transport: None,
+            timeout_seconds: None,
+            headers: BTreeMap::new(),
+            auth_type: None,
+            auth_token: None,
+        };
+
+        let normalized = normalize_server("remote".to_string(), &server, &defaults)
+            .expect("normalize should pass")
+            .expect("server should stay enabled");
+        assert_eq!(normalized.transport, McpTransportMode::Http);
+        assert_eq!(
+            normalized.endpoint.as_deref(),
+            Some("https://example.com/mcp")
+        );
+        assert_eq!(
+            normalized.headers.get("Authorization").map(String::as_str),
+            Some("Bearer token-value")
+        );
+        assert_eq!(
+            normalized.headers.get("X-Trace-Id").map(String::as_str),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn resolve_transport_mode_prefers_stdio_when_both_fields_are_present() {
+        let transport = resolve_transport_mode("srv", None, true, true).expect("transport");
+        assert_eq!(transport, McpTransportMode::Stdio);
+    }
+
+    #[test]
+    fn validate_mcp_config_rejects_invalid_transport_value() {
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "bad".to_string(),
+            McpServerConfig {
+                enabled: true,
+                transport: Some("stream".to_string()),
+                server_url: Some("https://example.com/mcp".to_string()),
+                endpoint: None,
+                command: None,
+                args: vec![],
+                env: BTreeMap::new(),
+                headers: BTreeMap::new(),
+                auth_type: None,
+                auth_token: None,
+                timeout_seconds: None,
+            },
+        );
+        let cfg = McpConfig {
+            enabled: true,
+            transport: None,
+            server_url: None,
+            endpoint: None,
+            command: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            auth_type: None,
+            auth_token: None,
+            timeout_seconds: None,
+            servers,
+        };
+        let err = validate_mcp_config(&cfg).expect_err("invalid transport must fail");
+        assert!(err.to_string().contains("invalid transport"));
+    }
+
+    #[test]
+    fn validate_mcp_config_allows_enabled_without_any_server() {
+        let cfg = McpConfig {
+            enabled: true,
+            ..McpConfig::default()
+        };
+        validate_mcp_config(&cfg).expect("enabled mcp without servers should be allowed");
+        assert_eq!(mcp_summary(&cfg), "enabled, servers=0");
+    }
+
+    #[test]
+    fn connect_allows_enabled_without_any_server() {
+        let cfg = McpConfig {
+            enabled: true,
+            ..McpConfig::default()
+        };
+        let manager = McpManager::connect(&cfg).expect("connect should allow empty mcp server set");
+        assert_eq!(manager.summary(), "enabled, servers=0");
+        assert!(manager.external_tool_definitions().is_empty());
+    }
+
+    #[test]
+    fn mcp_summary_uses_root_name_for_legacy_single_server() {
+        let cfg = McpConfig {
+            enabled: true,
+            endpoint: Some("http://127.0.0.1:8080/mcp".to_string()),
+            ..McpConfig::default()
+        };
+        let summary = mcp_summary(&cfg);
+        assert!(summary.contains("root:http="));
+        assert!(!summary.contains("default:http="));
+    }
+
+    #[test]
+    fn non_empty_trimmed_skips_blank_strings() {
+        assert_eq!(non_empty_trimmed(Some("  ")), None);
+        assert_eq!(
+            non_empty_trimmed(Some(" value ")),
+            Some("value".to_string())
+        );
     }
 }

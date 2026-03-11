@@ -212,7 +212,7 @@ fn is_allowed_key(key: &str) -> bool {
     if is_known_config_key(key) {
         return true;
     }
-    key.starts_with("mcp.env.")
+    key.starts_with("mcp.env.") || key.starts_with("mcp.headers.")
 }
 
 fn item_matches_literal(item: &Item, literal: &str) -> bool {

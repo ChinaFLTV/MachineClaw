@@ -335,8 +335,33 @@ fn sanitize_config_for_display(cfg: &AppConfig) -> AppConfig {
     let mut safe = cfg.clone();
     safe.ai.token = sanitize_secret_value(&safe.ai.token);
     sanitize_map_values(&mut safe.mcp.env);
+    sanitize_map_values(&mut safe.mcp.headers);
+    if !safe
+        .mcp
+        .auth_token
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        safe.mcp.auth_token = Some(sanitize_secret_value(
+            safe.mcp.auth_token.as_deref().unwrap_or_default(),
+        ));
+    }
     for server in safe.mcp.servers.values_mut() {
         sanitize_map_values(&mut server.env);
+        sanitize_map_values(&mut server.headers);
+        if !server
+            .auth_token
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            server.auth_token = Some(sanitize_secret_value(
+                server.auth_token.as_deref().unwrap_or_default(),
+            ));
+        }
     }
     safe
 }

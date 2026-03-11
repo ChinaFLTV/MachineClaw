@@ -687,10 +687,10 @@ pub fn chat_tag_mcp() -> &'static str {
     match current_language() {
         Language::ZhCn => "[MCP]",
         Language::ZhTw => "[MCP]",
-        Language::Fr => "[mcp]",
-        Language::De => "[mcp]",
+        Language::Fr => "[MCP]",
+        Language::De => "[MCP]",
         Language::Ja => "[MCP]",
-        Language::En => "[mcp]",
+        Language::En => "[MCP]",
     }
 }
 
@@ -1951,6 +1951,40 @@ pub fn chat_mcp_service_request_started(server: &str, tool: &str) -> String {
     }
 }
 
+pub fn chat_mcp_enabled(count: usize) -> String {
+    let count_fmt = human_count_u128(count as u128);
+    match current_language() {
+        Language::ZhCn => format!("已启用 MCP 服务，可用工具项 {count_fmt} 个。"),
+        Language::ZhTw => format!("已啟用 MCP 服務，可用工具項 {count_fmt} 個。"),
+        Language::Fr => format!("Services MCP activés, outils disponibles: {count_fmt}."),
+        Language::De => format!("MCP-Dienste aktiviert, verfügbare Tools: {count_fmt}."),
+        Language::Ja => format!("MCP サービスを有効化しました。利用可能ツール: {count_fmt}。"),
+        Language::En => format!("MCP services enabled, available tools: {count_fmt}."),
+    }
+}
+
+pub fn chat_mcp_prepare_started(count: usize) -> String {
+    let count_fmt = human_count_u128(count as u128);
+    match current_language() {
+        Language::ZhCn => format!("本轮将加载 MCP 上下文，可用项 {count_fmt} 个。"),
+        Language::ZhTw => format!("本輪將載入 MCP 上下文，可用項 {count_fmt} 個。"),
+        Language::Fr => {
+            format!("Ce tour chargera le contexte MCP, entrées disponibles: {count_fmt}.")
+        }
+        Language::De => {
+            format!(
+                "In dieser Runde wird der MCP-Kontext geladen, verfügbare Einträge: {count_fmt}."
+            )
+        }
+        Language::Ja => {
+            format!("このラウンドで MCP コンテキストを読み込みます。利用可能項目: {count_fmt}。")
+        }
+        Language::En => {
+            format!("This round will load MCP context, available entries: {count_fmt}.")
+        }
+    }
+}
+
 pub fn chat_round_received(round: usize, tool_calls: usize) -> String {
     let round_fmt = human_count_u128(round as u128);
     let tool_calls_fmt = human_count_u128(tool_calls as u128);
@@ -2826,6 +2860,72 @@ fn localize_detail(detail: &str) -> String {
                     "MCP 設定が不完全です（endpoint または command が不足）: {}",
                     detail
                 ),
+                Language::En => detail.to_string(),
+            }
+        }
+        _ if detail.starts_with("mcp server '")
+            && detail.ends_with("' transport=http requires endpoint or server-url") =>
+        {
+            match current_language() {
+                Language::ZhCn => format!("MCP HTTP 服务缺少 endpoint/server-url: {}", detail),
+                Language::ZhTw => format!("MCP HTTP 服務缺少 endpoint/server-url: {}", detail),
+                Language::Fr => format!("Serveur MCP HTTP sans endpoint/server-url: {}", detail),
+                Language::De => {
+                    format!("MCP-HTTP-Server ohne endpoint/server-url konfiguriert: {}", detail)
+                }
+                Language::Ja => {
+                    format!("MCP HTTP サーバーに endpoint/server-url が不足しています: {}", detail)
+                }
+                Language::En => detail.to_string(),
+            }
+        }
+        _ if detail.starts_with("mcp server '")
+            && detail.ends_with("' transport=stdio requires command") =>
+        {
+            match current_language() {
+                Language::ZhCn => format!("MCP stdio 服务缺少 command: {}", detail),
+                Language::ZhTw => format!("MCP stdio 服務缺少 command: {}", detail),
+                Language::Fr => format!("Serveur MCP stdio sans command: {}", detail),
+                Language::De => format!("MCP-stdio-Server ohne command: {}", detail),
+                Language::Ja => format!("MCP stdio サーバーに command が不足しています: {}", detail),
+                Language::En => detail.to_string(),
+            }
+        }
+        _ if detail.starts_with("mcp server '")
+            && detail.contains(" has invalid transport ")
+            && detail.ends_with(", expected one of: http, stdio") =>
+        {
+            match current_language() {
+                Language::ZhCn => format!("MCP transport 无效，仅支持 http/stdio: {}", detail),
+                Language::ZhTw => format!("MCP transport 無效，僅支援 http/stdio: {}", detail),
+                Language::Fr => format!("transport MCP invalide, seulement http/stdio: {}", detail),
+                Language::De => format!("Ungültiger MCP-Transport, nur http/stdio erlaubt: {}", detail),
+                Language::Ja => format!("MCP transport が不正です。http/stdio のみ対応: {}", detail),
+                Language::En => detail.to_string(),
+            }
+        }
+        _ if detail.starts_with("mcp server '")
+            && detail.contains(" timeout-seconds must be greater than 0") =>
+        {
+            match current_language() {
+                Language::ZhCn => format!("MCP timeout-seconds 必须大于 0: {}", detail),
+                Language::ZhTw => format!("MCP timeout-seconds 必須大於 0: {}", detail),
+                Language::Fr => format!("MCP timeout-seconds doit être > 0: {}", detail),
+                Language::De => format!("MCP timeout-seconds muss > 0 sein: {}", detail),
+                Language::Ja => format!("MCP timeout-seconds は 0 より大きい必要があります: {}", detail),
+                Language::En => detail.to_string(),
+            }
+        }
+        _ if detail.starts_with("mcp server '")
+            && detail.contains(" has invalid auth-type ")
+            && detail.ends_with(", expected: bearer") =>
+        {
+            match current_language() {
+                Language::ZhCn => format!("MCP auth-type 无效，仅支持 bearer: {}", detail),
+                Language::ZhTw => format!("MCP auth-type 無效，僅支援 bearer: {}", detail),
+                Language::Fr => format!("auth-type MCP invalide, seulement bearer: {}", detail),
+                Language::De => format!("Ungültiger MCP auth-type, nur bearer erlaubt: {}", detail),
+                Language::Ja => format!("MCP auth-type が不正です。bearer のみ対応: {}", detail),
                 Language::En => detail.to_string(),
             }
         }

@@ -178,6 +178,25 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 - `[log]`：日志目录、滚动策略、保留时长
 - `[session]`：上下文窗口相关配置
 
+### MCP 配置建议
+
+- HTTP 连接建议使用 `server-url = ".../mcp"`（优先 `/mcp`；若服务仅暴露旧 `/sse`，建议在服务侧开启 `/mcp` 兼容入口）。
+- `transport` 支持 `http` / `stdio`；不配置时会按 `command` 或 `endpoint/server-url` 自动推断。
+- 鉴权可用 `auth-type` + `auth-token`，或在 `headers` 中显式配置 `Authorization`。
+
+```toml
+[mcp]
+enabled = true
+
+[mcp.servers.deepwiki]
+transport = "http"
+server-url = "https://mcp.deepwiki.com/mcp"
+auth-type = "bearer"
+auth-token = "<token>"
+[mcp.servers.deepwiki.headers]
+X-Trace-Id = "machineclaw"
+```
+
 ## 命令说明
 
 ```bash
