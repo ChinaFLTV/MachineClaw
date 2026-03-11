@@ -75,7 +75,14 @@ sudo ./target/release/MachineClaw chat --conf=./sample/claw-sample.toml
 
 ## 跨平台构建可执行文件
 
-### 方式一：使用 Rust 原生 target（推荐先用这个）
+### 方式一：原生构建（同平台）
+
+```bash
+# 当前平台直接构建
+cargo build --release
+```
+
+### 方式二：Rust target 交叉构建（推荐）
 
 先安装目标平台：
 
@@ -90,14 +97,11 @@ rustup target add aarch64-apple-darwin
 按目标构建：
 
 ```bash
-# Linux (musl, 静态链接更友好)
+# Linux (musl) - 仓库已内置 zig 交叉编译脚本
 cargo build --release --target x86_64-unknown-linux-musl
 
 # Linux (gnu)
 cargo build --release --target x86_64-unknown-linux-gnu
-
-# Windows (MSVC)
-cargo build --release --target x86_64-pc-windows-msvc
 
 # macOS Intel
 cargo build --release --target x86_64-apple-darwin
@@ -106,29 +110,24 @@ cargo build --release --target x86_64-apple-darwin
 cargo build --release --target aarch64-apple-darwin
 ```
 
-注意：
+Windows 额外说明：
 
-- `x86_64-unknown-linux-musl` 目标在 macOS 上通常需要额外的 C 交叉编译器。
-- 若出现 `failed to find tool "x86_64-linux-musl-gcc"`，请改用下方 `cross` 或 `cargo-zigbuild` 方式构建。
-
-Windows 平台常用命令：
-
+- 在 Windows 主机本地构建 MSVC：
 ```bash
-rustup target add x86_64-pc-windows-msvc
 cargo build --release --target x86_64-pc-windows-msvc
 ```
-
-macOS 平台常用命令：
-
+- 在 macOS/Linux 直接执行 `cargo build --target x86_64-pc-windows-msvc` 常见失败原因是缺少 MSVC SDK/`link.exe`。
+- 若必须在 macOS/Linux 产出 `x86_64-pc-windows-msvc`，请使用 `cargo-xwin`：
 ```bash
-# Intel Mac
-rustup target add x86_64-apple-darwin
-cargo build --release --target x86_64-apple-darwin
-
-# Apple Silicon Mac
-rustup target add aarch64-apple-darwin
-cargo build --release --target aarch64-apple-darwin
+cargo install cargo-xwin
+cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
+- macOS 上若出现 `failed to find tool "llvm-lib"`，请先安装 LLVM 并补充 PATH：
+```bash
+brew install llvm
+export PATH="$(brew --prefix llvm)/bin:$PATH"
+```
+- `cargo-xwin` 首次执行会下载 MSVC CRT/SDK，耗时通常较长。
 
 产物路径格式：
 
@@ -137,7 +136,7 @@ target/<target-triple>/release/MachineClaw
 target/<target-triple>/release/MachineClaw.exe   # Windows
 ```
 
-### 方式二：使用 cross（依赖 Docker）
+### 方式三：使用 cross（依赖 Docker）
 
 ```bash
 cargo install cross --git https://github.com/cross-rs/cross
@@ -149,7 +148,7 @@ cross build --release --target x86_64-unknown-linux-musl
 - 需要 Docker Desktop / Docker Engine 正常运行。
 - 如果出现 `failed to connect to the docker API`，先启动 Docker 再重试。
 
-### 方式三：使用 cargo-zigbuild（不依赖 Docker）
+### 方式四：使用 cargo-zigbuild（不依赖 Docker）
 
 ```bash
 cargo install cargo-zigbuild

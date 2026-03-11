@@ -20,7 +20,7 @@ use serde_json::json;
 
 use crate::{
     config::AiConfig, error::AppError, i18n, logging, mask::mask_sensitive,
-    shell::take_interactive_input_refresh_hint,
+    shell::take_interactive_input_refresh_hint, tls::ensure_rustls_crypto_provider,
 };
 
 const MODEL_PRICE_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -145,7 +145,10 @@ impl Clone for AiClient {
             .client
             .read()
             .map(|guard| guard.clone())
-            .unwrap_or_else(|_| Client::builder().build().expect("fallback AI client clone"));
+            .unwrap_or_else(|_| {
+                ensure_rustls_crypto_provider();
+                Client::builder().build().expect("fallback AI client clone")
+            });
         let cached_prices = self
             .runtime_model_prices
             .read()
@@ -345,6 +348,7 @@ struct PersistedModelPriceEntry {
 
 impl AiClient {
     fn build_http_client() -> Result<Client, AppError> {
+        ensure_rustls_crypto_provider();
         Client::builder()
             .connect_timeout(Duration::from_secs(AI_HTTP_CONNECT_TIMEOUT_SECS))
             .timeout(Duration::from_secs(AI_HTTP_REQUEST_TIMEOUT_SECS))
@@ -3074,9 +3078,10 @@ mod tests {
         should_fallback_to_non_streaming, should_refresh_http_client_after_reqwest_error,
         should_retry_without_reasoning_content, strip_reasoning_content_from_request, with_cost,
     };
-    use crate::error::AppError;
+    use crate::{error::AppError, tls::ensure_rustls_crypto_provider};
 
     fn test_ai_client() -> AiClient {
+        ensure_rustls_crypto_provider();
         AiClient {
             client: RwLock::new(Client::builder().build().expect("test client")),
             base_url: "https://example.com/chat/completions".to_string(),
@@ -3501,6 +3506,7 @@ mod tests {
 
     #[test]
     fn refreshes_http_client_for_transient_transport_errors() {
+        ensure_rustls_crypto_provider();
         let connect_err = reqwest::blocking::Client::builder()
             .build()
             .expect("test client")
@@ -3512,6 +3518,7 @@ mod tests {
 
     #[test]
     fn does_not_refresh_http_client_for_builder_validation_errors() {
+        ensure_rustls_crypto_provider();
         let invalid_url_err = reqwest::blocking::Client::builder()
             .build()
             .expect("test client")

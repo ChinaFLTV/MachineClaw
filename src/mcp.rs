@@ -13,6 +13,7 @@ use crate::{
     config::{McpConfig, McpServerConfig},
     error::AppError,
     mask::mask_sensitive,
+    tls::ensure_rustls_crypto_provider,
 };
 
 #[derive(Debug, Clone)]
@@ -329,6 +330,7 @@ impl StdioMcpClient {
 
 impl HttpMcpClient {
     fn new(endpoint: &str, timeout: Duration) -> Result<Self, AppError> {
+        ensure_rustls_crypto_provider();
         let client = Client::builder()
             .timeout(timeout)
             .build()

@@ -400,5 +400,7 @@ fn ensure_executable_permission(path: &Path) -> Result<(), AppError> {
             })?;
         }
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }

@@ -15,6 +15,7 @@ mod shell;
 mod skills;
 mod snapshot;
 mod test_action;
+mod tls;
 
 use std::{
     io::{self, IsTerminal, Write},
