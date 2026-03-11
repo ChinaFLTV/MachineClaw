@@ -462,7 +462,7 @@ pub fn config_template_example() -> &'static str {
     r#"# MachineClaw Config Template
 
 ## Usage
-- Copy this template into `claw-sample.toml`.
+- Copy this template into `claw.toml` (default), or keep it as `claw-sample.toml` and pass `--conf`.
 - Keep required keys complete: `ai.base-url`, `ai.token`, `ai.model`.
 - Remove comments if you want a cleaner production config.
 
@@ -722,7 +722,7 @@ pub fn resolve_config_path(conf: Option<PathBuf>) -> Result<PathBuf, AppError> {
     let exe_dir = exe
         .parent()
         .ok_or_else(|| AppError::Runtime("cannot locate executable directory".to_string()))?;
-    Ok(exe_dir.join("claw-sample.toml"))
+    Ok(exe_dir.join("claw.toml"))
 }
 
 pub fn resolve_path(path: PathBuf) -> Result<PathBuf, AppError> {
@@ -990,13 +990,25 @@ fn has_file_extension(file_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_chat_model_price_check_mode;
+    use super::{normalize_chat_model_price_check_mode, resolve_config_path};
 
     #[test]
     fn normalize_model_price_check_mode_accepts_sync_async_and_rsync_alias() {
         assert_eq!(normalize_chat_model_price_check_mode("sync"), "sync");
         assert_eq!(normalize_chat_model_price_check_mode("async"), "async");
         assert_eq!(normalize_chat_model_price_check_mode("rsync"), "sync");
-        assert_eq!(normalize_chat_model_price_check_mode("invalid"), "__invalid__");
+        assert_eq!(
+            normalize_chat_model_price_check_mode("invalid"),
+            "__invalid__"
+        );
+    }
+
+    #[test]
+    fn resolve_default_config_file_name_is_claw_toml() {
+        let path = resolve_config_path(None).expect("default config path should resolve");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("claw.toml")
+        );
     }
 }

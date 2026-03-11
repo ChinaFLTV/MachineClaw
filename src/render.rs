@@ -342,11 +342,11 @@ impl ChatStreamPrinter {
         if self.active_block.is_none() {
             return Ok(());
         }
-        if !self.active_line_raw.is_empty() {
-            if let Some(block) = self.active_block {
-                self.flush_stable_prefix(block)?;
-                self.flush_final_line_fragment(block, &self.active_line_raw.clone())?;
-            }
+        if !self.active_line_raw.is_empty()
+            && let Some(block) = self.active_block
+        {
+            self.flush_stable_prefix(block)?;
+            self.flush_final_line_fragment(block, &self.active_line_raw.clone())?;
         }
         if self.line_has_output {
             let mut stdout = std::io::stdout();
@@ -393,11 +393,12 @@ impl ChatStreamPrinter {
             }
             if self.line_has_output || preserve_blank_line || !rendered_fence.is_empty() {
                 let mut stdout = std::io::stdout();
-                writeln!(stdout)
-                    .map_err(|err| AppError::Command(format!("failed to commit code fence line: {err}")))?;
-                stdout
-                    .flush()
-                    .map_err(|err| AppError::Command(format!("failed to flush code fence line: {err}")))?;
+                writeln!(stdout).map_err(|err| {
+                    AppError::Command(format!("failed to commit code fence line: {err}"))
+                })?;
+                stdout.flush().map_err(|err| {
+                    AppError::Command(format!("failed to flush code fence line: {err}"))
+                })?;
             }
             self.in_code_block = !self.in_code_block;
             self.active_line_raw.clear();
@@ -411,11 +412,12 @@ impl ChatStreamPrinter {
         }
         if self.line_has_output || preserve_blank_line {
             let mut stdout = std::io::stdout();
-            writeln!(stdout)
-                .map_err(|err| AppError::Command(format!("failed to commit streaming line: {err}")))?;
-            stdout
-                .flush()
-                .map_err(|err| AppError::Command(format!("failed to flush committed line: {err}")))?;
+            writeln!(stdout).map_err(|err| {
+                AppError::Command(format!("failed to commit streaming line: {err}"))
+            })?;
+            stdout.flush().map_err(|err| {
+                AppError::Command(format!("failed to flush committed line: {err}"))
+            })?;
         }
         self.active_line_raw.clear();
         self.line_has_output = false;
@@ -523,7 +525,10 @@ enum MarkdownListKind {
 
 fn render_markdown_blocks(text: &str, colorful: bool) -> String {
     let expanded_lines = expand_compact_markdown_text(text);
-    let line_refs = expanded_lines.iter().map(String::as_str).collect::<Vec<_>>();
+    let line_refs = expanded_lines
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     let mut lines = Vec::new();
     let mut in_code_block = false;
     let mut idx = 0usize;
@@ -620,7 +625,10 @@ fn render_markdown_structured_line(line: &str, colorful: bool) -> String {
         );
     }
     if is_horizontal_rule(trimmed) {
-        return format!("{block_prefix}{nested_indent}{}", render_horizontal_rule(colorful));
+        return format!(
+            "{block_prefix}{nested_indent}{}",
+            render_horizontal_rule(colorful)
+        );
     }
     if let Some((kind, marker, content)) = parse_list_line(trimmed) {
         return render_list_line(
@@ -1264,6 +1272,7 @@ fn find_stream_stable_prefix_len(text: &str) -> usize {
     stable_end
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_inline_state_closed(
     in_inline_code: bool,
     in_bold_star: bool,
@@ -1403,9 +1412,7 @@ fn render_stream_prefix(
                     ChatStreamBlockKind::Assistant => {
                         style_stream_prefix_segment(&text, 128, false)
                     }
-                    ChatStreamBlockKind::Thinking => {
-                        style_stream_prefix_segment(&text, 148, false)
-                    }
+                    ChatStreamBlockKind::Thinking => style_stream_prefix_segment(&text, 148, false),
                 },
             }
         })
@@ -1566,7 +1573,10 @@ fn split_compact_ordered_suffix(suffix: &str) -> Vec<(usize, String)> {
             break;
         };
         idx += 2;
-        let content_start = chars.get(idx).map(|(offset, _)| *offset).unwrap_or(suffix.len());
+        let content_start = chars
+            .get(idx)
+            .map(|(offset, _)| *offset)
+            .unwrap_or(suffix.len());
         let mut content_end = suffix.len();
         let mut probe = idx;
         while probe < chars.len() {
@@ -1640,9 +1650,7 @@ fn render_inline_markdown_mode(line: &str, colorful: bool) -> String {
             format!("{label} ({url})")
         })
         .to_string();
-    text = INLINE_AUTO_LINK_RE
-        .replace_all(&text, "$1")
-        .to_string();
+    text = INLINE_AUTO_LINK_RE.replace_all(&text, "$1").to_string();
     if colorful {
         text = INLINE_BOLD_ITALIC_RE
             .replace_all(&text, |caps: &regex::Captures<'_>| {
@@ -1655,10 +1663,14 @@ fn render_inline_markdown_mode(line: &str, colorful: bool) -> String {
             })
             .to_string();
         text = INLINE_BOLD_RE
-            .replace_all(&text, |caps: &regex::Captures<'_>| caps[1].bold().to_string())
+            .replace_all(&text, |caps: &regex::Captures<'_>| {
+                caps[1].bold().to_string()
+            })
             .to_string();
         text = INLINE_BOLD_UNDERSCORE_RE
-            .replace_all(&text, |caps: &regex::Captures<'_>| caps[1].bold().to_string())
+            .replace_all(&text, |caps: &regex::Captures<'_>| {
+                caps[1].bold().to_string()
+            })
             .to_string();
         text = INLINE_STRIKE_RE
             .replace_all(&text, |caps: &regex::Captures<'_>| {
@@ -1666,7 +1678,9 @@ fn render_inline_markdown_mode(line: &str, colorful: bool) -> String {
             })
             .to_string();
         text = INLINE_ITALIC_ASTERISK_RE
-            .replace_all(&text, |caps: &regex::Captures<'_>| caps[1].italic().to_string())
+            .replace_all(&text, |caps: &regex::Captures<'_>| {
+                caps[1].italic().to_string()
+            })
             .to_string();
         text = INLINE_ITALIC_UNDERSCORE_SAFE_RE
             .replace_all(&text, |caps: &regex::Captures<'_>| {
@@ -1858,7 +1872,13 @@ mod tests {
     #[test]
     fn stream_prefix_degrades_to_static_when_color_disabled() {
         assert_eq!(
-            render_stream_prefix("[MachineClaw]", false, true, ChatStreamBlockKind::Assistant, 3),
+            render_stream_prefix(
+                "[MachineClaw]",
+                false,
+                true,
+                ChatStreamBlockKind::Assistant,
+                3
+            ),
             "[MachineClaw]"
         );
     }
@@ -1877,8 +1897,13 @@ mod tests {
 
     #[test]
     fn stream_prefix_degrades_to_static_when_terminal_is_unavailable() {
-        let rendered =
-            render_stream_prefix("[MachineClaw]", true, false, ChatStreamBlockKind::Assistant, 2);
+        let rendered = render_stream_prefix(
+            "[MachineClaw]",
+            true,
+            false,
+            ChatStreamBlockKind::Assistant,
+            2,
+        );
         assert_eq!(rendered, "[MachineClaw]");
     }
 
@@ -1916,7 +1941,10 @@ mod tests {
 
     #[test]
     fn renders_extended_heading_levels_in_plain_mode() {
-        assert_eq!(render_markdown_for_terminal("###### heading", false), "heading");
+        assert_eq!(
+            render_markdown_for_terminal("###### heading", false),
+            "heading"
+        );
     }
 
     #[test]
@@ -1947,7 +1975,8 @@ mod tests {
 
     #[test]
     fn stream_preview_keeps_code_fence_visible() {
-        let rendered = render_stream_line_preview("```rust", false, false, ChatStreamBlockKind::Assistant);
+        let rendered =
+            render_stream_line_preview("```rust", false, false, ChatStreamBlockKind::Assistant);
         assert_eq!(rendered, "[code:rust]");
     }
 
@@ -1971,13 +2000,15 @@ mod tests {
 
     #[test]
     fn stream_preview_keeps_tilde_code_fence_visible() {
-        let rendered = render_stream_line_preview("~~~bash", false, false, ChatStreamBlockKind::Assistant);
+        let rendered =
+            render_stream_line_preview("~~~bash", false, false, ChatStreamBlockKind::Assistant);
         assert_eq!(rendered, "[code:bash]");
     }
 
     #[test]
     fn stream_final_keeps_tilde_code_fence_visible() {
-        let rendered = render_stream_line_final("~~~bash", false, false, ChatStreamBlockKind::Assistant);
+        let rendered =
+            render_stream_line_final("~~~bash", false, false, ChatStreamBlockKind::Assistant);
         assert_eq!(rendered, "[code:bash]");
     }
 

@@ -1,10 +1,11 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
+    fs,
     io::{self, BufRead, IsTerminal, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -26,16 +27,14 @@ use crate::{
     },
     cli::InspectTarget,
     config::{AppConfig, expand_tilde, normalize_chat_model_price_check_mode},
-    context::SessionStore,
+    context::{SessionMessage, SessionStore},
     error::{AppError, ExitCode},
     i18n, logging,
     mask::mask_sensitive,
     mcp::McpManager,
     platform::OsType,
     render::{self, ActionRenderData},
-    shell::{
-        CommandMode, CommandResult, CommandSpec, ShellExecutor, note_interactive_input_wait,
-    },
+    shell::{CommandMode, CommandResult, CommandSpec, ShellExecutor, note_interactive_input_wait},
 };
 
 pub struct ActionServices<'a> {
@@ -243,6 +242,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
     let mut tool_call_cache = HashMap::<String, ToolCallCacheItem>::new();
     let command_cache_ttl_ms = services.cfg.ai.chat.command_cache_ttl_seconds as u128 * 1000;
     let external_mcp_tools: Vec<ExternalToolDefinition> = services.mcp.external_tool_definitions();
+    let mut autosave_worker = ChatAutosaveWorker::start(services.session, Duration::from_secs(3));
     render_chat_window_header(services, false);
 
     loop {
@@ -357,7 +357,9 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                         Ok(switched) => {
                             pending_message = None;
                             last_assistant_reply.clear();
+                            autosave_worker.submit_from_session(services.session);
                             maybe_ensure_chat_environment_profile(services, &system_prompt)?;
+                            autosave_worker.submit_from_session(services.session);
                             println!(
                                 "{}",
                                 render::render_markdown_for_terminal(
@@ -393,6 +395,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                         continue;
                     }
                     services.session.rename_current_session(&command.arg)?;
+                    autosave_worker.submit_from_session(services.session);
                     println!(
                         "{}",
                         render::render_markdown_for_terminal(
@@ -408,7 +411,9 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                     services.session.start_new_session_with_new_file()?;
                     pending_message = None;
                     last_assistant_reply.clear();
+                    autosave_worker.submit_from_session(services.session);
                     maybe_ensure_chat_environment_profile(services, &system_prompt)?;
+                    autosave_worker.submit_from_session(services.session);
                     println!(
                         "{}",
                         render::render_markdown_for_terminal(
@@ -423,6 +428,31 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                 "clear" if command.arg.is_empty() => {
                     clear_terminal()?;
                     render_chat_window_header(services, true);
+                }
+                "history" => {
+                    let requested = match parse_chat_history_limit(&command.arg) {
+                        Ok(value) => value,
+                        Err(text) => {
+                            println!(
+                                "{}",
+                                render::render_chat_notice(text, services.cfg.console.colorful)
+                            );
+                            continue;
+                        }
+                    };
+                    let history_items = services.session.recent_messages_for_display(requested);
+                    let markdown = format_chat_history_markdown(
+                        &history_items,
+                        requested,
+                        services.session.message_count(),
+                    );
+                    println!(
+                        "{}",
+                        render::render_markdown_for_terminal(
+                            &markdown,
+                            services.cfg.console.colorful
+                        )
+                    );
                 }
                 other => {
                     println!(
@@ -442,6 +472,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         services
             .session
             .add_user_message(message.clone(), Some(group_id.clone()));
+        autosave_worker.submit_from_session(services.session);
         if services.cfg.ai.chat.show_tips
             && let Some(warn_message) = services.session.context_pressure_warning(
                 services.cfg.ai.chat.context_warn_percent,
@@ -455,6 +486,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         }
         maybe_run_ai_context_compression(services, &system_prompt)?;
         services.session.persist()?;
+        autosave_worker.submit_from_session(services.session);
         if services.cfg.skills.enabled && !services.skills.is_empty() {
             println!(
                 "{}",
@@ -572,16 +604,15 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                     spinner.stop();
                 }
                 if is_transient_ai_error(&err) {
-                    let failure_notice =
-                        i18n::chat_ai_recoverable_failure(&mask_sensitive(&i18n::localize_error(&err)));
-                    println!(
-                        "{}",
-                        render::render_chat_warning(&failure_notice, colorful)
-                    );
+                    let failure_notice = i18n::chat_ai_recoverable_failure(&mask_sensitive(
+                        &i18n::localize_error(&err),
+                    ));
+                    println!("{}", render::render_chat_warning(&failure_notice, colorful));
                     services
                         .session
                         .add_assistant_message(failure_notice.clone(), Some(group_id));
                     services.session.persist()?;
+                    autosave_worker.submit_from_session(services.session);
                     last_assistant_reply = failure_notice;
                     continue;
                 }
@@ -660,6 +691,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             .session
             .add_assistant_message(response.archived_content.clone(), Some(group_id));
         services.session.persist()?;
+        autosave_worker.submit_from_session(services.session);
         if let Some(selected) = maybe_pick_next_option(
             &response.content,
             services.cfg.console.colorful,
@@ -722,6 +754,8 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         },
         services.cfg.console.colorful,
     )?;
+    autosave_worker.submit_from_session(services.session);
+    autosave_worker.stop();
 
     Ok(ActionOutcome {
         rendered,
@@ -1351,7 +1385,7 @@ fn parse_builtin_command(message: &str) -> Option<BuiltinCommand> {
     }
     let name = trimmed.get(1..end)?.to_ascii_lowercase();
     let known = [
-        "help", "stats", "list", "change", "name", "new", "clear", "exit", "quit",
+        "help", "stats", "list", "change", "name", "new", "clear", "history", "exit", "quit",
     ];
     if !known.contains(&name.as_str()) {
         return None;
@@ -1405,6 +1439,12 @@ fn normalize_builtin_command_alias(message: String) -> String {
     }
     if (first_lower == "change" || first_lower == "name") && !rest.is_empty() {
         return format!("/{first_lower} {rest}");
+    }
+    if first_lower == "history" {
+        if rest.is_empty() {
+            return "/history".to_string();
+        }
+        return format!("/history {rest}");
     }
     trimmed.to_string()
 }
@@ -1517,6 +1557,85 @@ fn format_local_datetime(epoch_ms: u128) -> String {
     ts.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+fn parse_chat_history_limit(arg: &str) -> Result<usize, &'static str> {
+    const DEFAULT_LIMIT: usize = 10;
+    const MAX_LIMIT: usize = 200;
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_LIMIT);
+    }
+    let parsed = trimmed.parse::<usize>().ok();
+    let Some(value) = parsed else {
+        return Err(i18n::chat_history_usage());
+    };
+    if value == 0 {
+        return Err(i18n::chat_history_usage());
+    }
+    if value > MAX_LIMIT {
+        return Ok(MAX_LIMIT);
+    }
+    Ok(value)
+}
+
+fn format_chat_history_markdown(
+    messages: &[SessionMessage],
+    requested_limit: usize,
+    total_messages: usize,
+) -> String {
+    if messages.is_empty() {
+        return i18n::chat_history_empty().to_string();
+    }
+    let mut lines = Vec::<String>::new();
+    lines.push(format!(
+        "### {}",
+        i18n::chat_history_title(messages.len(), requested_limit, total_messages)
+    ));
+    lines.push(String::new());
+    for (idx, message) in messages.iter().enumerate() {
+        let role = normalize_history_role(message.role.as_str());
+        let safe_content = normalize_history_content(message.content.as_str());
+        lines.push(format!(
+            "{}. [{}] `{}` {}",
+            idx + 1,
+            format_local_datetime(message.created_at_epoch_ms),
+            role,
+            safe_content
+        ));
+    }
+    lines.join("\n")
+}
+
+fn normalize_history_role(role: &str) -> &'static str {
+    let normalized = role.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "assistant" => "assistant",
+        "tool" => "tool",
+        "system" => "system",
+        "user" => "user",
+        _ => "unknown",
+    }
+}
+
+fn normalize_history_content(raw: &str) -> String {
+    let stripped = strip_terminal_control_sequences(raw);
+    let filtered = stripped
+        .chars()
+        .filter(|ch| {
+            !matches!(
+                ch,
+                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}'
+            ) && (*ch == '\n' || *ch == '\r' || *ch == '\t' || !ch.is_control())
+        })
+        .collect::<String>();
+    let collapsed = trim_text(&mask_sensitive(filtered.trim()), 400)
+        .replace('\n', "\\n")
+        .replace('\r', "");
+    if collapsed.is_empty() {
+        return i18n::chat_history_empty_content().to_string();
+    }
+    collapsed
+}
+
 fn result_timeout_hint(command: &str, stdout: &str, stderr: &str) -> Option<String> {
     let command_lower = command.to_ascii_lowercase();
     let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
@@ -1573,8 +1692,9 @@ fn maybe_prepare_chat_model_price(services: &mut ActionServices<'_>) {
         )
     );
     if services.cfg.ai.chat.skip_model_price_check
-        || normalize_chat_model_price_check_mode(services.cfg.ai.chat.model_price_check_mode.as_str())
-            != "async"
+        || normalize_chat_model_price_check_mode(
+            services.cfg.ai.chat.model_price_check_mode.as_str(),
+        ) != "async"
     {
         let result = services
             .ai
@@ -2054,6 +2174,150 @@ fn should_show_tool_event(services: &ActionServices<'_>, kind: render::ChatToolE
     }
 }
 
+struct ChatAutosaveWorker {
+    latest_snapshot: Arc<Mutex<Option<ChatAutosaveSnapshot>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone)]
+struct ChatAutosaveSnapshot {
+    path: PathBuf,
+    content: String,
+}
+
+impl ChatAutosaveWorker {
+    fn start(session: &SessionStore, interval: Duration) -> Self {
+        let latest_snapshot = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let latest_snapshot_cloned = latest_snapshot.clone();
+        let stop_cloned = stop.clone();
+        let handle = thread::spawn(move || {
+            loop {
+                if stop_cloned.load(Ordering::SeqCst) {
+                    flush_chat_autosave_snapshot(&latest_snapshot_cloned);
+                    break;
+                }
+                flush_chat_autosave_snapshot(&latest_snapshot_cloned);
+                thread::sleep(interval);
+            }
+        });
+        let worker = Self {
+            latest_snapshot,
+            stop,
+            handle: Some(handle),
+        };
+        worker.submit_from_session(session);
+        logging::info("chat autosave worker started");
+        worker
+    }
+
+    fn submit_from_session(&self, session: &SessionStore) {
+        match session.serialized_state_pretty() {
+            Ok(raw) => self.submit_raw(ChatAutosaveSnapshot {
+                path: session.autosave_file_path(),
+                content: raw,
+            }),
+            Err(err) => logging::warn(&format!(
+                "chat autosave serialize failed: {}",
+                mask_sensitive(&err.to_string())
+            )),
+        }
+    }
+
+    fn submit_raw(&self, raw: ChatAutosaveSnapshot) {
+        match self.latest_snapshot.lock() {
+            Ok(mut slot) => {
+                *slot = Some(raw);
+            }
+            Err(_) => {
+                logging::warn("chat autosave snapshot lock poisoned");
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ChatAutosaveWorker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn flush_chat_autosave_snapshot(snapshot: &Arc<Mutex<Option<ChatAutosaveSnapshot>>>) {
+    let raw = match snapshot.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => {
+            logging::warn("chat autosave snapshot lock poisoned");
+            None
+        }
+    };
+    let Some(snapshot_data) = raw else {
+        return;
+    };
+    if let Err(err) = write_string_atomically_local(&snapshot_data.path, &snapshot_data.content) {
+        logging::warn(&format!(
+            "chat autosave persist failed path={}: {}",
+            snapshot_data.path.display(),
+            mask_sensitive(&err.to_string())
+        ));
+        if let Ok(mut slot) = snapshot.lock()
+            && slot.is_none()
+        {
+            *slot = Some(snapshot_data);
+        }
+    }
+}
+
+fn write_string_atomically_local(path: &Path, content: &str) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            AppError::Runtime(format!(
+                "failed to create directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|item| item.to_str())
+        .unwrap_or("session.json");
+    let tmp_name = format!(".{file_name}.{}.tmp", Uuid::new_v4());
+    let tmp_path = path.with_file_name(tmp_name);
+    fs::write(&tmp_path, content).map_err(|err| {
+        AppError::Runtime(format!(
+            "failed to write temp session file {}: {err}",
+            tmp_path.display()
+        ))
+    })?;
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        if path.exists() {
+            let _ = fs::remove_file(path);
+            fs::rename(&tmp_path, path).map_err(|rename_err| {
+                AppError::Runtime(format!(
+                    "failed to replace session file {} after rename error {}: {}",
+                    path.display(),
+                    err,
+                    rename_err
+                ))
+            })?;
+        } else {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(AppError::Runtime(format!(
+                "failed to move temporary file into place {}: {err}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 struct ActivitySpinner {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
@@ -2528,5 +2792,70 @@ fn read_cmd(label: &str, command: &str) -> CommandSpec {
         label: label.to_string(),
         command: command.to_string(),
         mode: CommandMode::Read,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ChatAutosaveSnapshot, flush_chat_autosave_snapshot, normalize_builtin_command_alias,
+        normalize_history_content, parse_builtin_command, parse_chat_history_limit,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::fs;
+    use uuid::Uuid;
+
+    #[test]
+    fn parse_builtin_command_supports_history_with_optional_limit() {
+        let cmd = parse_builtin_command("/history 20").expect("history should parse");
+        assert_eq!(cmd.name, "history");
+        assert_eq!(cmd.arg, "20");
+        let cmd_noarg = parse_builtin_command("/history").expect("history no-arg should parse");
+        assert_eq!(cmd_noarg.name, "history");
+        assert!(cmd_noarg.arg.is_empty());
+    }
+
+    #[test]
+    fn normalize_builtin_alias_supports_history() {
+        assert_eq!(
+            normalize_builtin_command_alias("history".to_string()),
+            "/history"
+        );
+        assert_eq!(
+            normalize_builtin_command_alias("history 25".to_string()),
+            "/history 25"
+        );
+    }
+
+    #[test]
+    fn parse_chat_history_limit_defaults_and_caps() {
+        assert_eq!(parse_chat_history_limit("").expect("default"), 10);
+        assert_eq!(parse_chat_history_limit("5").expect("value"), 5);
+        assert_eq!(parse_chat_history_limit("999").expect("capped"), 200);
+        assert!(parse_chat_history_limit("0").is_err());
+        assert!(parse_chat_history_limit("abc").is_err());
+    }
+
+    #[test]
+    fn normalize_history_content_sanitizes_control_and_empty() {
+        let cleaned = normalize_history_content("\u{1B}[31mhello\u{1B}[0m\nworld");
+        assert_eq!(cleaned, "hello\\nworld");
+        let empty = normalize_history_content("\u{200B}\u{0007}");
+        assert_eq!(empty, crate::i18n::chat_history_empty_content());
+    }
+
+    #[test]
+    fn flush_chat_autosave_snapshot_writes_to_snapshot_path() {
+        let temp_dir = std::env::temp_dir().join(format!("machineclaw-actions-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let target_path = temp_dir.join("session-a.json.autosave");
+        let snapshot = Arc::new(Mutex::new(Some(ChatAutosaveSnapshot {
+            path: target_path.clone(),
+            content: "{\"ok\":true}".to_string(),
+        })));
+        flush_chat_autosave_snapshot(&snapshot);
+        let written = fs::read_to_string(&target_path).expect("autosave file should be written");
+        assert_eq!(written, "{\"ok\":true}");
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }

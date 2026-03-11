@@ -219,7 +219,10 @@ fn run() -> Result<ExitCode, AppError> {
         logging::info(&notice);
     }
 
-    let ai_client = AiClient::new(&cfg.ai, run_dir.join(".machineclaw").join("model-prices.json"))?;
+    let ai_client = AiClient::new(
+        &cfg.ai,
+        run_dir.join(".machineclaw").join("model-prices.json"),
+    )?;
     let run_ai_connectivity_check =
         !matches!(&command, Commands::Chat) || cfg.ai.connectivity_check;
     run_preflight_checks(&cfg, &ai_client, run_ai_connectivity_check)?;

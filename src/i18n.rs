@@ -938,7 +938,9 @@ pub fn chat_ai_reconnecting(current: u32, total: u32) -> String {
         Language::ZhCn => format!("AI 连接异常，正在重连... {current}/{total}"),
         Language::ZhTw => format!("AI 連線異常，正在重連... {current}/{total}"),
         Language::Fr => format!("Connexion IA instable, reconnexion... {current}/{total}"),
-        Language::De => format!("KI-Verbindung instabil, erneuter Verbindungsaufbau... {current}/{total}"),
+        Language::De => {
+            format!("KI-Verbindung instabil, erneuter Verbindungsaufbau... {current}/{total}")
+        }
         Language::Ja => format!("AI 接続が不安定です。再接続中... {current}/{total}"),
         Language::En => format!("AI connection issue. Reconnecting... {current}/{total}"),
     }
@@ -1064,22 +1066,22 @@ pub fn chat_welcome(
 pub fn chat_hint() -> &'static str {
     match current_language() {
         Language::ZhCn => {
-            "输入问题开始对话。命令: /help, /stats, /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+            "输入问题开始对话。命令: /help, /stats, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
         Language::ZhTw => {
-            "輸入問題開始對話。命令: /help, /stats, /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+            "輸入問題開始對話。命令: /help, /stats, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
         Language::Fr => {
-            "Saisissez votre question pour commencer. Commandes: /help, /stats, /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+            "Saisissez votre question pour commencer. Commandes: /help, /stats, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
         Language::De => {
-            "Geben Sie eine Frage ein, um zu starten. Befehle: /help, /stats, /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+            "Geben Sie eine Frage ein, um zu starten. Befehle: /help, /stats, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
         Language::Ja => {
-            "質問を入力して開始します。コマンド: /help, /stats, /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+            "質問を入力して開始します。コマンド: /help, /stats, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
         Language::En => {
-            "Type a question to start. Commands: /help, /stats, /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
+            "Type a question to start. Commands: /help, /stats, /history [number], /list, /change <id|name>, /name <new-name>, /new, /clear, /exit"
         }
     }
 }
@@ -1087,22 +1089,95 @@ pub fn chat_hint() -> &'static str {
 pub fn chat_help_text() -> &'static str {
     match current_language() {
         Language::ZhCn => {
-            "/help 显示帮助, /stats 查看上下文统计, /list 列出会话, /change <id|name> 切换会话, /name <new-name> 重命名当前会话, /new 新建会话, /clear 清屏(不清历史), /exit 退出 chat"
+            "/help 显示帮助, /stats 查看上下文统计, /history [number] 查看最近聊天历史(默认10条), /list 列出会话, /change <id|name> 切换会话, /name <new-name> 重命名当前会话, /new 新建会话, /clear 清屏(不清历史), /exit 退出 chat"
         }
         Language::ZhTw => {
-            "/help 顯示說明, /stats 查看上下文統計, /list 列出會話, /change <id|name> 切換會話, /name <new-name> 重新命名目前會話, /new 建立新會話, /clear 清屏(不清歷史), /exit 離開 chat"
+            "/help 顯示說明, /stats 查看上下文統計, /history [number] 查看最近聊天歷史(預設10筆), /list 列出會話, /change <id|name> 切換會話, /name <new-name> 重新命名目前會話, /new 建立新會話, /clear 清屏(不清歷史), /exit 離開 chat"
         }
         Language::Fr => {
-            "/help aide, /stats statistiques du contexte, /list lister les sessions, /change <id|name> changer de session, /name <new-name> renommer la session actuelle, /new nouvelle session, /clear effacer l'écran (garde l'historique), /exit quitter chat"
+            "/help aide, /stats statistiques du contexte, /history [number] afficher l'historique récent (10 par défaut), /list lister les sessions, /change <id|name> changer de session, /name <new-name> renommer la session actuelle, /new nouvelle session, /clear effacer l'écran (garde l'historique), /exit quitter chat"
         }
         Language::De => {
-            "/help Hilfe, /stats Kontextstatistik, /list Sitzungen auflisten, /change <id|name> Sitzung wechseln, /name <new-name> aktuelle Sitzung umbenennen, /new neue Sitzung, /clear Bildschirm leeren (Verlauf bleibt), /exit chat beenden"
+            "/help Hilfe, /stats Kontextstatistik, /history [number] letzten Verlauf anzeigen (Standard 10), /list Sitzungen auflisten, /change <id|name> Sitzung wechseln, /name <new-name> aktuelle Sitzung umbenennen, /new neue Sitzung, /clear Bildschirm leeren (Verlauf bleibt), /exit chat beenden"
         }
         Language::Ja => {
-            "/help ヘルプ, /stats コンテキスト統計, /list セッション一覧, /change <id|name> セッション切替, /name <new-name> 現在セッション名変更, /new 新規セッション, /clear 画面クリア(履歴保持), /exit chat 終了"
+            "/help ヘルプ, /stats コンテキスト統計, /history [number] 直近履歴を表示(既定10件), /list セッション一覧, /change <id|name> セッション切替, /name <new-name> 現在セッション名変更, /new 新規セッション, /clear 画面クリア(履歴保持), /exit chat 終了"
         }
         Language::En => {
-            "/help help, /stats context stats, /list list sessions, /change <id|name> switch session, /name <new-name> rename current session, /new new session, /clear clear screen (keep history), /exit leave chat"
+            "/help help, /stats context stats, /history [number] show recent chat history (default 10), /list list sessions, /change <id|name> switch session, /name <new-name> rename current session, /new new session, /clear clear screen (keep history), /exit leave chat"
+        }
+    }
+}
+
+pub fn chat_history_usage() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "用法: /history [number]，number 必须为大于 0 的整数（默认 10）",
+        Language::ZhTw => "用法: /history [number]，number 必須為大於 0 的整數（預設 10）",
+        Language::Fr => "Usage: /history [number], number doit être un entier > 0 (défaut 10)",
+        Language::De => {
+            "Verwendung: /history [number], number muss eine ganze Zahl > 0 sein (Standard 10)"
+        }
+        Language::Ja => "使い方: /history [number]。number は 0 より大きい整数（既定 10）",
+        Language::En => "Usage: /history [number], number must be an integer > 0 (default 10)",
+    }
+}
+
+pub fn chat_history_empty() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "当前会话暂无可展示的聊天历史。",
+        Language::ZhTw => "目前會話暫無可顯示的聊天歷史。",
+        Language::Fr => "Aucun historique de chat affichable dans cette session.",
+        Language::De => "Kein anzeigbarer Chatverlauf in dieser Sitzung.",
+        Language::Ja => "このセッションには表示可能な履歴がありません。",
+        Language::En => "No displayable chat history in this session.",
+    }
+}
+
+pub fn chat_history_empty_content() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "(空内容)",
+        Language::ZhTw => "(空內容)",
+        Language::Fr => "(contenu vide)",
+        Language::De => "(leer)",
+        Language::Ja => "(空内容)",
+        Language::En => "(empty)",
+    }
+}
+
+pub fn chat_history_title(shown: usize, requested_limit: usize, total_messages: usize) -> String {
+    let shown_fmt = human_count_u128(shown as u128);
+    let requested_fmt = human_count_u128(requested_limit as u128);
+    let total_fmt = human_count_u128(total_messages as u128);
+    match current_language() {
+        Language::ZhCn => {
+            format!(
+                "聊天历史（显示 {shown_fmt} 条，请求 {requested_fmt} 条，会话总计 {total_fmt} 条）"
+            )
+        }
+        Language::ZhTw => {
+            format!(
+                "聊天歷史（顯示 {shown_fmt} 筆，請求 {requested_fmt} 筆，會話總計 {total_fmt} 筆）"
+            )
+        }
+        Language::Fr => {
+            format!(
+                "Historique chat (affichées {shown_fmt}, demandées {requested_fmt}, total session {total_fmt})"
+            )
+        }
+        Language::De => {
+            format!(
+                "Chatverlauf (angezeigt {shown_fmt}, angefordert {requested_fmt}, gesamt {total_fmt})"
+            )
+        }
+        Language::Ja => {
+            format!(
+                "チャット履歴（表示 {shown_fmt} 件、要求 {requested_fmt} 件、セッション合計 {total_fmt} 件）"
+            )
+        }
+        Language::En => {
+            format!(
+                "Chat history (showing {shown_fmt}, requested {requested_fmt}, session total {total_fmt})"
+            )
         }
     }
 }

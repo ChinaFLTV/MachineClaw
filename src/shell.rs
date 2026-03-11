@@ -1,9 +1,9 @@
 use std::{
     io::{self, IsTerminal, Read, Write},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
     sync::atomic::{AtomicBool, Ordering},
     sync::mpsc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -60,9 +60,8 @@ static WRITE_HINT_PATTERNS: Lazy<Vec<&'static str>> = Lazy::new(|| {
     ]
 });
 
-static DETACHED_AMPERSAND_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(^|\s)&(\s|$)").expect("valid detached ampersand regex")
-});
+static DETACHED_AMPERSAND_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(^|\s)&(\s|$)").expect("valid detached ampersand regex"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandMode {
@@ -710,7 +709,7 @@ fn prompt_write_decision(
     } else {
         i18n::prompt_write_command_proceed()
     };
-    print!("{confirm_title}\n");
+    println!("{confirm_title}");
     loop {
         print!("{confirm_question}");
         io::stdout().flush().map_err(|err| {
@@ -909,7 +908,11 @@ mod tests {
             .expect("background command should complete");
 
         assert!(result.success);
-        assert!(result.duration_ms < 1_500, "duration_ms={}", result.duration_ms);
+        assert!(
+            result.duration_ms < 1_500,
+            "duration_ms={}",
+            result.duration_ms
+        );
         assert!(result.stdout.contains("ready"));
     }
 

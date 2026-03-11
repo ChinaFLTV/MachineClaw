@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -14,9 +15,10 @@ const SUMMARY_MAX_CHARS: usize = 4000;
 const AI_COMPRESSION_MARKER: &str = "[ai_summary_compression]";
 const CHAT_PROFILE_MARKER: &str = "[chat_profile_v1]";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageKind {
+    #[default]
     User,
     Assistant,
     Tool,
@@ -25,10 +27,15 @@ pub enum MessageKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMessage {
+    #[serde(default)]
     pub role: String,
+    #[serde(default)]
     pub content: String,
+    #[serde(default)]
     pub kind: MessageKind,
+    #[serde(default)]
     pub group_id: Option<String>,
+    #[serde(default)]
     pub created_at_epoch_ms: u128,
 }
 
@@ -62,10 +69,13 @@ pub struct SessionCompass {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
+    #[serde(default = "default_session_id")]
     pub session_id: String,
     #[serde(default)]
     pub session_name: String,
+    #[serde(default)]
     pub summary: String,
+    #[serde(default)]
     pub messages: Vec<SessionMessage>,
     #[serde(default)]
     pub compass: SessionCompass,
@@ -136,28 +146,7 @@ impl SessionStore {
             })?;
         }
 
-        let state = if path.exists() {
-            let raw = fs::read_to_string(&path).map_err(|err| {
-                AppError::Runtime(format!(
-                    "failed to read session file {}: {err}",
-                    path.display()
-                ))
-            })?;
-            serde_json::from_str::<SessionState>(&raw).map_err(|err| {
-                AppError::Runtime(format!(
-                    "failed to parse session file {}: {err}",
-                    path.display()
-                ))
-            })?
-        } else {
-            SessionState {
-                session_id: Uuid::new_v4().to_string(),
-                session_name: String::new(),
-                summary: String::new(),
-                messages: Vec::new(),
-                compass: new_compass(),
-            }
-        };
+        let state = load_state_with_autosave_or_new(&path)?;
 
         let mut store = Self {
             path,
@@ -246,6 +235,15 @@ impl SessionStore {
         write_string_atomically(&self.path, &raw)
     }
 
+    pub fn serialized_state_pretty(&self) -> Result<String, AppError> {
+        serde_json::to_string_pretty(&self.state)
+            .map_err(|err| AppError::Runtime(format!("failed to serialize session state: {err}")))
+    }
+
+    pub fn autosave_file_path(&self) -> PathBuf {
+        autosave_file_path_for(&self.path)
+    }
+
     pub fn session_file(path: &Path) -> PathBuf {
         let base_dir = path.join(".machineclaw");
         let sessions_dir = base_dir.join("sessions");
@@ -290,6 +288,28 @@ impl SessionStore {
 
     pub fn message_count(&self) -> usize {
         self.state.messages.len()
+    }
+
+    pub fn recent_messages_for_display(&self, limit: usize) -> Vec<SessionMessage> {
+        let mut items = Vec::<SessionMessage>::new();
+        let wanted = limit.max(1);
+        for item in self.state.messages.iter().rev() {
+            if item.role.trim().is_empty() && item.content.trim().is_empty() {
+                continue;
+            }
+            if item.role == "system"
+                && (item.content.trim_start().starts_with(AI_COMPRESSION_MARKER)
+                    || item.content.trim_start().starts_with(CHAT_PROFILE_MARKER))
+            {
+                continue;
+            }
+            items.push(item.clone());
+            if items.len() >= wanted {
+                break;
+            }
+        }
+        items.reverse();
+        items
     }
 
     pub fn summary_len(&self) -> usize {
@@ -727,6 +747,9 @@ impl SessionStore {
 
     fn repair_compass(&mut self) {
         let now = now_epoch_ms();
+        if self.state.session_id.trim().is_empty() {
+            self.state.session_id = default_session_id();
+        }
         self.state.session_name =
             normalize_session_name(&self.state.session_id, Some(&self.state.session_name));
         let persisted_counts = self.archived_role_counts();
@@ -853,6 +876,216 @@ fn compute_keep_recent_messages(max_history_messages: usize) -> usize {
     max_history_messages.saturating_sub(compress_recent).max(1)
 }
 
+fn load_state_with_autosave_or_new(path: &Path) -> Result<SessionState, AppError> {
+    let autosave_path = autosave_file_path_for(path);
+    let primary = if path.exists() {
+        Some(read_state_from_file(path).or_else(|primary_err| {
+            try_read_state_from_file(&autosave_path).map_err(|_| primary_err)
+        })?)
+    } else {
+        None
+    };
+    let autosave = try_read_state_from_file(&autosave_path);
+    match (primary, autosave) {
+        (Some(primary_state), Ok(autosave_state)) => {
+            if session_state_order_key(&autosave_state) >= session_state_order_key(&primary_state) {
+                Ok(autosave_state)
+            } else {
+                Ok(primary_state)
+            }
+        }
+        (Some(primary_state), Err(_)) => Ok(primary_state),
+        (None, Ok(autosave_state)) => Ok(autosave_state),
+        (None, Err(_)) => Ok(SessionState {
+            session_id: Uuid::new_v4().to_string(),
+            session_name: String::new(),
+            summary: String::new(),
+            messages: Vec::new(),
+            compass: new_compass(),
+        }),
+    }
+}
+
+fn read_state_from_file(path: &Path) -> Result<SessionState, AppError> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        AppError::Runtime(format!(
+            "failed to read session file {}: {err}",
+            path.display()
+        ))
+    })?;
+    match serde_json::from_str::<SessionState>(&raw) {
+        Ok(state) => Ok(state),
+        Err(strict_err) => parse_session_state_lenient(&raw).ok_or_else(|| {
+            AppError::Runtime(format!(
+                "failed to parse session file {}: {strict_err}",
+                path.display()
+            ))
+        }),
+    }
+}
+
+fn try_read_state_from_file(path: &Path) -> Result<SessionState, AppError> {
+    if !path.exists() {
+        return Err(AppError::Runtime(format!(
+            "session file not found: {}",
+            path.display()
+        )));
+    }
+    read_state_from_file(path)
+}
+
+fn session_state_order_key(state: &SessionState) -> (u128, usize) {
+    (
+        state.compass.last_updated_epoch_ms,
+        state
+            .messages
+            .len()
+            .saturating_add(state.summary.chars().count()),
+    )
+}
+
+fn autosave_file_path_for(path: &Path) -> PathBuf {
+    let mut value = OsString::from(path.as_os_str());
+    value.push(".autosave");
+    PathBuf::from(value)
+}
+
+fn parse_session_state_lenient(raw: &str) -> Option<SessionState> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let object = value.as_object()?;
+    let mut state = SessionState {
+        session_id: value_to_string(object.get("session_id")).unwrap_or_else(default_session_id),
+        session_name: value_to_string(object.get("session_name")).unwrap_or_default(),
+        summary: value_to_string(object.get("summary")).unwrap_or_default(),
+        messages: object
+            .get("messages")
+            .and_then(|item| item.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(parse_session_message_lenient)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        compass: parse_session_compass_lenient(object.get("compass")),
+    };
+    if state.session_id.trim().is_empty() {
+        state.session_id = default_session_id();
+    }
+    Some(state)
+}
+
+fn parse_session_message_lenient(value: &serde_json::Value) -> Option<SessionMessage> {
+    let object = value.as_object()?;
+    let raw_role = value_to_string(object.get("role")).unwrap_or_default();
+    let kind = parse_message_kind_lenient(object.get("kind"), raw_role.as_str());
+    let normalized_role = raw_role.trim().to_ascii_lowercase();
+    let role = if matches!(
+        normalized_role.as_str(),
+        "user" | "assistant" | "tool" | "system"
+    ) {
+        normalized_role
+    } else {
+        default_role_for_kind(kind)
+    };
+    let content = value_to_string(object.get("content")).unwrap_or_default();
+    if role.trim().is_empty() && content.trim().is_empty() {
+        return None;
+    }
+    let group_id = value_to_string(object.get("group_id")).and_then(|item| {
+        let trimmed = item.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+    let created_at_epoch_ms = value_to_u128(object.get("created_at_epoch_ms")).unwrap_or_default();
+    Some(SessionMessage {
+        role,
+        content,
+        kind,
+        group_id,
+        created_at_epoch_ms,
+    })
+}
+
+fn parse_session_compass_lenient(value: Option<&serde_json::Value>) -> SessionCompass {
+    let mut compass = SessionCompass::default();
+    let Some(object) = value.and_then(|item| item.as_object()) else {
+        return compass;
+    };
+    compass.created_at_epoch_ms = value_to_u128(object.get("created_at_epoch_ms")).unwrap_or(0);
+    compass.last_updated_epoch_ms = value_to_u128(object.get("last_updated_epoch_ms")).unwrap_or(0);
+    compass.truncated_messages = value_to_usize(object.get("truncated_messages")).unwrap_or(0);
+    compass.compression_rounds = value_to_usize(object.get("compression_rounds")).unwrap_or(0);
+    compass.dropped_groups = value_to_usize(object.get("dropped_groups")).unwrap_or(0);
+    compass.total_user_messages = value_to_usize(object.get("total_user_messages")).unwrap_or(0);
+    compass.total_assistant_messages =
+        value_to_usize(object.get("total_assistant_messages")).unwrap_or(0);
+    compass.total_tool_messages = value_to_usize(object.get("total_tool_messages")).unwrap_or(0);
+    compass.last_action = value_to_string(object.get("last_action")).unwrap_or_default();
+    compass.last_user_topic = value_to_string(object.get("last_user_topic")).unwrap_or_default();
+    compass.last_assistant_focus =
+        value_to_string(object.get("last_assistant_focus")).unwrap_or_default();
+    compass.last_compaction_preview =
+        value_to_string(object.get("last_compaction_preview")).unwrap_or_default();
+    compass
+}
+
+fn parse_message_kind_lenient(value: Option<&serde_json::Value>, role: &str) -> MessageKind {
+    let by_kind = value_to_string(value)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let by_role = role.trim().to_ascii_lowercase();
+    match by_kind.as_str() {
+        "user" => MessageKind::User,
+        "assistant" => MessageKind::Assistant,
+        "tool" => MessageKind::Tool,
+        "system" => MessageKind::System,
+        _ => match by_role.as_str() {
+            "assistant" => MessageKind::Assistant,
+            "tool" => MessageKind::Tool,
+            "system" => MessageKind::System,
+            _ => MessageKind::User,
+        },
+    }
+}
+
+fn default_role_for_kind(kind: MessageKind) -> String {
+    match kind {
+        MessageKind::User => "user".to_string(),
+        MessageKind::Assistant => "assistant".to_string(),
+        MessageKind::Tool => "tool".to_string(),
+        MessageKind::System => "system".to_string(),
+    }
+}
+
+fn value_to_string(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(item) => Some(item.clone()),
+        serde_json::Value::Number(item) => Some(item.to_string()),
+        serde_json::Value::Bool(item) => Some(item.to_string()),
+        serde_json::Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
+fn value_to_u128(value: Option<&serde_json::Value>) -> Option<u128> {
+    match value? {
+        serde_json::Value::Number(item) => item
+            .as_u64()
+            .map(|v| v as u128)
+            .or_else(|| item.as_i64().filter(|v| *v >= 0).map(|v| v as u128)),
+        serde_json::Value::String(item) => item.trim().parse::<u128>().ok(),
+        _ => None,
+    }
+}
+
+fn value_to_usize(value: Option<&serde_json::Value>) -> Option<usize> {
+    value_to_u128(value).map(|item| item.min(usize::MAX as u128) as usize)
+}
+
 fn is_session_state_file_name(file_name: &str) -> bool {
     if !file_name.ends_with(".json") {
         return false;
@@ -865,6 +1098,10 @@ fn is_session_state_file_name(file_name: &str) -> bool {
 
 fn default_session_name(session_id: &str) -> String {
     format!("session-{session_id}")
+}
+
+fn default_session_id() -> String {
+    Uuid::new_v4().to_string()
 }
 
 fn normalize_session_name(session_id: &str, raw_name: Option<&str>) -> String {
@@ -1222,8 +1459,12 @@ fn write_string_atomically(path: &Path, content: &str) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageKind, SessionRoleCounts, SessionState, SessionStore, new_compass};
-    use std::path::PathBuf;
+    use super::{
+        AI_COMPRESSION_MARKER, CHAT_PROFILE_MARKER, MessageKind, SessionRoleCounts, SessionState,
+        SessionStore, new_compass,
+    };
+    use std::{fs, path::PathBuf};
+    use uuid::Uuid;
 
     fn build_store(summary: &str) -> SessionStore {
         SessionStore {
@@ -1308,5 +1549,83 @@ mod tests {
         assert!(!store.state.compass.last_user_topic.is_empty());
         assert!(!store.state.compass.last_assistant_focus.is_empty());
         assert_eq!(store.state.compass.last_updated_epoch_ms, 3);
+    }
+
+    #[test]
+    fn recent_messages_for_display_skips_internal_system_markers() {
+        let mut store = build_store("");
+        store.add_system_message(format!("{AI_COMPRESSION_MARKER}\nsummary"), None);
+        store.add_system_message(format!("{CHAT_PROFILE_MARKER}\nprofile"), None);
+        store.add_assistant_message("assistant ok".to_string(), None);
+        let items = store.recent_messages_for_display(10);
+        assert!(items.iter().all(|item| {
+            !item.content.starts_with(AI_COMPRESSION_MARKER)
+                && !item.content.starts_with(CHAT_PROFILE_MARKER)
+        }));
+        assert!(items.iter().any(|item| item.content == "assistant ok"));
+    }
+
+    #[test]
+    fn autosave_file_path_appends_suffix() {
+        let store = build_store("");
+        let autosave = store.autosave_file_path();
+        assert_eq!(
+            autosave.file_name().and_then(|name| name.to_str()),
+            Some("session.json.autosave")
+        );
+    }
+
+    #[test]
+    fn load_or_new_falls_back_to_valid_autosave_when_primary_is_corrupted() {
+        let temp_dir = std::env::temp_dir().join(format!("machineclaw-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let primary_path = temp_dir.join("session.json");
+        fs::write(&primary_path, "{invalid json").expect("primary file should be written");
+        let autosave_path = PathBuf::from(format!("{}.autosave", primary_path.display()));
+        let autosave_state = SessionState {
+            session_id: "session-autosave".to_string(),
+            session_name: "session-autosave".to_string(),
+            summary: String::new(),
+            messages: vec![super::SessionMessage {
+                role: "user".to_string(),
+                content: "recover me".to_string(),
+                kind: MessageKind::User,
+                group_id: None,
+                created_at_epoch_ms: 123,
+            }],
+            compass: new_compass(),
+        };
+        let raw = serde_json::to_string_pretty(&autosave_state).expect("autosave state to json");
+        fs::write(&autosave_path, raw).expect("autosave file should be written");
+
+        let store = SessionStore::load_or_new(primary_path, 40, 80, 40, 80_000)
+            .expect("load_or_new should recover from autosave");
+        assert_eq!(store.session_id(), "session-autosave");
+        assert_eq!(store.message_count(), 1);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn load_or_new_accepts_lenient_session_shape_with_missing_fields() {
+        let temp_dir = std::env::temp_dir().join(format!("machineclaw-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let primary_path = temp_dir.join("session.json");
+        let raw = r#"{
+            "session_name": 123,
+            "messages": [
+                {"role": 1, "content": {"x": 1}, "kind": "assistant", "created_at_epoch_ms": "168"},
+                {"content": "ok"}
+            ],
+            "compass": {"last_updated_epoch_ms": "456", "total_user_messages": "7"}
+        }"#;
+        fs::write(&primary_path, raw).expect("primary file should be written");
+
+        let store = SessionStore::load_or_new(primary_path, 40, 80, 40, 80_000)
+            .expect("lenient parser should recover session shape");
+        assert!(!store.session_id().trim().is_empty());
+        assert_eq!(store.message_count(), 2);
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }

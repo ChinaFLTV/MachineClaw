@@ -36,3 +36,5 @@ Thumbs.db
 
 .docs
 midscene_run
+.zig-cache
+.zig-global-cache

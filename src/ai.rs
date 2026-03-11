@@ -11,11 +11,11 @@ use std::{
 
 use once_cell::sync::Lazy;
 use regex::Regex;
-use reqwest::header::RETRY_AFTER;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
+use reqwest::header::RETRY_AFTER;
 use serde::de::Deserializer;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
@@ -384,10 +384,9 @@ impl AiClient {
     }
 
     pub fn prepare_model_pricing(&self, skip_probe: bool) -> ModelPriceCheckResult {
-        if let Some(prices) = configured_model_prices(
-            self.input_price_per_million,
-            self.output_price_per_million,
-        ) {
+        if let Some(prices) =
+            configured_model_prices(self.input_price_per_million, self.output_price_per_million)
+        {
             return ModelPriceCheckResult {
                 source: ModelPriceSource::Configured,
                 prices: Some(prices),
@@ -457,7 +456,10 @@ impl AiClient {
             Err(err) => {
                 self.debug_emit(
                     AiDebugLevel::Warn,
-                    &format!("model pricing probe failed: {}", mask_sensitive(&err.to_string())),
+                    &format!(
+                        "model pricing probe failed: {}",
+                        mask_sensitive(&err.to_string())
+                    ),
                 );
                 let prices = builtin_model_prices(&self.model);
                 ModelPriceCheckResult {
@@ -939,7 +941,7 @@ impl AiClient {
             );
             if !refreshed_for_idle_hint && take_interactive_input_refresh_hint() {
                 self.reconnect_http_client()?;
-                maybe_print_ai_reconnect_notice(&i18n::chat_ai_reconnecting_after_idle());
+                maybe_print_ai_reconnect_notice(i18n::chat_ai_reconnecting_after_idle());
                 refreshed_for_idle_hint = true;
             }
             let started = Instant::now();
@@ -1041,9 +1043,8 @@ impl AiClient {
                     let err_msg = format!("AI request failed: {}", format_reqwest_error(&err));
                     logging::warn(&err_msg);
                     if attempt <= self.max_retries {
-                        retry_with_fresh_client = should_refresh_http_client_after_reqwest_error(
-                            &err,
-                        );
+                        retry_with_fresh_client =
+                            should_refresh_http_client_after_reqwest_error(&err);
                         if retry_with_fresh_client {
                             maybe_print_ai_reconnect_notice(&i18n::chat_ai_reconnecting(
                                 attempt,
@@ -1079,9 +1080,7 @@ impl AiClient {
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            logging::info(&format!(
-                "AI streaming request started, attempt={attempt}"
-            ));
+            logging::info(&format!("AI streaming request started, attempt={attempt}"));
             self.debug_emit(
                 AiDebugLevel::Info,
                 &format!(
@@ -1096,11 +1095,14 @@ impl AiClient {
             stream_body.stream = Some(true);
             self.debug_emit(
                 AiDebugLevel::Debug,
-                &format!("AI streaming request body: {}", serialize_debug_json(&stream_body)),
+                &format!(
+                    "AI streaming request body: {}",
+                    serialize_debug_json(&stream_body)
+                ),
             );
             if !refreshed_for_idle_hint && take_interactive_input_refresh_hint() {
                 self.reconnect_http_client()?;
-                maybe_print_ai_reconnect_notice(&i18n::chat_ai_reconnecting_after_idle());
+                maybe_print_ai_reconnect_notice(i18n::chat_ai_reconnecting_after_idle());
                 refreshed_for_idle_hint = true;
             }
             let client = if retry_with_fresh_client {
@@ -1251,9 +1253,8 @@ impl AiClient {
                     self.debug_emit(AiDebugLevel::Error, &err_msg);
                     logging::warn(&err_msg);
                     if attempt <= self.max_retries {
-                        retry_with_fresh_client = should_refresh_http_client_after_reqwest_error(
-                            &err,
-                        );
+                        retry_with_fresh_client =
+                            should_refresh_http_client_after_reqwest_error(&err);
                         if retry_with_fresh_client {
                             maybe_print_ai_reconnect_notice(&i18n::chat_ai_reconnecting(
                                 attempt,
@@ -1292,9 +1293,11 @@ impl AiClient {
             tool_choice: None,
             stream: None,
         };
-        let call = match self
-            .send_chat_completion_with_optional_streaming(&request, stream_output, on_stream_event)
-        {
+        let call = match self.send_chat_completion_with_optional_streaming(
+            &request,
+            stream_output,
+            on_stream_event,
+        ) {
             Ok(call) => call,
             Err(err) => {
                 if is_rate_limited_error(&err) {
@@ -1785,9 +1788,7 @@ where
             if streamed_content || streamed_thinking {
                 StreamParseResult::Fatal(format!("failed to read AI streaming response: {err}"))
             } else {
-                StreamParseResult::Retryable(format!(
-                    "failed to read AI streaming response: {err}"
-                ))
+                StreamParseResult::Retryable(format!("failed to read AI streaming response: {err}"))
             }
         })?;
         if read == 0 {
@@ -1802,13 +1803,9 @@ where
             if !saw_sse {
                 buffered_body.push_str(trimmed_line);
                 buffered_body.push('\n');
-                reader
-                    .read_to_string(&mut buffered_body)
-                    .map_err(|err| {
-                        StreamParseResult::Retryable(format!(
-                            "failed to read AI fallback body: {err}"
-                        ))
-                    })?;
+                reader.read_to_string(&mut buffered_body).map_err(|err| {
+                    StreamParseResult::Retryable(format!("failed to read AI fallback body: {err}"))
+                })?;
                 return Err(StreamParseResult::FallbackJson(buffered_body));
             }
             continue;
@@ -1832,9 +1829,7 @@ where
                     &format!("AI streaming chunk parse error: {err}; payload={payload}"),
                 );
                 if streamed_content || streamed_thinking {
-                    StreamParseResult::Fatal(format!(
-                        "failed to parse AI streaming chunk: {err}"
-                    ))
+                    StreamParseResult::Fatal(format!("failed to parse AI streaming chunk: {err}"))
                 } else {
                     StreamParseResult::Retryable(format!(
                         "failed to parse AI streaming chunk: {err}"
@@ -2396,14 +2391,12 @@ fn with_cost(
     output_price_per_million: f64,
     runtime_model_prices: Option<(f64, f64)>,
 ) -> ChatMetrics {
-    let Some((resolved_input_price, resolved_output_price)) =
-        resolve_effective_model_prices(
-            model,
-            input_price_per_million,
-            output_price_per_million,
-            runtime_model_prices,
-        )
-    else {
+    let Some((resolved_input_price, resolved_output_price)) = resolve_effective_model_prices(
+        model,
+        input_price_per_million,
+        output_price_per_million,
+        runtime_model_prices,
+    ) else {
         metrics.estimated_cost_usd = None;
         return metrics;
     };
@@ -2476,8 +2469,7 @@ fn normalize_priced_model_name(model: &str) -> String {
         .unwrap_or(trimmed.as_str())
         .trim();
     last_segment
-        .replace('_', "-")
-        .replace(' ', "-")
+        .replace(['_', ' '], "-")
         .trim_matches('-')
         .to_string()
 }
@@ -2531,8 +2523,7 @@ fn price_probe_candidate_models(model: &str) -> Vec<String> {
         return candidates;
     };
     for candidate in known_priced_models() {
-        if candidate.starts_with(family_prefix) && seen.insert((*candidate).to_string())
-        {
+        if candidate.starts_with(family_prefix) && seen.insert((*candidate).to_string()) {
             candidates.push((*candidate).to_string());
         }
     }
@@ -2830,8 +2821,7 @@ pub(crate) fn is_transient_ai_error(err: &AppError) -> bool {
 }
 
 fn should_retry_status(status: StatusCode) -> bool {
-    status.is_server_error()
-        || matches!(status, StatusCode::REQUEST_TIMEOUT)
+    status.is_server_error() || matches!(status, StatusCode::REQUEST_TIMEOUT)
 }
 
 fn parse_rate_limit_retry_delay(status: StatusCode, retry_after: Option<&str>) -> Option<Duration> {
@@ -2982,7 +2972,11 @@ fn normalize_tool_call_ids_in_request(body: &mut ChatCompletionRequest) {
             for tool_call in tool_calls {
                 let original_id = tool_call.id.trim().to_string();
                 let normalized_id = if original_id.is_empty() || seen_ids.contains(&original_id) {
-                    generate_unique_tool_call_id(&original_id, &mut seen_ids, &mut generated_counter)
+                    generate_unique_tool_call_id(
+                        &original_id,
+                        &mut seen_ids,
+                        &mut generated_counter,
+                    )
                 } else {
                     seen_ids.insert(original_id.clone());
                     original_id.clone()
@@ -3062,25 +3056,23 @@ fn should_retry_without_reasoning_content(status: StatusCode, body: &str) -> boo
 
 #[cfg(test)]
 mod tests {
-    use reqwest::blocking::Client;
     use reqwest::StatusCode;
+    use reqwest::blocking::Client;
     use serde_json::json;
     use std::{env, fs, sync::RwLock, time::Duration};
 
     use super::{
-        AiClient, ChatCompletionStreamResponse, ChatMetrics, ChatStopReason,
-        FinalizeWithoutToolsState, ModelPriceSource, PersistedModelPriceCatalog,
-        PersistedModelPriceEntry, builtin_model_prices, extract_text_from_value,
-        extract_text_delta_from_value, fresh_model_price_catalog, merge_text_delta,
-        merge_visible_chunks,
-        parse_model_price_catalog_response, parse_model_price_probe_response,
+        AiClient, ApiMessage, ApiToolCall, ApiToolFunction, ChatCompletionRequest,
+        ChatCompletionStreamResponse, ChatMetrics, ChatStopReason, FinalizeWithoutToolsState,
+        ModelPriceSource, PersistedModelPriceCatalog, PersistedModelPriceEntry,
+        builtin_model_prices, extract_text_delta_from_value, extract_text_from_value,
+        fresh_model_price_catalog, is_rate_limited_error, merge_text_delta, merge_visible_chunks,
+        normalize_stepfun_chat_request, parse_model_price_catalog_response,
+        parse_model_price_probe_response, parse_rate_limit_retry_delay,
         price_probe_candidate_models, provider_requires_reasoning_content_omission,
         request_contains_reasoning_content, resolve_effective_model_prices,
-        is_rate_limited_error, parse_rate_limit_retry_delay,
-        should_refresh_http_client_after_reqwest_error,
-        should_fallback_to_non_streaming, should_retry_without_reasoning_content,
-        strip_reasoning_content_from_request, with_cost, ChatCompletionRequest, ApiMessage,
-        normalize_stepfun_chat_request, ApiToolCall, ApiToolFunction,
+        should_fallback_to_non_streaming, should_refresh_http_client_after_reqwest_error,
+        should_retry_without_reasoning_content, strip_reasoning_content_from_request, with_cost,
     };
     use crate::error::AppError;
 
@@ -3338,7 +3330,13 @@ mod tests {
     #[test]
     fn unknown_model_price_probe_candidates_do_not_expand_to_all_known_models() {
         let candidates = price_probe_candidate_models("vendor/custom-model");
-        assert_eq!(candidates, vec!["vendor/custom-model".to_string(), "custom-model".to_string()]);
+        assert_eq!(
+            candidates,
+            vec![
+                "vendor/custom-model".to_string(),
+                "custom-model".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -3380,10 +3378,9 @@ mod tests {
 
     #[test]
     fn streaming_chunk_accepts_null_usage() {
-        let parsed: ChatCompletionStreamResponse = serde_json::from_str(
-            r#"{"choices":[{"delta":{"content":"hello"}}],"usage":null}"#,
-        )
-        .expect("null usage should deserialize");
+        let parsed: ChatCompletionStreamResponse =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"hello"}}],"usage":null}"#)
+                .expect("null usage should deserialize");
         assert_eq!(parsed.usage.prompt_tokens, 0);
         assert_eq!(parsed.usage.completion_tokens, 0);
         assert_eq!(parsed.usage.total_tokens, 0);
@@ -3521,7 +3518,9 @@ mod tests {
             .get("://bad-url")
             .build()
             .expect_err("request build should fail");
-        assert!(!should_refresh_http_client_after_reqwest_error(&invalid_url_err));
+        assert!(!should_refresh_http_client_after_reqwest_error(
+            &invalid_url_err
+        ));
     }
 
     #[test]
@@ -3601,7 +3600,13 @@ mod tests {
         assert_eq!(first_id, "call_1");
         assert_ne!(second_id, "call_1");
         assert_ne!(second_id, first_id);
-        assert_eq!(request.messages[1].tool_call_id.as_deref(), Some(first_id.as_str()));
-        assert_eq!(request.messages[3].tool_call_id.as_deref(), Some(second_id.as_str()));
+        assert_eq!(
+            request.messages[1].tool_call_id.as_deref(),
+            Some(first_id.as_str())
+        );
+        assert_eq!(
+            request.messages[3].tool_call_id.as_deref(),
+            Some(second_id.as_str())
+        );
     }
 }

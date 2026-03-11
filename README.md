@@ -48,28 +48,29 @@ cargo build --release
 ### 2) 生成配置模板
 
 ```bash
-./target/release/MachineClaw --show-config-template
+./target/release/MachineClaw --show-config-template > ./target/release/claw.toml
 ```
 
-将输出内容保存为 `claw.toml`（建议放在你的运行目录或通过 `--conf` 显式指定）。
+默认读取 `<可执行文件目录>/claw.toml`。  
+若你更希望把示例文件放在仓库目录，可保存为 `sample/claw-sample.toml`，并通过 `--conf` 显式指定。
 
 ### 3) 运行示例
 
 ```bash
 # 运行前检查
-sudo ./target/release/MachineClaw prepare --conf=./.docs/claw-sample.toml
+sudo ./target/release/MachineClaw prepare --conf=./sample/claw-sample.toml
 
 # 状态巡检
-sudo ./target/release/MachineClaw inspect all --conf=./.docs/claw-sample.toml
+sudo ./target/release/MachineClaw inspect all --conf=./sample/claw-sample.toml
 
 # 进入 chat
-sudo ./target/release/MachineClaw chat --conf=./.docs/claw-sample.toml
+sudo ./target/release/MachineClaw chat --conf=./sample/claw-sample.toml
 
 # 查看当前生效配置快照（脱敏）
-./target/release/MachineClaw show-config --conf=./.docs/claw-sample.toml
+./target/release/MachineClaw show-config --conf=./sample/claw-sample.toml
 
 # 生成内嵌配置快照的新二进制
-./target/release/MachineClaw snapshot --conf=./.docs/claw-sample.toml -o ./MachineClaw-prod
+./target/release/MachineClaw snapshot --conf=./sample/claw-sample.toml -o ./MachineClaw-prod
 ```
 
 ## 跨平台构建可执行文件
@@ -104,6 +105,11 @@ cargo build --release --target x86_64-apple-darwin
 # macOS Apple Silicon
 cargo build --release --target aarch64-apple-darwin
 ```
+
+注意：
+
+- `x86_64-unknown-linux-musl` 目标在 macOS 上通常需要额外的 C 交叉编译器。
+- 若出现 `failed to find tool "x86_64-linux-musl-gcc"`，请改用下方 `cross` 或 `cargo-zigbuild` 方式构建。
 
 Windows 平台常用命令：
 
