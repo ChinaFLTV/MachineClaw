@@ -233,7 +233,8 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
     let base_system_prompt = render::load_prompt_template(services.assets_dir, "chat_system.md")?;
     let system_prompt = build_chat_system_prompt(services, &base_system_prompt);
     maybe_ensure_chat_environment_profile(services, &system_prompt)?;
-    maybe_prepare_chat_model_price(services);
+    let chat_input_waiting = Arc::new(AtomicBool::new(false));
+    maybe_prepare_chat_model_price(services, chat_input_waiting.clone());
     let initial_message_count = services.session.message_count();
     let mut chat_turns: usize = 0;
     let mut tool_stats = ChatToolStats::default();
@@ -246,6 +247,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
     render_chat_window_header(services, false);
 
     loop {
+        chat_input_waiting.store(true, Ordering::SeqCst);
         print!(
             "{}",
             render::render_chat_user_prompt(
@@ -258,18 +260,21 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             .map_err(|err| AppError::Command(format!("failed to flush chat prompt: {err}")))?;
 
         let message_raw = if let Some(next_message) = pending_message.take() {
+            chat_input_waiting.store(false, Ordering::SeqCst);
             println!("{next_message}");
             next_message
         } else {
             let mut input = Vec::<u8>::new();
             let wait_started = Instant::now();
-            let read_count = {
+            let read_count_result = {
                 let stdin = io::stdin();
                 let mut stdin_lock = stdin.lock();
                 stdin_lock
                     .read_until(b'\n', &mut input)
-                    .map_err(|err| AppError::Command(format!("failed to read chat input: {err}")))?
+                    .map_err(|err| AppError::Command(format!("failed to read chat input: {err}")))
             };
+            chat_input_waiting.store(false, Ordering::SeqCst);
+            let read_count = read_count_result?;
             note_interactive_input_wait(wait_started);
             if read_count == 0 {
                 break;
@@ -1681,7 +1686,10 @@ fn clear_terminal() -> Result<(), AppError> {
         .map_err(|err| AppError::Command(format!("failed to clear terminal: {err}")))
 }
 
-fn maybe_prepare_chat_model_price(services: &mut ActionServices<'_>) {
+fn maybe_prepare_chat_model_price(
+    services: &mut ActionServices<'_>,
+    chat_input_waiting: Arc<AtomicBool>,
+) {
     let colorful = services.cfg.console.colorful;
     println!(
         "{}",
@@ -1715,9 +1723,11 @@ fn maybe_prepare_chat_model_price(services: &mut ActionServices<'_>) {
     thread::spawn(move || {
         let result = ai.prepare_model_pricing(false);
         let message = format_model_price_check_message(result);
-        println!(
-            "{}",
-            render::render_chat_custom_tag_event(i18n::chat_tag_model_price(), &message, colorful)
+        print_async_chat_notice(
+            i18n::chat_tag_model_price(),
+            &message,
+            colorful,
+            chat_input_waiting.as_ref(),
         );
         logging::info(&format!(
             "async model price check finished, model={}, message={}",
@@ -1756,6 +1766,32 @@ fn format_model_price_check_message(result: ModelPriceCheckResult) -> String {
         }
         _ => i18n::chat_model_price_check_unavailable().to_string(),
     }
+}
+
+fn print_async_chat_notice(tag: &str, message: &str, colorful: bool, input_waiting: &AtomicBool) {
+    let restore_prompt = io::stdout().is_terminal() && input_waiting.load(Ordering::SeqCst);
+    print!(
+        "{}",
+        render_async_chat_notice_output(tag, message, colorful, restore_prompt)
+    );
+    let _ = io::stdout().flush();
+}
+
+fn render_async_chat_notice_output(
+    tag: &str,
+    message: &str,
+    colorful: bool,
+    restore_prompt: bool,
+) -> String {
+    let rendered = render::render_chat_custom_tag_event(tag, message, colorful);
+    if !restore_prompt {
+        return format!("{rendered}\n");
+    }
+    format!(
+        "\r{: <160}\r{rendered}\n{}",
+        "",
+        render::render_chat_user_prompt(i18n::chat_prompt_user(), colorful)
+    )
 }
 
 fn render_chat_window_header(services: &ActionServices<'_>, after_clear: bool) {
@@ -2800,6 +2836,7 @@ mod tests {
     use super::{
         ChatAutosaveSnapshot, flush_chat_autosave_snapshot, normalize_builtin_command_alias,
         normalize_history_content, parse_builtin_command, parse_chat_history_limit,
+        render_async_chat_notice_output,
     };
     use std::fs;
     use std::sync::{Arc, Mutex};
@@ -2857,5 +2894,18 @@ mod tests {
         let written = fs::read_to_string(&target_path).expect("autosave file should be written");
         assert_eq!(written, "{\"ok\":true}");
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn async_chat_notice_output_restores_prompt_when_requested() {
+        let output = render_async_chat_notice_output("[tag]", "done", false, true);
+        assert!(output.contains("[tag] done\n"));
+        assert!(output.ends_with(crate::i18n::chat_prompt_user()));
+    }
+
+    #[test]
+    fn async_chat_notice_output_does_not_append_prompt_by_default() {
+        let output = render_async_chat_notice_output("[tag]", "done", false, false);
+        assert_eq!(output, "[tag] done\n");
     }
 }
