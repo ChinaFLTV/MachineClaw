@@ -211,6 +211,10 @@ impl ShellExecutor {
         INTERRUPTED.store(false, Ordering::SeqCst);
     }
 
+    pub fn request_interrupt() {
+        INTERRUPTED.store(true, Ordering::SeqCst);
+    }
+
     pub fn run(&self, spec: &CommandSpec) -> Result<CommandResult, AppError> {
         self.run_with_effective_timeout(spec, self.timeout)
     }

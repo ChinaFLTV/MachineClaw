@@ -249,7 +249,7 @@ fn run() -> Result<ExitCode, AppError> {
             == "async";
     let mut mcp_manager = if use_async_mcp_availability_check {
         let pending_summary = format!("{}, availability=checking(async)", mcp_summary(&cfg.mcp));
-        mcp::McpManager::pending(pending_summary)
+        mcp::McpManager::pending_with_config(&cfg.mcp, pending_summary)
     } else {
         mcp::McpManager::connect(&cfg.mcp)?
     };

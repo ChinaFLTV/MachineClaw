@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     fs,
-    io::{self, BufRead, IsTerminal, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -14,6 +14,7 @@ use std::{
 };
 
 use chrono::{Local, TimeZone};
+use colored::Colorize;
 use dialoguer::{MultiSelect, theme::ColorfulTheme};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -25,7 +26,7 @@ use crate::{
     ai::{
         AiClient, ChatRoundEvent, ChatStreamEvent, ChatStreamEventKind, ExternalToolDefinition,
         ModelPriceCheckResult, ModelPriceSource, ToolCallRequest, ToolUsePolicy,
-        is_transient_ai_error,
+        is_chat_cancelled_error, is_transient_ai_error,
     },
     cli::InspectTarget,
     config::{
@@ -341,25 +342,15 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             println!("{next_message}");
             next_message
         } else {
-            let mut input = Vec::<u8>::new();
             let wait_started = Instant::now();
-            let read_count_result = {
-                let stdin = io::stdin();
-                let mut stdin_lock = stdin.lock();
-                stdin_lock
-                    .read_until(b'\n', &mut input)
-                    .map_err(|err| AppError::Command(format!("failed to read chat input: {err}")))
-            };
+            let read_result = read_chat_user_input_line();
             chat_input_waiting.store(false, Ordering::SeqCst);
-            let read_count = read_count_result?;
             note_interactive_input_wait(wait_started);
-            if read_count == 0 {
-                break;
+            match read_result? {
+                ChatInputReadOutcome::Eof => break,
+                ChatInputReadOutcome::CancelRequested => continue,
+                ChatInputReadOutcome::Line(line) => line.trim().to_string(),
             }
-            while matches!(input.last(), Some(b'\n' | b'\r')) {
-                input.pop();
-            }
-            String::from_utf8_lossy(&input).trim().to_string()
         };
         let message = normalize_builtin_command_alias(normalize_chat_message(&message_raw));
         if message.is_empty() {
@@ -419,8 +410,13 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                     );
                 }
                 "skills" if command.arg.is_empty() => {
-                    let markdown =
-                        format_chat_skills_markdown(services.cfg.skills.enabled, services.skills);
+                    let skills_dir = expand_tilde(&services.cfg.skills.dir);
+                    let markdown = format_chat_skills_markdown(
+                        services.cfg.skills.enabled,
+                        &skills_dir,
+                        services.skills,
+                        services.cfg.console.colorful,
+                    );
                     println!(
                         "{}",
                         render::render_markdown_for_terminal(
@@ -430,8 +426,11 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                     );
                 }
                 "mcps" if command.arg.is_empty() => {
-                    let markdown =
-                        format_chat_mcps_markdown(services.cfg.mcp.enabled, services.mcp);
+                    let markdown = format_chat_mcps_markdown(
+                        services.cfg.mcp.enabled,
+                        services.mcp,
+                        services.cfg.console.colorful,
+                    );
                     println!(
                         "{}",
                         render::render_markdown_for_terminal(
@@ -442,7 +441,8 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                 }
                 "list" if command.arg.is_empty() => {
                     let sessions = services.session.list_sessions()?;
-                    let markdown = format_chat_session_list_markdown(&sessions);
+                    let markdown =
+                        format_chat_session_list_markdown(&sessions, services.cfg.console.colorful);
                     println!(
                         "{}",
                         render::render_markdown_for_terminal(
@@ -644,7 +644,10 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
         }));
         let spinner_first_output = Arc::new(AtomicBool::new(false));
         let spinner_first_output_cloned = spinner_first_output.clone();
-        let response = match services.ai.chat_with_shell_tool(
+        let chat_cancel_requested = Arc::new(AtomicBool::new(false));
+        let mut cancel_watcher =
+            ChatCancelWatcher::start(chat_cancel_requested.clone(), services.cfg.console.colorful);
+        let response_result = services.ai.chat_with_shell_tool(
             &history,
             &system_prompt,
             &message,
@@ -653,6 +656,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             services.cfg.ai.chat.max_total_tool_calls,
             stream_output,
             &external_mcp_tools,
+            Some(chat_cancel_requested.as_ref()),
             |tool_call| {
                 execute_tool_call(
                     services,
@@ -723,12 +727,22 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
                 };
                 let _ = result;
             },
-        ) {
+        );
+        cancel_watcher.stop();
+        ShellExecutor::clear_interrupt_flag();
+        let response = match response_result {
             Ok(response) => response,
             Err(err) => {
                 let _ = stream_printer.borrow_mut().finish();
                 if let Some(mut spinner) = ai_wait_spinner.into_inner() {
                     spinner.stop();
+                }
+                if is_chat_cancelled_error(&err) {
+                    println!(
+                        "{}",
+                        render::render_chat_notice(i18n::chat_ai_cancelled_by_shortcut(), colorful,)
+                    );
+                    continue;
                 }
                 if is_transient_ai_error(&err) {
                     let failure_notice = i18n::chat_ai_recoverable_failure(&mask_sensitive(
@@ -1489,6 +1503,340 @@ fn extract_skill_name_with_prefix(command: &str, prefix: &str) -> Option<String>
     Some(skill_name)
 }
 
+enum ChatInputReadOutcome {
+    Line(String),
+    Eof,
+    CancelRequested,
+}
+
+fn is_chat_cancel_shortcut_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() == 1 && bytes[0] == 0x10 {
+        return true;
+    }
+    if bytes.first().copied() != Some(0x1b) {
+        return false;
+    }
+    is_cancel_shortcut_escape_sequence(&bytes[1..])
+}
+
+fn is_cancel_shortcut_escape_sequence(sequence: &[u8]) -> bool {
+    if sequence.is_empty() {
+        return false;
+    }
+    if sequence.len() == 1 {
+        return matches!(sequence[0], b'p' | b'P');
+    }
+    if sequence[0] != b'[' {
+        return false;
+    }
+    is_cancel_shortcut_csi_sequence(&sequence[1..])
+}
+
+fn is_cancel_shortcut_csi_sequence(sequence: &[u8]) -> bool {
+    let Some((&suffix, body_bytes)) = sequence.split_last() else {
+        return false;
+    };
+    let Ok(body) = std::str::from_utf8(body_bytes) else {
+        return false;
+    };
+    match suffix {
+        b'u' => {
+            let mut parts = body.split(';');
+            let codepoint = parts.next().and_then(|item| item.parse::<u32>().ok());
+            let modifiers = parts
+                .next()
+                .and_then(|item| item.parse::<u32>().ok())
+                .unwrap_or(1);
+            matches!(codepoint, Some(80 | 112)) && modifiers > 1
+        }
+        b'~' => {
+            let parts = body.split(';').collect::<Vec<_>>();
+            if parts.len() < 3 || parts[0] != "27" {
+                return false;
+            }
+            let modifiers = parts
+                .get(1)
+                .and_then(|item| item.parse::<u32>().ok())
+                .unwrap_or(1);
+            let key_code = parts.last().and_then(|item| item.parse::<u32>().ok());
+            matches!(key_code, Some(80 | 112)) && modifiers > 1
+        }
+        _ => false,
+    }
+}
+
+fn read_chat_user_input_line() -> Result<ChatInputReadOutcome, AppError> {
+    #[cfg(unix)]
+    {
+        return read_chat_user_input_line_unix();
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::BufRead;
+        let mut input = Vec::<u8>::new();
+        let stdin = io::stdin();
+        let mut stdin_lock = stdin.lock();
+        let read_count = stdin_lock
+            .read_until(b'\n', &mut input)
+            .map_err(|err| AppError::Command(format!("failed to read chat input: {err}")))?;
+        if read_count == 0 {
+            return Ok(ChatInputReadOutcome::Eof);
+        }
+        while matches!(input.last(), Some(b'\n' | b'\r')) {
+            input.pop();
+        }
+        if is_chat_cancel_shortcut_bytes(input.as_slice()) {
+            return Ok(ChatInputReadOutcome::CancelRequested);
+        }
+        Ok(ChatInputReadOutcome::Line(
+            String::from_utf8_lossy(&input).to_string(),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn read_chat_user_input_line_unix() -> Result<ChatInputReadOutcome, AppError> {
+    let fd = libc::STDIN_FILENO;
+    let _guard = TerminalRawModeGuard::new(fd)?;
+    let mut buffer = String::new();
+    loop {
+        let Some(byte) = read_single_terminal_byte(fd)? else {
+            return Ok(ChatInputReadOutcome::Eof);
+        };
+        match byte {
+            b'\r' | b'\n' => {
+                println!();
+                io::stdout()
+                    .flush()
+                    .map_err(|err| AppError::Command(format!("failed to flush newline: {err}")))?;
+                return Ok(ChatInputReadOutcome::Line(buffer));
+            }
+            0x04 => {
+                if buffer.is_empty() {
+                    println!();
+                    io::stdout().flush().map_err(|err| {
+                        AppError::Command(format!("failed to flush eof newline: {err}"))
+                    })?;
+                    return Ok(ChatInputReadOutcome::Eof);
+                }
+            }
+            0x10 => {
+                println!();
+                io::stdout().flush().map_err(|err| {
+                    AppError::Command(format!("failed to flush cancel newline: {err}"))
+                })?;
+                return Ok(ChatInputReadOutcome::CancelRequested);
+            }
+            0x7f | 0x08 => {
+                erase_last_terminal_char(&mut buffer)?;
+            }
+            0x1b => {
+                let action = handle_terminal_escape_sequence(fd, &mut buffer)?;
+                if matches!(action, TerminalEscapeAction::CancelRequested) {
+                    println!();
+                    io::stdout().flush().map_err(|err| {
+                        AppError::Command(format!("failed to flush cancel newline: {err}"))
+                    })?;
+                    return Ok(ChatInputReadOutcome::CancelRequested);
+                }
+            }
+            _ => {
+                if byte.is_ascii_control() {
+                    continue;
+                }
+                if byte.is_ascii() {
+                    let ch = byte as char;
+                    buffer.push(ch);
+                    print!("{ch}");
+                    io::stdout().flush().map_err(|err| {
+                        AppError::Command(format!("failed to flush chat input: {err}"))
+                    })?;
+                    continue;
+                }
+                if let Some(text) = read_utf8_char_from_terminal(fd, byte)? {
+                    buffer.push_str(&text);
+                    print!("{text}");
+                    io::stdout().flush().map_err(|err| {
+                        AppError::Command(format!("failed to flush chat utf8 input: {err}"))
+                    })?;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+enum TerminalEscapeAction {
+    Consumed,
+    CancelRequested,
+}
+
+#[cfg(unix)]
+fn handle_terminal_escape_sequence(
+    fd: i32,
+    buffer: &mut String,
+) -> Result<TerminalEscapeAction, AppError> {
+    let Some(sequence) = read_terminal_escape_sequence(fd)? else {
+        return Ok(TerminalEscapeAction::Consumed);
+    };
+    if is_cancel_shortcut_escape_sequence(&sequence) {
+        return Ok(TerminalEscapeAction::CancelRequested);
+    }
+    if sequence.first().copied() != Some(b'[') {
+        return Ok(TerminalEscapeAction::Consumed);
+    }
+    let Some(third) = sequence.get(1).copied() else {
+        return Ok(TerminalEscapeAction::Consumed);
+    };
+    if matches!(third, b'A' | b'B' | b'C' | b'D') {
+        return Ok(TerminalEscapeAction::Consumed);
+    }
+    if third == b'3' {
+        erase_last_terminal_char(buffer)?;
+    }
+    Ok(TerminalEscapeAction::Consumed)
+}
+
+#[cfg(unix)]
+fn read_terminal_escape_sequence(fd: i32) -> Result<Option<Vec<u8>>, AppError> {
+    let Some(second) = poll_terminal_byte(fd, ESC_SEQUENCE_POLL_TIMEOUT_MS)? else {
+        return Ok(None);
+    };
+    let mut sequence = vec![second];
+    if second != b'[' {
+        return Ok(Some(sequence));
+    }
+    while let Some(next) = poll_terminal_byte(fd, ESC_SEQUENCE_POLL_TIMEOUT_MS)? {
+        sequence.push(next);
+        if (b'@'..=b'~').contains(&next) || sequence.len() >= 24 {
+            break;
+        }
+    }
+    Ok(Some(sequence))
+}
+
+#[cfg(unix)]
+fn erase_last_terminal_char(buffer: &mut String) -> Result<(), AppError> {
+    let Some(ch) = buffer.pop() else {
+        return Ok(());
+    };
+    let width = unicode_width::UnicodeWidthChar::width(ch)
+        .unwrap_or(1)
+        .max(1);
+    print!("{}", "\u{8} \u{8}".repeat(width));
+    io::stdout()
+        .flush()
+        .map_err(|err| AppError::Command(format!("failed to flush backspace: {err}")))
+}
+
+#[cfg(unix)]
+fn read_utf8_char_from_terminal(fd: i32, first: u8) -> Result<Option<String>, AppError> {
+    let expected_len = if first & 0b1110_0000 == 0b1100_0000 {
+        2
+    } else if first & 0b1111_0000 == 0b1110_0000 {
+        3
+    } else if first & 0b1111_1000 == 0b1111_0000 {
+        4
+    } else {
+        1
+    };
+    if expected_len == 1 {
+        return Ok(None);
+    }
+    let mut bytes = vec![first];
+    for _ in 1..expected_len {
+        let Some(next) = read_single_terminal_byte(fd)? else {
+            return Ok(None);
+        };
+        bytes.push(next);
+    }
+    match std::str::from_utf8(&bytes) {
+        Ok(text) => Ok(Some(text.to_string())),
+        Err(_) => Ok(None),
+    }
+}
+
+#[cfg(unix)]
+fn read_single_terminal_byte(fd: i32) -> Result<Option<u8>, AppError> {
+    let mut byte = 0u8;
+    let read_count = unsafe { libc::read(fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
+    if read_count < 0 {
+        return Err(AppError::Command(format!(
+            "failed to read chat input byte: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if read_count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(byte))
+}
+
+#[cfg(unix)]
+fn poll_terminal_byte(fd: i32, timeout_ms: i32) -> Result<Option<u8>, AppError> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let poll_ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if poll_ret < 0 {
+        return Err(AppError::Command(format!(
+            "failed to poll chat input byte: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if poll_ret == 0 || (pfd.revents & libc::POLLIN) == 0 {
+        return Ok(None);
+    }
+    read_single_terminal_byte(fd)
+}
+
+#[cfg(unix)]
+struct TerminalRawModeGuard {
+    fd: i32,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl TerminalRawModeGuard {
+    fn new(fd: i32) -> Result<Self, AppError> {
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        let ret = unsafe { libc::tcgetattr(fd, &mut original as *mut libc::termios) };
+        if ret != 0 {
+            return Err(AppError::Command(format!(
+                "failed to get terminal mode: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut raw = original;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        let set_ret = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw as *const libc::termios) };
+        if set_ret != 0 {
+            return Err(AppError::Command(format!(
+                "failed to set terminal raw mode: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(Self { fd, original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalRawModeGuard {
+    fn drop(&mut self) {
+        let _ = unsafe {
+            libc::tcsetattr(
+                self.fd,
+                libc::TCSANOW,
+                &self.original as *const libc::termios,
+            )
+        };
+    }
+}
+
 struct BuiltinCommand {
     name: String,
     arg: String,
@@ -1622,7 +1970,16 @@ fn strip_terminal_control_sequences(input: &str) -> String {
     out
 }
 
-fn format_chat_session_list_markdown(sessions: &[crate::context::SessionOverview]) -> String {
+const SESSION_LIST_MIN_COLUMN_WIDTHS: [usize; 8] = [1, 6, 6, 8, 3, 8, 8, 10];
+const SKILLS_TABLE_MIN_COLUMN_WIDTHS: [usize; 6] = [1, 8, 8, 16, 12, 6];
+const MCP_SERVICES_TABLE_MIN_COLUMN_WIDTHS: [usize; 8] = [8, 4, 12, 3, 3, 3, 8, 8];
+const MCP_TOOLS_TABLE_MIN_COLUMN_WIDTHS: [usize; 5] = [8, 8, 8, 12, 8];
+const ESC_SEQUENCE_POLL_TIMEOUT_MS: i32 = 25;
+
+fn format_chat_session_list_markdown(
+    sessions: &[crate::context::SessionOverview],
+    colorful: bool,
+) -> String {
     if sessions.is_empty() {
         return i18n::chat_session_list_empty().to_string();
     }
@@ -1662,7 +2019,8 @@ fn format_chat_session_list_markdown(sessions: &[crate::context::SessionOverview
             item.file_path.display().to_string(),
         ]);
     }
-    lines.extend(format_fixed_table(
+    let table_max_width = current_terminal_columns().saturating_sub(2);
+    lines.extend(format_fixed_table_with_options(
         &[
             i18n::chat_session_list_header_active(),
             i18n::chat_session_list_header_name(),
@@ -1674,6 +2032,9 @@ fn format_chat_session_list_markdown(sessions: &[crate::context::SessionOverview
             i18n::chat_session_list_header_file(),
         ],
         &rows,
+        Some(table_max_width),
+        Some(&SESSION_LIST_MIN_COLUMN_WIDTHS),
+        colorful,
     ));
     lines.join("\n")
 }
@@ -1718,7 +2079,13 @@ fn pad_cell(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(width - current))
 }
 
-fn format_fixed_table(headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {
+fn format_fixed_table_with_options(
+    headers: &[&str],
+    rows: &[Vec<String>],
+    max_total_width: Option<usize>,
+    min_widths: Option<&[usize]>,
+    colorful: bool,
+) -> Vec<String> {
     if headers.is_empty() {
         return Vec::new();
     }
@@ -1735,7 +2102,16 @@ fn format_fixed_table(headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {
             }
         }
     }
-    let border = format!(
+    if let Some(limit) = max_total_width {
+        let minimums = min_widths.unwrap_or(&[]);
+        shrink_table_width_to_limit(&mut widths, limit, minimums);
+    }
+    let truncated_headers = headers
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| truncate_display_width(value, widths[idx]))
+        .collect::<Vec<_>>();
+    let border_raw = format!(
         "+{}+",
         widths
             .iter()
@@ -1743,23 +2119,34 @@ fn format_fixed_table(headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {
             .collect::<Vec<_>>()
             .join("+")
     );
+    let border = if colorful {
+        border_raw.bright_black().to_string()
+    } else {
+        border_raw
+    };
     let mut lines = Vec::<String>::new();
     lines.push(border.clone());
-    lines.push(format!(
+    let header_line = format!(
         "| {} |",
-        headers
+        truncated_headers
             .iter()
             .enumerate()
             .map(|(idx, value)| pad_cell(value, widths[idx]))
             .collect::<Vec<_>>()
             .join(" | ")
-    ));
+    );
+    lines.push(if colorful {
+        header_line.bold().bright_cyan().to_string()
+    } else {
+        header_line
+    });
     lines.push(border.clone());
     for row in rows {
         let mut padded = Vec::<String>::new();
         for (idx, width) in widths.iter().enumerate() {
             let value = row.get(idx).cloned().unwrap_or_default();
-            padded.push(pad_cell(&value, *width));
+            let truncated = truncate_display_width(&value, *width);
+            padded.push(pad_cell(&truncated, *width));
         }
         lines.push(format!("| {} |", padded.join(" | ")));
     }
@@ -1767,7 +2154,80 @@ fn format_fixed_table(headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {
     lines
 }
 
-fn format_chat_skills_markdown(enabled: bool, skills: &[String]) -> String {
+fn current_terminal_columns() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value >= 40)
+        .unwrap_or(120)
+}
+
+fn table_total_width(widths: &[usize]) -> usize {
+    widths.iter().sum::<usize>() + (widths.len() * 3) + 1
+}
+
+fn shrink_table_width_to_limit(widths: &mut [usize], max_total_width: usize, min_widths: &[usize]) {
+    if max_total_width == 0 || widths.is_empty() {
+        return;
+    }
+    let mut total = table_total_width(widths);
+    while total > max_total_width {
+        let mut widest_idx = None;
+        for (idx, width) in widths.iter().enumerate() {
+            let min_width = min_widths.get(idx).copied().unwrap_or(3).max(1);
+            if *width <= min_width {
+                continue;
+            }
+            match widest_idx {
+                Some(current) if widths[current] >= *width => {}
+                _ => widest_idx = Some(idx),
+            }
+        }
+        let Some(idx) = widest_idx else {
+            break;
+        };
+        widths[idx] = widths[idx].saturating_sub(1);
+        total = total.saturating_sub(1);
+    }
+}
+
+fn truncate_display_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if display_width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+    let mut truncated = String::new();
+    let mut current_width = 0usize;
+    for ch in text.chars() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + ch_width > max_width.saturating_sub(3) {
+            break;
+        }
+        truncated.push(ch);
+        current_width += ch_width;
+    }
+    truncated.push_str("...");
+    truncated
+}
+
+#[derive(Debug, Clone)]
+struct SkillDisplayRow {
+    path: String,
+    summary: String,
+    size_bytes: u64,
+}
+
+fn format_chat_skills_markdown(
+    enabled: bool,
+    skills_dir: &Path,
+    skills: &[String],
+    colorful: bool,
+) -> String {
     let mut sorted = skills.to_vec();
     sorted.sort();
     let mut lines = Vec::<String>::new();
@@ -1782,27 +2242,48 @@ fn format_chat_skills_markdown(enabled: bool, skills: &[String]) -> String {
         "- 扫描数量: {}",
         i18n::human_count_u128(sorted.len() as u128)
     ));
+    lines.push(format!("- 扫描目录: `{}`", skills_dir.display()));
     if sorted.is_empty() {
         lines.push("- 结果: (empty)".to_string());
         return lines.join("\n");
     }
+    let details = build_skill_display_map(skills_dir, &sorted);
+    let total_size = details.values().map(|item| item.size_bytes).sum::<u64>();
+    lines.push(format!("- 总占用: {}", format_human_bytes(total_size)));
     lines.push(String::new());
     let rows = sorted
         .iter()
         .enumerate()
         .map(|(idx, name)| {
+            let detail = details.get(name);
             vec![
                 format!("{}", idx + 1),
                 name.replace('|', "\\|"),
                 availability_badge(enabled).to_string(),
+                detail
+                    .map(|item| item.path.replace('|', "\\|"))
+                    .unwrap_or_else(|| "-".to_string()),
+                detail
+                    .map(|item| item.summary.replace('|', "\\|"))
+                    .unwrap_or_else(|| "-".to_string()),
+                detail
+                    .map(|item| format_human_bytes(item.size_bytes))
+                    .unwrap_or_else(|| "-".to_string()),
             ]
         })
         .collect::<Vec<_>>();
-    lines.extend(format_fixed_table(&["#", "Skill", "可用性"], &rows));
+    let table_max_width = current_terminal_columns().saturating_sub(2);
+    lines.extend(format_fixed_table_with_options(
+        &["#", "Skill", "可用性", "路径", "摘要", "大小"],
+        &rows,
+        Some(table_max_width),
+        Some(&SKILLS_TABLE_MIN_COLUMN_WIDTHS),
+        colorful,
+    ));
     lines.join("\n")
 }
 
-fn format_chat_mcps_markdown(enabled: bool, mcp: &McpManager) -> String {
+fn format_chat_mcps_markdown(enabled: bool, mcp: &McpManager, colorful: bool) -> String {
     let services = mcp.service_statuses();
     let mut tools = mcp.tool_statuses();
     tools.sort_by(|left, right| {
@@ -1837,15 +2318,35 @@ fn format_chat_mcps_markdown(enabled: bool, mcp: &McpManager) -> String {
                 vec![
                     item.name.replace('|', "\\|"),
                     item.transport.replace('|', "\\|"),
-                    availability_badge(item.available).to_string(),
+                    item.target.replace('|', "\\|"),
+                    i18n::human_count_u128(item.args_count as u128),
+                    i18n::human_count_u128(item.timeout_seconds as u128),
                     i18n::human_count_u128(item.tool_count as u128),
-                    item.error.as_deref().unwrap_or("-").replace('|', "\\|"),
+                    availability_badge(item.available).to_string(),
+                    item.summary
+                        .as_deref()
+                        .or(item.error.as_deref())
+                        .unwrap_or("-")
+                        .replace('|', "\\|"),
                 ]
             })
             .collect::<Vec<_>>();
-        lines.extend(format_fixed_table(
-            &["服务", "传输", "可用性", "工具数", "详情"],
+        let table_max_width = current_terminal_columns().saturating_sub(2);
+        lines.extend(format_fixed_table_with_options(
+            &[
+                "服务",
+                "传输",
+                "目标",
+                "参数",
+                "超时",
+                "工具",
+                "可用性",
+                "摘要",
+            ],
             &service_rows,
+            Some(table_max_width),
+            Some(&MCP_SERVICES_TABLE_MIN_COLUMN_WIDTHS),
+            colorful,
         ));
     }
     if !tools.is_empty() {
@@ -1859,19 +2360,123 @@ fn format_chat_mcps_markdown(enabled: bool, mcp: &McpManager) -> String {
                     item.server_name.replace('|', "\\|"),
                     item.remote_name.replace('|', "\\|"),
                     item.ai_name.replace('|', "\\|"),
+                    trim_text(&item.description, 64).replace('|', "\\|"),
                     availability_badge(item.available).to_string(),
                 ]
             })
             .collect::<Vec<_>>();
-        lines.extend(format_fixed_table(
-            &["服务", "MCP工具", "AI工具名", "可用性"],
+        let table_max_width = current_terminal_columns().saturating_sub(2);
+        lines.extend(format_fixed_table_with_options(
+            &["服务", "MCP工具", "AI工具名", "摘要", "可用性"],
             &tool_rows,
+            Some(table_max_width),
+            Some(&MCP_TOOLS_TABLE_MIN_COLUMN_WIDTHS),
+            colorful,
         ));
     }
     if services.is_empty() && tools.is_empty() {
         lines.push("- 结果: (empty)".to_string());
     }
     lines.join("\n")
+}
+
+fn build_skill_display_map(
+    skills_dir: &Path,
+    skills: &[String],
+) -> HashMap<String, SkillDisplayRow> {
+    let mut map = HashMap::<String, SkillDisplayRow>::new();
+    for name in skills {
+        let skill_path = skills_dir.join(name);
+        let summary = read_skill_summary(&skill_path).unwrap_or_else(|| "-".to_string());
+        let size_bytes = compute_directory_size_bytes(&skill_path).unwrap_or(0);
+        map.insert(
+            name.clone(),
+            SkillDisplayRow {
+                path: skill_path.display().to_string(),
+                summary,
+                size_bytes,
+            },
+        );
+    }
+    map
+}
+
+fn read_skill_summary(skill_dir: &Path) -> Option<String> {
+    let skill_md = skill_dir.join("SKILL.md");
+    let content = fs::read_to_string(skill_md).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed == "---"
+            || trimmed.starts_with("```")
+            || trimmed.starts_with('#')
+        {
+            continue;
+        }
+        let cleaned = trimmed.trim_start_matches('#').trim();
+        if cleaned.is_empty() {
+            continue;
+        }
+        return Some(trim_text(cleaned, 80));
+    }
+    None
+}
+
+fn compute_directory_size_bytes(root: &Path) -> Result<u64, AppError> {
+    if !root.exists() {
+        return Ok(0);
+    }
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = fs::read_dir(&current).map_err(|err| {
+            AppError::Runtime(format!(
+                "failed to read directory {}: {err}",
+                current.display()
+            ))
+        })?;
+        for entry in entries {
+            let entry = match entry {
+                Ok(item) => item,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(item) => item,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    total = total.saturating_add(meta.len());
+                }
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn format_human_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let value = bytes as f64;
+    if value < MB {
+        return format!("{:.1} KB", value / KB);
+    }
+    if value < GB {
+        return format!("{:.1} MB", value / MB);
+    }
+    format!("{:.2} GB", value / GB)
 }
 
 fn format_local_datetime(epoch_ms: u128) -> String {
@@ -2856,6 +3461,87 @@ fn should_show_tool_event(services: &ActionServices<'_>, kind: render::ChatToolE
     }
 }
 
+struct ChatCancelWatcher {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ChatCancelWatcher {
+    fn start(cancel_requested: Arc<AtomicBool>, colorful: bool) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
+        let handle = {
+            let stop_cloned = stop.clone();
+            let cancel_requested_cloned = cancel_requested.clone();
+            Some(thread::spawn(move || {
+                watch_chat_cancel_shortcut(
+                    stop_cloned.as_ref(),
+                    cancel_requested_cloned.as_ref(),
+                    colorful,
+                );
+            }))
+        };
+        #[cfg(not(unix))]
+        let handle = None;
+        Self { stop, handle }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn watch_chat_cancel_shortcut(stop: &AtomicBool, cancel_requested: &AtomicBool, colorful: bool) {
+    let fd = libc::STDIN_FILENO;
+    let guard = TerminalRawModeGuard::new(fd);
+    if guard.is_err() {
+        return;
+    }
+    let _guard = guard.ok();
+    while !stop.load(Ordering::SeqCst) {
+        let maybe_byte = match poll_terminal_byte(fd, 100) {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        let Some(byte) = maybe_byte else {
+            continue;
+        };
+        if is_chat_cancel_control_or_escape_shortcut(fd, byte) {
+            notify_chat_cancel_requested(cancel_requested, colorful);
+            break;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_chat_cancel_control_or_escape_shortcut(fd: i32, byte: u8) -> bool {
+    if is_chat_cancel_shortcut_bytes(&[byte]) {
+        return true;
+    }
+    if byte != 0x1b {
+        return false;
+    }
+    match read_terminal_escape_sequence(fd) {
+        Ok(Some(sequence)) => is_cancel_shortcut_escape_sequence(&sequence),
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn notify_chat_cancel_requested(cancel_requested: &AtomicBool, colorful: bool) {
+    cancel_requested.store(true, Ordering::SeqCst);
+    ShellExecutor::request_interrupt();
+    println!(
+        "\n{}",
+        render::render_chat_notice(i18n::chat_ai_cancel_requested(), colorful)
+    );
+    let _ = io::stdout().flush();
+}
+
 struct ChatAutosaveWorker {
     latest_snapshot: Arc<Mutex<Option<ChatAutosaveSnapshot>>>,
     stop: Arc<AtomicBool>,
@@ -3480,13 +4166,15 @@ fn read_cmd(label: &str, command: &str) -> CommandSpec {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatAutosaveSnapshot, flush_chat_autosave_snapshot, format_chat_session_list_markdown,
-        format_chat_skills_markdown, format_fixed_table, normalize_builtin_command_alias,
-        normalize_history_content, parse_builtin_command, parse_chat_history_limit,
-        render_async_chat_notice_output, strip_ansi_escape_sequences,
+        ChatAutosaveSnapshot, display_width, flush_chat_autosave_snapshot,
+        format_chat_mcps_markdown, format_chat_session_list_markdown, format_chat_skills_markdown,
+        format_fixed_table_with_options, is_cancel_shortcut_csi_sequence,
+        is_cancel_shortcut_escape_sequence, is_chat_cancel_shortcut_bytes,
+        normalize_builtin_command_alias, normalize_history_content, parse_builtin_command,
+        parse_chat_history_limit, render_async_chat_notice_output, strip_ansi_escape_sequences,
     };
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use unicode_width::UnicodeWidthStr;
     use uuid::Uuid;
@@ -3529,6 +4217,33 @@ mod tests {
         assert_eq!(parse_chat_history_limit("999").expect("capped"), 200);
         assert!(parse_chat_history_limit("0").is_err());
         assert!(parse_chat_history_limit("abc").is_err());
+    }
+
+    #[test]
+    fn cancel_shortcut_bytes_supports_ctrl_and_escape_variants() {
+        assert!(is_chat_cancel_shortcut_bytes(&[0x10]));
+        assert!(is_chat_cancel_shortcut_bytes(&[0x1b, b'p']));
+        assert!(is_chat_cancel_shortcut_bytes(&[0x1b, b'P']));
+        assert!(!is_chat_cancel_shortcut_bytes(b"p"));
+        assert!(!is_chat_cancel_shortcut_bytes(&[0x1b, b'a']));
+    }
+
+    #[test]
+    fn cancel_shortcut_escape_sequence_supports_common_terminal_protocols() {
+        assert!(is_cancel_shortcut_escape_sequence(b"p"));
+        assert!(is_cancel_shortcut_escape_sequence(b"[112;9u"));
+        assert!(is_cancel_shortcut_escape_sequence(b"[27;9;112~"));
+        assert!(!is_cancel_shortcut_escape_sequence(b"[112;1u"));
+        assert!(!is_cancel_shortcut_escape_sequence(b"[27;1;112~"));
+        assert!(!is_cancel_shortcut_escape_sequence(b"[65;9u"));
+    }
+
+    #[test]
+    fn cancel_shortcut_csi_sequence_rejects_invalid_payloads() {
+        assert!(!is_cancel_shortcut_csi_sequence(b""));
+        assert!(!is_cancel_shortcut_csi_sequence(b"112;9"));
+        assert!(!is_cancel_shortcut_csi_sequence(b"invalidu"));
+        assert!(!is_cancel_shortcut_csi_sequence(b"27;9~"));
     }
 
     #[test]
@@ -3591,7 +4306,7 @@ mod tests {
             ],
             vec!["中文技能".to_string(), "🔴 unavailable".to_string()],
         ];
-        let lines = format_fixed_table(&["Skill", "可用性"], &rows);
+        let lines = format_fixed_table_with_options(&["Skill", "可用性"], &rows, None, None, false);
         assert!(lines.len() >= 4);
         let expected_width =
             UnicodeWidthStr::width(strip_ansi_escape_sequences(&lines[0]).as_str());
@@ -3604,10 +4319,52 @@ mod tests {
     }
 
     #[test]
+    fn fixed_table_can_shrink_to_target_width() {
+        let headers = ["A", "B", "C"];
+        let rows = vec![vec![
+            "aaaaaaaaaaaaaaaa".to_string(),
+            "bbbbbbbbbbbbbbbb".to_string(),
+            "cccccccccccccccc".to_string(),
+        ]];
+        let lines =
+            format_fixed_table_with_options(&headers, &rows, Some(24), Some(&[4, 4, 4]), false);
+        for line in lines {
+            assert!(display_width(&line) <= 24);
+        }
+    }
+
+    #[test]
     fn skills_output_uses_availability_header() {
-        let output = format_chat_skills_markdown(true, &["doc".to_string()]);
+        let output =
+            format_chat_skills_markdown(true, Path::new("/tmp"), &["doc".to_string()], false);
         assert!(output.contains("可用性"));
         assert!(!output.contains("指示灯"));
+    }
+
+    #[test]
+    fn skills_output_includes_path_summary_and_size_columns() {
+        let temp_dir = std::env::temp_dir().join(format!("machineclaw-skill-{}", Uuid::new_v4()));
+        let skill_dir = temp_dir.join("demo");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Demo Skill\nUse this skill for demo checks.\n",
+        )
+        .expect("write skill markdown");
+        let output = format_chat_skills_markdown(true, &temp_dir, &["demo".to_string()], false);
+        assert!(output.contains("路径"));
+        assert!(output.contains("摘要"));
+        assert!(output.contains("大小"));
+        assert!(output.contains("Use this skill"));
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn mcps_output_includes_target_and_summary_columns() {
+        let mcp = crate::mcp::McpManager::pending("enabled, servers=1".to_string());
+        let output = format_chat_mcps_markdown(true, &mcp, false);
+        assert!(output.contains("MCP Services"));
+        assert!(output.contains("MCP 摘要"));
     }
 
     #[test]
@@ -3626,9 +4383,31 @@ mod tests {
             last_updated_epoch_ms: 0,
             active: true,
         }];
-        let output = format_chat_session_list_markdown(&sessions);
+        let output = format_chat_session_list_markdown(&sessions, false);
         assert!(output.contains("+"));
         assert!(output.contains("|"));
         assert!(!output.contains("|---|---|"));
+    }
+
+    #[test]
+    fn session_list_output_supports_colorful_table_style() {
+        let sessions = vec![crate::context::SessionOverview {
+            session_id: "1234567890abcdef".to_string(),
+            session_name: "dev-chat".to_string(),
+            file_path: PathBuf::from("/tmp/dev-chat.json"),
+            message_count: 1,
+            summary_len: 0,
+            user_count: 1,
+            assistant_count: 0,
+            tool_count: 0,
+            system_count: 0,
+            created_at_epoch_ms: 0,
+            last_updated_epoch_ms: 0,
+            active: true,
+        }];
+        colored::control::set_override(true);
+        let output = format_chat_session_list_markdown(&sessions, true);
+        colored::control::unset_override();
+        assert!(output.contains('\u{1b}'));
     }
 }

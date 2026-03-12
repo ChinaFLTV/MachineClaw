@@ -4,7 +4,10 @@ use std::{
     fs,
     io::{BufRead, BufReader, IsTerminal, Read, Write},
     path::{Path, PathBuf},
-    sync::RwLock,
+    sync::{
+        RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -30,6 +33,7 @@ const AI_HTTP_CONNECT_TIMEOUT_SECS: u64 = 8;
 const AI_HTTP_REQUEST_TIMEOUT_SECS: u64 = 60;
 const AI_HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 30;
 const AI_HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
+const CHAT_CANCELLED_ERROR: &str = "chat request cancelled by user";
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -105,6 +109,10 @@ pub enum ChatStreamEventKind {
 pub struct ChatStreamEvent {
     pub kind: ChatStreamEventKind,
     pub text: String,
+}
+
+pub fn is_chat_cancelled_error(err: &AppError) -> bool {
+    matches!(err, AppError::Ai(detail) if detail == CHAT_CANCELLED_ERROR)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -501,7 +509,7 @@ impl AiClient {
             tool_choice: None,
             stream: None,
         };
-        let call = self.send_chat_completion(&request)?;
+        let call = self.send_chat_completion(&request, None)?;
         let assistant = call.assistant;
 
         let content = assistant_content_text(&assistant);
@@ -522,6 +530,7 @@ impl AiClient {
         max_total_tool_calls: usize,
         stream_output: bool,
         extra_tools: &[ExternalToolDefinition],
+        cancel_requested: Option<&AtomicBool>,
         mut execute_tool: F,
         mut on_round_event: impl FnMut(ChatRoundEvent),
         mut on_stream_event: G,
@@ -559,6 +568,7 @@ impl AiClient {
         };
 
         for _ in 0..max_tool_rounds {
+            return_if_chat_cancelled(cancel_requested)?;
             let tool_choice = match tool_choice_mode {
                 ToolChoiceMode::Disabled => None,
                 ToolChoiceMode::AutoOnly => Some(json!("auto")),
@@ -585,6 +595,7 @@ impl AiClient {
                 &request,
                 stream_output,
                 &mut on_stream_event,
+                cancel_requested,
             ) {
                 Ok(call) => call,
                 Err(err) => {
@@ -644,6 +655,7 @@ impl AiClient {
                     return Err(err);
                 }
             };
+            return_if_chat_cancelled(cancel_requested)?;
             metrics.api_rounds += 1;
             tool_rounds_used += 1;
             metrics.api_duration_ms += call.elapsed_ms;
@@ -702,6 +714,7 @@ impl AiClient {
 
                 let mut finalize_reason: Option<ChatStopReason> = None;
                 for tool_call in tool_calls {
+                    return_if_chat_cancelled(cancel_requested)?;
                     total_tool_calls += 1;
                     let request = ToolCallRequest {
                         id: tool_call.id,
@@ -800,6 +813,7 @@ impl AiClient {
                         finalize_reason,
                         stream_output,
                         &mut on_stream_event,
+                        cancel_requested,
                     );
                 }
                 continue;
@@ -922,12 +936,14 @@ impl AiClient {
             Some(ChatStopReason::MaxToolRoundsReached),
             stream_output,
             &mut on_stream_event,
+            cancel_requested,
         )
     }
 
     fn send_chat_completion(
         &self,
         body: &ChatCompletionRequest,
+        cancel_requested: Option<&AtomicBool>,
     ) -> Result<ApiChatCallResult, AppError> {
         let mut effective_body = normalize_request_for_provider(body, &self.base_url);
         let mut stripped_reasoning_retry_used = false;
@@ -935,6 +951,7 @@ impl AiClient {
         let mut refreshed_for_idle_hint = false;
         let mut attempt: u32 = 0;
         loop {
+            return_if_chat_cancelled(cancel_requested)?;
             attempt += 1;
             logging::info(&format!("AI request started, attempt={attempt}"));
             self.debug_emit(
@@ -1015,17 +1032,21 @@ impl AiClient {
                             if let Some(delay) =
                                 parse_rate_limit_retry_delay(status, retry_after.as_deref())
                             {
-                                thread::sleep(delay);
+                                sleep_with_chat_cancel(delay, cancel_requested)?;
                                 continue;
                             }
                             if should_retry_status(status) {
-                                thread::sleep(Duration::from_millis(self.backoff_millis));
+                                sleep_with_chat_cancel(
+                                    Duration::from_millis(self.backoff_millis),
+                                    cancel_requested,
+                                )?;
                                 continue;
                             }
                         }
                         return Err(AppError::Ai(err_msg));
                     }
 
+                    return_if_chat_cancelled(cancel_requested)?;
                     let response_text = resp.text().map_err(|err| {
                         AppError::Ai(format!("failed to read AI response body: {err}"))
                     })?;
@@ -1065,7 +1086,10 @@ impl AiClient {
                                 self.colorful,
                             );
                         }
-                        thread::sleep(Duration::from_millis(self.backoff_millis));
+                        sleep_with_chat_cancel(
+                            Duration::from_millis(self.backoff_millis),
+                            cancel_requested,
+                        )?;
                         continue;
                     }
                     return Err(AppError::Ai(err_msg));
@@ -1079,12 +1103,13 @@ impl AiClient {
         body: &ChatCompletionRequest,
         stream_output: bool,
         on_stream_event: &mut G,
+        cancel_requested: Option<&AtomicBool>,
     ) -> Result<ApiChatCallResult, AppError>
     where
         G: FnMut(ChatStreamEvent),
     {
         if !stream_output {
-            return self.send_chat_completion(body);
+            return self.send_chat_completion(body, cancel_requested);
         }
 
         let mut effective_body = normalize_request_for_provider(body, &self.base_url);
@@ -1093,6 +1118,7 @@ impl AiClient {
         let mut refreshed_for_idle_hint = false;
         let mut attempt: u32 = 0;
         loop {
+            return_if_chat_cancelled(cancel_requested)?;
             attempt += 1;
             logging::info(&format!("AI streaming request started, attempt={attempt}"));
             self.debug_emit(
@@ -1182,7 +1208,7 @@ impl AiClient {
                                     "AI streaming fallback to non-streaming triggered: status={status}, body={safe_body}"
                                 ),
                             );
-                            return self.send_chat_completion(body);
+                            return self.send_chat_completion(body, cancel_requested);
                         }
                         let err_msg = format!("AI HTTP status={status}, body={safe_body}");
                         logging::warn(&err_msg);
@@ -1190,18 +1216,26 @@ impl AiClient {
                             if let Some(delay) =
                                 parse_rate_limit_retry_delay(status, retry_after.as_deref())
                             {
-                                thread::sleep(delay);
+                                sleep_with_chat_cancel(delay, cancel_requested)?;
                                 continue;
                             }
                             if should_retry_status(status) {
-                                thread::sleep(Duration::from_millis(self.backoff_millis));
+                                sleep_with_chat_cancel(
+                                    Duration::from_millis(self.backoff_millis),
+                                    cancel_requested,
+                                )?;
                                 continue;
                             }
                         }
                         return Err(AppError::Ai(err_msg));
                     }
 
-                    match parse_streaming_chat_response(resp, on_stream_event, self.debug) {
+                    match parse_streaming_chat_response(
+                        resp,
+                        on_stream_event,
+                        self.debug,
+                        cancel_requested,
+                    ) {
                         Ok(parsed) => {
                             logging::info("AI streaming request finished successfully");
                             self.debug_emit(
@@ -1253,10 +1287,16 @@ impl AiClient {
                                     &i18n::chat_ai_reconnecting(attempt, self.max_retries),
                                     self.colorful,
                                 );
-                                thread::sleep(Duration::from_millis(self.backoff_millis));
+                                sleep_with_chat_cancel(
+                                    Duration::from_millis(self.backoff_millis),
+                                    cancel_requested,
+                                )?;
                                 continue;
                             }
                             return Err(AppError::Ai(err_msg));
+                        }
+                        Err(StreamParseResult::Cancelled) => {
+                            return Err(AppError::Ai(CHAT_CANCELLED_ERROR.to_string()));
                         }
                         Err(StreamParseResult::Fatal(err_msg)) => {
                             self.debug_emit(AiDebugLevel::Error, &err_msg);
@@ -1278,7 +1318,10 @@ impl AiClient {
                                 self.colorful,
                             );
                         }
-                        thread::sleep(Duration::from_millis(self.backoff_millis));
+                        sleep_with_chat_cancel(
+                            Duration::from_millis(self.backoff_millis),
+                            cancel_requested,
+                        )?;
                         continue;
                     }
                     return Err(AppError::Ai(err_msg));
@@ -1294,7 +1337,9 @@ impl AiClient {
         stop_reason: Option<ChatStopReason>,
         stream_output: bool,
         on_stream_event: &mut impl FnMut(ChatStreamEvent),
+        cancel_requested: Option<&AtomicBool>,
     ) -> Result<ChatToolResponse, AppError> {
+        return_if_chat_cancelled(cancel_requested)?;
         messages.push(ApiMessage {
             role: "system".to_string(),
             content: Some("Now provide a final answer based on available tool outputs. Do not call any more tools.".to_string()),
@@ -1314,6 +1359,7 @@ impl AiClient {
             &request,
             stream_output,
             on_stream_event,
+            cancel_requested,
         ) {
             Ok(call) => call,
             Err(err) => {
@@ -1335,6 +1381,7 @@ impl AiClient {
                 return Err(err);
             }
         };
+        return_if_chat_cancelled(cancel_requested)?;
         state.metrics.api_rounds += 1;
         state.metrics.api_duration_ms += call.elapsed_ms;
         state.metrics.prompt_tokens += call.usage.prompt_tokens;
@@ -1603,7 +1650,7 @@ impl AiClient {
             tool_choice: None,
             stream: None,
         };
-        let call = self.send_chat_completion(&request)?;
+        let call = self.send_chat_completion(&request, None)?;
         let response_text = assistant_content_text(&call.assistant);
         self.debug_emit(
             AiDebugLevel::Debug,
@@ -1749,6 +1796,7 @@ struct ParsedStreamingChatResponse {
 enum StreamParseResult {
     FallbackJson(String),
     Retryable(String),
+    Cancelled,
     Fatal(String),
 }
 
@@ -1768,6 +1816,34 @@ struct FinalizeWithoutToolsState {
     total_tool_calls: usize,
 }
 
+fn chat_cancel_requested(cancel_requested: Option<&AtomicBool>) -> bool {
+    cancel_requested.is_some_and(|flag| flag.load(Ordering::SeqCst))
+}
+
+fn return_if_chat_cancelled(cancel_requested: Option<&AtomicBool>) -> Result<(), AppError> {
+    if chat_cancel_requested(cancel_requested) {
+        return Err(AppError::Ai(CHAT_CANCELLED_ERROR.to_string()));
+    }
+    Ok(())
+}
+
+fn sleep_with_chat_cancel(
+    duration: Duration,
+    cancel_requested: Option<&AtomicBool>,
+) -> Result<(), AppError> {
+    if duration.is_zero() {
+        return Ok(());
+    }
+    let mut elapsed = Duration::ZERO;
+    while elapsed < duration {
+        return_if_chat_cancelled(cancel_requested)?;
+        let step = (duration - elapsed).min(Duration::from_millis(50));
+        thread::sleep(step);
+        elapsed += step;
+    }
+    Ok(())
+}
+
 fn parse_chat_completion_response_text(body: &str) -> Result<ParsedChatResponse, AppError> {
     let parsed: ChatCompletionResponse = serde_json::from_str(body)
         .map_err(|err| AppError::Ai(format!("failed to parse AI response: {err}")))?;
@@ -1784,6 +1860,7 @@ fn parse_streaming_chat_response<G>(
     response: reqwest::blocking::Response,
     on_stream_event: &mut G,
     debug_enabled: bool,
+    cancel_requested: Option<&AtomicBool>,
 ) -> Result<ParsedStreamingChatResponse, StreamParseResult>
 where
     G: FnMut(ChatStreamEvent),
@@ -1800,6 +1877,9 @@ where
     let mut streamed_thinking = false;
 
     loop {
+        if chat_cancel_requested(cancel_requested) {
+            return Err(StreamParseResult::Cancelled);
+        }
         line.clear();
         let read = reader.read_line(&mut line).map_err(|err| {
             if streamed_content || streamed_thinking {

@@ -1030,6 +1030,34 @@ pub fn chat_ai_reconnecting_after_idle() -> &'static str {
     }
 }
 
+pub fn chat_ai_cancel_requested() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "已收到 Ctrl+P / Command+P，正在终止当前 AI 回复...",
+        Language::ZhTw => "已收到 Ctrl+P / Command+P，正在終止當前 AI 回覆...",
+        Language::Fr => "Ctrl+P / Command+P reçu, interruption de la réponse IA en cours...",
+        Language::De => "Ctrl+P / Command+P erkannt, laufende KI-Antwort wird abgebrochen...",
+        Language::Ja => "Ctrl+P / Command+P を受信しました。現在の AI 応答を中断しています...",
+        Language::En => "Ctrl+P / Command+P received. Stopping the current AI response...",
+    }
+}
+
+pub fn chat_ai_cancelled_by_shortcut() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "已终止本轮 AI 回复，请继续输入修正内容。",
+        Language::ZhTw => "已終止本輪 AI 回覆，請繼續輸入修正內容。",
+        Language::Fr => {
+            "La réponse IA de ce tour a été arrêtée. Vous pouvez corriger votre saisie."
+        }
+        Language::De => {
+            "Die KI-Antwort dieser Runde wurde gestoppt. Sie können Ihre Eingabe korrigieren."
+        }
+        Language::Ja => "このラウンドの AI 応答を停止しました。修正内容を続けて入力できます。",
+        Language::En => {
+            "Stopped this round's AI response. You can continue with a corrected prompt."
+        }
+    }
+}
+
 pub fn prompt_write_command_edit_title(command: &str) -> String {
     match current_language() {
         Language::ZhCn => format!("准备编辑写命令: {command}"),

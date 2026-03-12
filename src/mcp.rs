@@ -117,8 +117,12 @@ struct McpToolInfo {
 pub struct McpServiceStatus {
     pub name: String,
     pub transport: String,
+    pub target: String,
+    pub args_count: usize,
+    pub timeout_seconds: u64,
     pub available: bool,
     pub tool_count: usize,
+    pub summary: Option<String>,
     pub error: Option<String>,
 }
 
@@ -127,6 +131,7 @@ pub struct McpToolStatus {
     pub server_name: String,
     pub ai_name: String,
     pub remote_name: String,
+    pub description: String,
     pub available: bool,
 }
 
@@ -185,6 +190,33 @@ impl McpManager {
         }
     }
 
+    pub fn pending_with_config(cfg: &McpConfig, summary: String) -> Self {
+        let mut manager = Self::pending(summary);
+        let service_statuses = normalized_server_configs(cfg)
+            .map(|servers| {
+                servers
+                    .into_iter()
+                    .map(|server| McpServiceStatus {
+                        name: server.name.clone(),
+                        transport: transport_mode_name(server.transport).to_string(),
+                        target: server_target_display(&server),
+                        args_count: server.args.len(),
+                        timeout_seconds: server.timeout.as_secs(),
+                        available: false,
+                        tool_count: 0,
+                        summary: Some(format!(
+                            "{}, availability=checking",
+                            server_summary(&server)
+                        )),
+                        error: None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        manager.service_statuses = service_statuses;
+        manager
+    }
+
     pub fn connect(cfg: &McpConfig) -> Result<Self, AppError> {
         if !cfg.enabled {
             return Ok(Self {
@@ -229,8 +261,12 @@ impl McpManager {
                     service_statuses.push(McpServiceStatus {
                         name: server.name.clone(),
                         transport: transport_mode_name(server.transport).to_string(),
+                        target: server_target_display(&server),
+                        args_count: server.args.len(),
+                        timeout_seconds: server.timeout.as_secs(),
                         available: false,
                         tool_count: 0,
+                        summary: Some(server_summary(&server)),
                         error: Some(masked_error),
                     });
                     continue;
@@ -245,6 +281,7 @@ impl McpManager {
                     server_name: tool.server_name.clone(),
                     ai_name: tool.ai_name.clone(),
                     remote_name: tool.remote_name.clone(),
+                    description: tool.description.clone(),
                     available: true,
                 });
             }
@@ -261,8 +298,12 @@ impl McpManager {
             service_statuses.push(McpServiceStatus {
                 name: server.name.clone(),
                 transport: transport_mode_name(server.transport).to_string(),
+                target: server_target_display(&server),
+                args_count: server.args.len(),
+                timeout_seconds: server.timeout.as_secs(),
                 available: true,
                 tool_count: server_tool_count,
+                summary: Some(server_summary(&server)),
                 error: None,
             });
             connections.push(McpConnection {
@@ -1174,6 +1215,30 @@ fn transport_mode_name(mode: McpTransportMode) -> &'static str {
         McpTransportMode::Stdio => "stdio",
         McpTransportMode::Http => "http",
     }
+}
+
+fn server_target_display(server: &NormalizedServerConfig) -> String {
+    match server.transport {
+        McpTransportMode::Http => server
+            .endpoint
+            .as_deref()
+            .map(mask_sensitive)
+            .unwrap_or_else(|| "-".to_string()),
+        McpTransportMode::Stdio => server
+            .command
+            .as_deref()
+            .map(mask_sensitive)
+            .unwrap_or_else(|| "-".to_string()),
+    }
+}
+
+fn server_summary(server: &NormalizedServerConfig) -> String {
+    format!(
+        "tools=dynamic env={} headers={} timeout={}s",
+        server.env.len(),
+        server.headers.len(),
+        server.timeout.as_secs()
+    )
 }
 
 fn sanitize_tool_name(name: &str) -> String {
