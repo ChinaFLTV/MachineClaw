@@ -276,12 +276,13 @@ pub struct McpConfig {
         default = "default_mcp_availability_check_mode"
     )]
     pub mcp_availability_check_mode: String,
-    #[serde(default)]
+    #[serde(default, alias = "type")]
     pub transport: Option<String>,
     #[serde(
         rename = "server-url",
         alias = "server_url",
         alias = "serverUrl",
+        alias = "url",
         default
     )]
     pub server_url: Option<String>,
@@ -310,12 +311,13 @@ pub struct McpConfig {
 pub struct McpServerConfig {
     #[serde(default = "default_mcp_server_enabled")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default, alias = "type")]
     pub transport: Option<String>,
     #[serde(
         rename = "server-url",
         alias = "server_url",
         alias = "serverUrl",
+        alias = "url",
         default
     )]
     pub server_url: Option<String>,
@@ -563,8 +565,10 @@ dir = "~/.skills" # optional
 [mcp]
 enabled = false # optional
 mcp-availability-check-mode = "rsync" # optional, default "rsync"; "async" runs MCP availability check in background so chat can start sooner
-# transport = "http" # optional: http, stdio; omitted = auto detect by endpoint/command
+# transport = "http" # optional: http, streamable_http, sse, stdio; omitted = auto detect by endpoint/command
+# type = "sse" # optional alias of transport (for smithery-style config)
 # server-url = "http://127.0.0.1:8080/mcp" # optional, same as endpoint
+# url = "http://127.0.0.1:8080/mcp" # optional alias of server-url
 # auth-type = "bearer" # optional, default bearer when auth-token is set
 # auth-token = "<token>" # optional
 [mcp.headers]
@@ -572,8 +576,10 @@ mcp-availability-check-mode = "rsync" # optional, default "rsync"; "async" runs 
 
 [mcp.servers.local]
 enabled = true # optional, default true
-# transport = "http" # optional: http, stdio
+# transport = "http" # optional: http, streamable_http, sse, stdio
+# type = "sse" # optional alias of transport
 # server-url = "http://127.0.0.1:8080/mcp" # optional, same as endpoint
+# url = "http://127.0.0.1:8080/mcp" # optional alias of server-url
 # endpoint = "http://127.0.0.1:8080/mcp" # optional (legacy alias)
 # command = "python3" # optional
 # auth-type = "bearer" # optional, default bearer when auth-token is set
@@ -1060,7 +1066,7 @@ fn has_file_extension(file_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_chat_model_price_check_mode, normalize_mcp_availability_check_mode,
+        McpServerConfig, normalize_chat_model_price_check_mode, normalize_mcp_availability_check_mode,
         resolve_config_path,
     };
 
@@ -1094,5 +1100,19 @@ mod tests {
             path.file_name().and_then(|name| name.to_str()),
             Some("claw.toml")
         );
+    }
+
+    #[test]
+    fn mcp_server_config_supports_smithery_style_type_and_url_alias() {
+        let server: McpServerConfig = toml::from_str(
+            r#"
+enabled = true
+type = "sse"
+url = "https://example.com/sse"
+"#,
+        )
+        .expect("toml should parse");
+        assert_eq!(server.transport.as_deref(), Some("sse"));
+        assert_eq!(server.server_url.as_deref(), Some("https://example.com/sse"));
     }
 }

@@ -1,16 +1,18 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     io::{BufRead, BufReader, ErrorKind, Read, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    thread::sleep,
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    thread::{self, sleep},
     time::{Duration, Instant},
 };
 
 use reqwest::{
     blocking::{Client, Response},
     header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
+    Url,
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     ai::ExternalToolDefinition,
@@ -39,6 +41,7 @@ struct NormalizedServerConfig {
 enum McpTransportMode {
     Stdio,
     Http,
+    Sse,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +83,11 @@ pub fn mcp_summary(cfg: &McpConfig) -> String {
             McpTransportMode::Http => {
                 if let Some(endpoint) = server.endpoint.as_deref() {
                     previews.push(format!("{}:http={}", server.name, mask_sensitive(endpoint)));
+                }
+            }
+            McpTransportMode::Sse => {
+                if let Some(endpoint) = server.endpoint.as_deref() {
+                    previews.push(format!("{}:sse={}", server.name, mask_sensitive(endpoint)));
                 }
             }
             McpTransportMode::Stdio => {
@@ -160,6 +168,7 @@ pub struct McpManager {
 enum McpTransport {
     Stdio(StdioMcpClient),
     Http(HttpMcpClient),
+    Sse(LegacySseMcpClient),
 }
 
 struct StdioMcpClient {
@@ -175,6 +184,30 @@ struct HttpMcpClient {
     headers: HeaderMap,
     session_id: Option<String>,
     next_id: u64,
+}
+
+struct LegacySseMcpClient {
+    client: Client,
+    sse_endpoint: String,
+    headers: HeaderMap,
+    message_endpoint: Option<String>,
+    session_id: Option<String>,
+    event_rx: Option<Receiver<Result<LegacySseEvent, String>>>,
+    event_stop_tx: Option<mpsc::Sender<()>>,
+    event_thread: Option<thread::JoinHandle<()>>,
+    next_id: u64,
+}
+
+#[derive(Debug)]
+enum LegacySseEvent {
+    Endpoint(String),
+    Message(Value),
+}
+
+#[derive(Debug)]
+struct SseFrame {
+    event: Option<String>,
+    data_lines: Vec<String>,
 }
 
 impl McpManager {
@@ -249,6 +282,8 @@ impl McpManager {
         let mut tool_statuses = Vec::<McpToolStatus>::new();
         let mut service_statuses = Vec::<McpServiceStatus>::new();
         let mut tool_index = HashMap::<String, ToolBinding>::new();
+        let mut used_tool_names = HashSet::<String>::new();
+        let mut tool_name_suffixes = HashMap::<String, usize>::new();
         let mut errors = Vec::<String>::new();
 
         for server in server_configs {
@@ -274,7 +309,12 @@ impl McpManager {
             };
 
             let connection_idx = connections.len();
-            let server_tools = extract_tools(&server.name, &tools_result);
+            let mut server_tools = extract_tools(&server.name, &tools_result);
+            ensure_unique_ai_tool_names(
+                &mut server_tools,
+                &mut used_tool_names,
+                &mut tool_name_suffixes,
+            );
             let server_tool_count = server_tools.len();
             for tool in &server_tools {
                 tool_statuses.push(McpToolStatus {
@@ -520,6 +560,173 @@ impl HttpMcpClient {
     }
 }
 
+impl LegacySseMcpClient {
+    fn new(
+        endpoint: &str,
+        headers: &BTreeMap<String, String>,
+        connect_timeout: Duration,
+    ) -> Result<Self, AppError> {
+        ensure_rustls_crypto_provider();
+        let client = Client::builder()
+            .connect_timeout(connect_timeout)
+            .build()
+            .map_err(|err| AppError::Runtime(format!("failed to build MCP sse client: {err}")))?;
+        let headers = parse_http_headers(headers)?;
+        Ok(Self {
+            client,
+            sse_endpoint: endpoint.to_string(),
+            headers,
+            message_endpoint: None,
+            session_id: None,
+            event_rx: None,
+            event_stop_tx: None,
+            event_thread: None,
+            next_id: 1,
+        })
+    }
+
+    fn ensure_connected(&mut self, timeout: Duration) -> Result<(), AppError> {
+        if self.event_rx.is_some() && self.message_endpoint.is_some() {
+            return Ok(());
+        }
+        self.open_event_stream(timeout)?;
+        self.wait_for_endpoint(timeout)
+    }
+
+    fn open_event_stream(&mut self, timeout: Duration) -> Result<(), AppError> {
+        self.stop_event_stream_worker();
+        let mut request_builder = self
+            .client
+            .get(&self.sse_endpoint)
+            .headers(self.headers.clone())
+            .header(ACCEPT, "text/event-stream");
+        request_builder = request_builder.timeout(timeout);
+        if let Some(session_id) = self.session_id.as_deref() {
+            request_builder = request_builder.header("Mcp-Session-Id", session_id);
+        }
+        let response = request_builder
+            .send()
+            .map_err(|err| AppError::Runtime(format!("MCP sse connect failed: {err}")))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<unreadable body>".to_string());
+            return Err(AppError::Runtime(format!(
+                "MCP sse connect failed: status={}, body={}",
+                status,
+                mask_sensitive(&trim_text_preview(&body, 1200))
+            )));
+        }
+        update_sse_session_id(&mut self.session_id, response.headers());
+
+        let (tx, rx) = mpsc::channel::<Result<LegacySseEvent, String>>();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let worker = thread::spawn(move || {
+            let mut reader = BufReader::new(response);
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                match read_sse_frame(&mut reader) {
+                    Ok(Some(frame)) => {
+                        if let Some(parsed) = parse_legacy_sse_event(frame) {
+                            if tx.send(Ok(parsed)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = tx.send(Err("MCP SSE stream closed by remote".to_string()));
+                        break;
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Err(format!("failed to read MCP SSE stream: {err}")));
+                        break;
+                    }
+                }
+            }
+        });
+        self.event_rx = Some(rx);
+        self.event_stop_tx = Some(stop_tx);
+        self.event_thread = Some(worker);
+        self.message_endpoint = None;
+        Ok(())
+    }
+
+    fn wait_for_endpoint(&mut self, timeout: Duration) -> Result<(), AppError> {
+        let started = Instant::now();
+        loop {
+            if started.elapsed() > timeout {
+                self.reset_event_stream();
+                return Err(AppError::Runtime(
+                    "MCP sse handshake timeout: endpoint event not received".to_string(),
+                ));
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            let event = self.recv_event(remaining)?;
+            match event {
+                LegacySseEvent::Endpoint(raw_endpoint) => {
+                    let resolved = resolve_sse_message_endpoint(&self.sse_endpoint, &raw_endpoint)?;
+                    self.message_endpoint = Some(resolved);
+                    return Ok(());
+                }
+                LegacySseEvent::Message(_) => {
+                    // ignore non-endpoint events during handshake
+                }
+            }
+        }
+    }
+
+    fn recv_event(&mut self, timeout: Duration) -> Result<LegacySseEvent, AppError> {
+        let Some(rx) = self.event_rx.as_ref() else {
+            return Err(AppError::Runtime(
+                "MCP sse stream not initialized".to_string(),
+            ));
+        };
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(event)) => Ok(event),
+            Ok(Err(detail)) => {
+                self.reset_event_stream();
+                Err(AppError::Runtime(detail))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.reset_event_stream();
+                Err(AppError::Runtime("MCP sse receive timeout".to_string()))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.reset_event_stream();
+                Err(AppError::Runtime(
+                    "MCP sse stream disconnected".to_string(),
+                ))
+            }
+        }
+    }
+
+    fn reset_event_stream(&mut self) {
+        self.stop_event_stream_worker();
+        self.event_rx = None;
+        self.event_stop_tx = None;
+        self.event_thread = None;
+        self.message_endpoint = None;
+    }
+
+    fn stop_event_stream_worker(&mut self) {
+        if let Some(stop_tx) = self.event_stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(worker) = self.event_thread.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for LegacySseMcpClient {
+    fn drop(&mut self) {
+        self.stop_event_stream_worker();
+    }
+}
+
 fn normalized_server_configs(cfg: &McpConfig) -> Result<Vec<NormalizedServerConfig>, AppError> {
     let defaults = McpGlobalDefaults {
         transport: cfg.transport.clone(),
@@ -603,7 +810,7 @@ fn normalize_server(
     }
     let mut headers = defaults.headers.clone();
     headers.extend(server.headers.clone());
-    if transport == McpTransportMode::Http {
+    if transport == McpTransportMode::Http || transport == McpTransportMode::Sse {
         apply_auth_to_headers(
             &name,
             &mut headers,
@@ -655,6 +862,19 @@ fn connect_one_server(
                 server.timeout,
             )?)
         }
+        McpTransportMode::Sse => {
+            let Some(endpoint) = server.endpoint.as_deref() else {
+                return Err(AppError::Config(format!(
+                    "mcp server '{}' transport=sse requires endpoint or server-url",
+                    server.name
+                )));
+            };
+            McpTransport::Sse(LegacySseMcpClient::new(
+                endpoint,
+                &server.headers,
+                server.timeout,
+            )?)
+        }
     };
 
     let initialize_result = request_mcp(
@@ -671,7 +891,12 @@ fn connect_one_server(
         server.timeout,
     )?;
 
-    notify_mcp(&mut transport, "notifications/initialized", json!({}))?;
+    notify_mcp(
+        &mut transport,
+        "notifications/initialized",
+        json!({}),
+        server.timeout,
+    )?;
     let tools_result = request_mcp(&mut transport, "tools/list", json!({}), server.timeout)?;
     Ok((transport, initialize_result, tools_result))
 }
@@ -685,10 +910,16 @@ fn request_mcp(
     match transport {
         McpTransport::Stdio(client) => stdio_request(client, method, params, timeout),
         McpTransport::Http(client) => http_request(client, method, params),
+        McpTransport::Sse(client) => sse_request(client, method, params, timeout),
     }
 }
 
-fn notify_mcp(transport: &mut McpTransport, method: &str, params: Value) -> Result<(), AppError> {
+fn notify_mcp(
+    transport: &mut McpTransport,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<(), AppError> {
     match transport {
         McpTransport::Stdio(client) => stdio_notify(client, method, params),
         McpTransport::Http(client) => {
@@ -701,6 +932,7 @@ fn notify_mcp(transport: &mut McpTransport, method: &str, params: Value) -> Resu
             update_http_session_id(client, resp.headers());
             Ok(())
         }
+        McpTransport::Sse(client) => sse_notify(client, method, params, timeout),
     }
 }
 
@@ -785,6 +1017,133 @@ fn http_request(
     Ok(body.get("result").cloned().unwrap_or_else(|| json!({})))
 }
 
+fn sse_request(
+    client: &mut LegacySseMcpClient,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, AppError> {
+    let id = client.next_id;
+    client.next_id += 1;
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params
+    });
+
+    client.ensure_connected(timeout)?;
+    let immediate = send_sse_post_request(client, &payload, method, timeout)?;
+    if let Some(body) = immediate {
+        if let Some(resp_id) = body.get("id")
+            && resp_id == &json!(id)
+        {
+            if let Some(err) = body.get("error") {
+                return Err(AppError::Runtime(format!(
+                    "MCP returned error for method {}: {}",
+                    method,
+                    mask_sensitive(&err.to_string())
+                )));
+            }
+            return Ok(body.get("result").cloned().unwrap_or_else(|| json!({})));
+        }
+    }
+
+    let started = Instant::now();
+    loop {
+        if started.elapsed() > timeout {
+            client.reset_event_stream();
+            return Err(AppError::Runtime(format!(
+                "MCP request timeout: method={method}"
+            )));
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let event = client.recv_event(remaining)?;
+        let LegacySseEvent::Message(frame) = event else {
+            continue;
+        };
+        if let Some(resp_id) = frame.get("id")
+            && resp_id == &json!(id)
+        {
+            if let Some(err) = frame.get("error") {
+                return Err(AppError::Runtime(format!(
+                    "MCP returned error for method {}: {}",
+                    method,
+                    mask_sensitive(&err.to_string())
+                )));
+            }
+            return Ok(frame.get("result").cloned().unwrap_or_else(|| json!({})));
+        }
+    }
+}
+
+fn sse_notify(
+    client: &mut LegacySseMcpClient,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<(), AppError> {
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params
+    });
+    client.ensure_connected(timeout)?;
+    let _ = send_sse_post_request(client, &payload, "notification", timeout)?;
+    Ok(())
+}
+
+fn send_sse_post_request(
+    client: &mut LegacySseMcpClient,
+    payload: &Value,
+    method: &str,
+    timeout: Duration,
+) -> Result<Option<Value>, AppError> {
+    let Some(message_endpoint) = client.message_endpoint.as_deref() else {
+        return Err(AppError::Runtime(
+            "MCP sse handshake failed: message endpoint is missing".to_string(),
+        ));
+    };
+
+    let mut request_builder = client
+        .client
+        .post(message_endpoint)
+        .headers(client.headers.clone())
+        .json(payload)
+        .timeout(timeout);
+    if let Some(session_id) = client.session_id.as_deref() {
+        request_builder = request_builder.header("Mcp-Session-Id", session_id);
+    }
+    let response = request_builder
+        .send()
+        .map_err(|err| {
+            client.reset_event_stream();
+            AppError::Runtime(format!("MCP sse post failed: {err}"))
+        })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .unwrap_or_else(|_| "<unreadable body>".to_string());
+        client.reset_event_stream();
+        return Err(AppError::Runtime(format!(
+            "MCP sse post failed: status={}, body={}, method={}",
+            status,
+            mask_sensitive(&trim_text_preview(&body, 1200)),
+            method
+        )));
+    }
+    update_sse_session_id(&mut client.session_id, response.headers());
+    let body = parse_mcp_http_response(response).map_err(|err| {
+        client.reset_event_stream();
+        err
+    })?;
+    if body.as_object().is_some_and(|obj| obj.is_empty()) {
+        return Ok(None);
+    }
+    Ok(Some(body))
+}
+
 fn send_http_request(
     client: &HttpMcpClient,
     payload: &Value,
@@ -818,13 +1177,17 @@ fn send_http_request(
 }
 
 fn update_http_session_id(client: &mut HttpMcpClient, headers: &HeaderMap) {
+    update_sse_session_id(&mut client.session_id, headers);
+}
+
+fn update_sse_session_id(session_id: &mut Option<String>, headers: &HeaderMap) {
     if let Some(value) = headers
         .get("mcp-session-id")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        client.session_id = Some(value.to_string());
+        *session_id = Some(value.to_string());
     }
 }
 
@@ -849,6 +1212,13 @@ fn parse_mcp_http_response(resp: Response) -> Result<Value, AppError> {
 }
 
 fn parse_sse_jsonrpc_payload(raw: &str) -> Result<Value, AppError> {
+    let trimmed = raw.trim();
+    if !trimmed.is_empty()
+        && let Some(value) = parse_sse_data_block(&[trimmed.to_string()])
+    {
+        return Ok(value);
+    }
+
     let mut data_lines: Vec<String> = Vec::new();
     for line in raw.lines() {
         let trimmed = line.trim_end_matches('\r');
@@ -895,6 +1265,103 @@ fn parse_sse_data_block(data_lines: &[String]) -> Option<Value> {
         return Some(nested);
     }
     None
+}
+
+fn read_sse_frame<R: BufRead>(reader: &mut R) -> std::io::Result<Option<SseFrame>> {
+    let mut event: Option<String> = None;
+    let mut data_lines: Vec<String> = Vec::new();
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            if event.is_none() && data_lines.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+        if trimmed.is_empty() {
+            break;
+        }
+        if trimmed.starts_with(':') {
+            continue;
+        }
+        if let Some(raw_event) = trimmed.strip_prefix("event:") {
+            event = Some(raw_event.trim().to_string());
+            continue;
+        }
+        if let Some(data) = trimmed.strip_prefix("data:") {
+            data_lines.push(data.trim_start().to_string());
+        }
+    }
+    Ok(Some(SseFrame { event, data_lines }))
+}
+
+fn parse_legacy_sse_event(frame: SseFrame) -> Option<LegacySseEvent> {
+    let normalized_event = frame
+        .event
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase());
+    if normalized_event.as_deref() == Some("endpoint") {
+        return parse_legacy_sse_endpoint_block(&frame.data_lines).map(LegacySseEvent::Endpoint);
+    }
+    if normalized_event.is_none() || normalized_event.as_deref() == Some("message") {
+        return parse_sse_data_block(&frame.data_lines).map(LegacySseEvent::Message);
+    }
+    parse_sse_data_block(&frame.data_lines).map(LegacySseEvent::Message)
+}
+
+fn parse_legacy_sse_endpoint_block(data_lines: &[String]) -> Option<String> {
+    if data_lines.is_empty() {
+        return None;
+    }
+    let payload = data_lines.join("\n");
+    let trimmed = payload.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return None;
+    }
+    let parsed = serde_json::from_str::<Value>(trimmed).ok();
+    if let Some(Value::String(endpoint)) = parsed.as_ref() {
+        return non_empty_trimmed(Some(endpoint));
+    }
+    if let Some(parsed_value) = parsed {
+        for key in [
+            "endpoint",
+            "url",
+            "uri",
+            "messageEndpoint",
+            "message_endpoint",
+        ] {
+            if let Some(raw) = parsed_value.get(key).and_then(|value| value.as_str())
+                && let Some(cleaned) = non_empty_trimmed(Some(raw))
+            {
+                return Some(cleaned);
+            }
+        }
+    }
+    non_empty_trimmed(Some(trimmed))
+}
+
+fn resolve_sse_message_endpoint(base_endpoint: &str, raw_endpoint: &str) -> Result<String, AppError> {
+    let endpoint = non_empty_trimmed(Some(raw_endpoint)).ok_or_else(|| {
+        AppError::Runtime("MCP sse handshake failed: endpoint event is empty".to_string())
+    })?;
+    if let Ok(url) = Url::parse(&endpoint) {
+        return Ok(url.to_string());
+    }
+    let base = Url::parse(base_endpoint).map_err(|err| {
+        AppError::Runtime(format!(
+            "MCP sse handshake failed: invalid base endpoint '{}': {err}",
+            mask_sensitive(base_endpoint)
+        ))
+    })?;
+    let joined = base.join(&endpoint).map_err(|err| {
+        AppError::Runtime(format!(
+            "MCP sse handshake failed: cannot resolve message endpoint '{}': {err}",
+            mask_sensitive(&endpoint)
+        ))
+    })?;
+    Ok(joined.to_string())
 }
 
 fn write_mcp_frame(writer: &mut ChildStdin, payload: &Value) -> Result<(), AppError> {
@@ -1062,12 +1529,22 @@ fn resolve_transport_mode(
     if let Some(raw) = non_empty_trimmed(transport_raw) {
         let normalized = raw.to_ascii_lowercase();
         return match normalized.as_str() {
-            "http" => {
+            "http" | "streamable_http" => {
                 if has_endpoint {
                     Ok(McpTransportMode::Http)
                 } else {
                     Err(AppError::Config(format!(
-                        "mcp server '{}' transport=http requires endpoint or server-url",
+                        "mcp server '{}' transport={} requires endpoint or server-url",
+                        server_name, normalized
+                    )))
+                }
+            }
+            "sse" => {
+                if has_endpoint {
+                    Ok(McpTransportMode::Sse)
+                } else {
+                    Err(AppError::Config(format!(
+                        "mcp server '{}' transport=sse requires endpoint or server-url",
                         server_name
                     )))
                 }
@@ -1083,7 +1560,7 @@ fn resolve_transport_mode(
                 }
             }
             _ => Err(AppError::Config(format!(
-                "mcp server '{}' has invalid transport '{}', expected one of: http, stdio",
+                "mcp server '{}' has invalid transport '{}', expected one of: http, streamable_http, sse, stdio",
                 server_name, raw
             ))),
         };
@@ -1178,18 +1655,7 @@ fn extract_tools(server_name: &str, result: &Value) -> Vec<McpToolInfo> {
             .and_then(|value| value.as_str())
             .unwrap_or("MCP tool")
             .to_string();
-        let params = tool
-            .get("inputSchema")
-            .or_else(|| tool.get("input_schema"))
-            .or_else(|| tool.get("parameters"))
-            .cloned()
-            .unwrap_or_else(|| {
-                json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": true
-                })
-            });
+        let params = normalize_tool_parameters_schema(select_tool_parameters_source(&tool));
         let sanitized_server = sanitize_tool_name(server_name);
         let sanitized_tool = sanitize_tool_name(remote_name);
         output.push(McpToolInfo {
@@ -1203,10 +1669,93 @@ fn extract_tools(server_name: &str, result: &Value) -> Vec<McpToolInfo> {
     output
 }
 
+fn ensure_unique_ai_tool_names(
+    tools: &mut [McpToolInfo],
+    used_tool_names: &mut HashSet<String>,
+    tool_name_suffixes: &mut HashMap<String, usize>,
+) {
+    for tool in tools {
+        let base = tool.ai_name.clone();
+        if used_tool_names.insert(base.clone()) {
+            continue;
+        }
+        let mut suffix = *tool_name_suffixes.get(&base).unwrap_or(&2);
+        loop {
+            let candidate = format!("{base}_{suffix}");
+            suffix += 1;
+            if used_tool_names.insert(candidate.clone()) {
+                tool.ai_name = candidate;
+                tool_name_suffixes.insert(base, suffix);
+                break;
+            }
+        }
+    }
+}
+
+fn select_tool_parameters_source(tool: &Value) -> Option<&Value> {
+    let source = tool
+        .get("inputSchema")
+        .or_else(|| tool.get("input_schema"))
+        .or_else(|| tool.get("parameters"))?;
+    if let Some(obj) = source.as_object() {
+        if let Some(schema) = obj.get("jsonSchema") {
+            return Some(schema);
+        }
+        if let Some(schema) = obj.get("schema") {
+            return Some(schema);
+        }
+    }
+    Some(source)
+}
+
+fn default_tool_parameters_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true
+    })
+}
+
+fn normalize_tool_parameters_schema(raw: Option<&Value>) -> Value {
+    let Some(value) = raw else {
+        return default_tool_parameters_schema();
+    };
+    let mut schema = match value {
+        Value::Object(map) => Value::Object(map.clone()),
+        _ => return default_tool_parameters_schema(),
+    };
+    let Some(map) = schema.as_object_mut() else {
+        return default_tool_parameters_schema();
+    };
+
+    // OpenAI function calling requires top-level JSON schema to be object.
+    let root_is_object = match map.get("type") {
+        Some(Value::String(kind)) => kind.eq_ignore_ascii_case("object"),
+        Some(Value::Array(kinds)) => kinds
+            .iter()
+            .any(|item| item.as_str().is_some_and(|kind| kind.eq_ignore_ascii_case("object"))),
+        _ => false,
+    };
+    if !root_is_object || !matches!(map.get("type"), Some(Value::String(_))) {
+        map.insert("type".to_string(), Value::String("object".to_string()));
+    }
+    if !map.get("properties").is_some_and(Value::is_object) {
+        map.insert("properties".to_string(), Value::Object(Map::new()));
+    }
+    if map.get("required").is_some() && !map.get("required").is_some_and(Value::is_array) {
+        map.remove("required");
+    }
+    if !map.contains_key("additionalProperties") {
+        map.insert("additionalProperties".to_string(), Value::Bool(true));
+    }
+    schema
+}
+
 fn transport_name(transport: &McpTransport) -> &'static str {
     match transport {
         McpTransport::Stdio(_) => "stdio",
         McpTransport::Http(_) => "http",
+        McpTransport::Sse(_) => "sse",
     }
 }
 
@@ -1214,12 +1763,13 @@ fn transport_mode_name(mode: McpTransportMode) -> &'static str {
     match mode {
         McpTransportMode::Stdio => "stdio",
         McpTransportMode::Http => "http",
+        McpTransportMode::Sse => "sse",
     }
 }
 
 fn server_target_display(server: &NormalizedServerConfig) -> String {
     match server.transport {
-        McpTransportMode::Http => server
+        McpTransportMode::Http | McpTransportMode::Sse => server
             .endpoint
             .as_deref()
             .map(mask_sensitive)
@@ -1315,11 +1865,19 @@ fn extract_tool_call_text(result: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::{BTreeMap, HashMap, HashSet},
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+    use serde_json::{Value, json};
 
     use super::{
-        McpGlobalDefaults, McpManager, McpTransportMode, mcp_summary, non_empty_trimmed,
-        normalize_server, parse_mcp_tool_arguments, resolve_transport_mode, validate_mcp_config,
+        LegacySseMcpClient, McpGlobalDefaults, McpManager, McpToolInfo, McpTransportMode,
+        ensure_unique_ai_tool_names, extract_tools, mcp_summary, non_empty_trimmed, normalize_server,
+        parse_legacy_sse_endpoint_block, parse_mcp_tool_arguments, parse_sse_jsonrpc_payload,
+        resolve_sse_message_endpoint, resolve_transport_mode, validate_mcp_config,
     };
     use crate::config::{McpConfig, McpServerConfig};
 
@@ -1389,6 +1947,184 @@ mod tests {
     fn resolve_transport_mode_prefers_stdio_when_both_fields_are_present() {
         let transport = resolve_transport_mode("srv", None, true, true).expect("transport");
         assert_eq!(transport, McpTransportMode::Stdio);
+    }
+
+    #[test]
+    fn resolve_transport_mode_accepts_sse_transport_mode() {
+        let transport = resolve_transport_mode("srv", Some("sse"), true, false).expect("transport");
+        assert_eq!(transport, McpTransportMode::Sse);
+    }
+
+    #[test]
+    fn resolve_transport_mode_accepts_streamable_http_alias() {
+        let transport =
+            resolve_transport_mode("srv", Some("streamable_http"), true, false).expect("transport");
+        assert_eq!(transport, McpTransportMode::Http);
+    }
+
+    #[test]
+    fn parse_legacy_sse_endpoint_block_accepts_string_or_json() {
+        let plain = parse_legacy_sse_endpoint_block(&["/messages?session=1".to_string()]);
+        assert_eq!(plain.as_deref(), Some("/messages?session=1"));
+
+        let json_endpoint = parse_legacy_sse_endpoint_block(&[
+            "{\"endpoint\":\"/messages?session=2\"}".to_string(),
+        ]);
+        assert_eq!(json_endpoint.as_deref(), Some("/messages?session=2"));
+    }
+
+    #[test]
+    fn parse_sse_jsonrpc_payload_accepts_plain_json_body() {
+        let parsed = parse_sse_jsonrpc_payload(r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#)
+            .expect("plain json body should parse");
+        assert_eq!(
+            parsed
+                .get("result")
+                .and_then(|value| value.get("ok"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn ensure_unique_ai_tool_names_adds_suffix_for_collisions() {
+        let mut tools = vec![
+            McpToolInfo {
+                ai_name: "mcp__server__tool".to_string(),
+                server_name: "s1".to_string(),
+                remote_name: "tool-a".to_string(),
+                description: "d".to_string(),
+                parameters: json!({}),
+            },
+            McpToolInfo {
+                ai_name: "mcp__server__tool".to_string(),
+                server_name: "s1".to_string(),
+                remote_name: "tool_b".to_string(),
+                description: "d".to_string(),
+                parameters: json!({}),
+            },
+            McpToolInfo {
+                ai_name: "mcp__server__tool".to_string(),
+                server_name: "s2".to_string(),
+                remote_name: "tool c".to_string(),
+                description: "d".to_string(),
+                parameters: json!({}),
+            },
+        ];
+        let mut used_tool_names = HashSet::new();
+        let mut tool_name_suffixes = HashMap::new();
+        ensure_unique_ai_tool_names(&mut tools, &mut used_tool_names, &mut tool_name_suffixes);
+        let names = tools.iter().map(|tool| tool.ai_name.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "mcp__server__tool".to_string(),
+                "mcp__server__tool_2".to_string(),
+                "mcp__server__tool_3".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn sse_recv_event_timeout_resets_stream_state() {
+        let mut client =
+            LegacySseMcpClient::new("https://example.com/sse", &BTreeMap::new(), Duration::from_secs(1))
+                .expect("client");
+        let (_tx, rx) = mpsc::channel();
+        client.event_rx = Some(rx);
+        client.message_endpoint = Some("https://example.com/messages".to_string());
+
+        let err = client
+            .recv_event(Duration::from_millis(1))
+            .expect_err("timeout should fail");
+        assert!(err.to_string().contains("MCP sse receive timeout"));
+        assert!(client.event_rx.is_none());
+        assert!(client.message_endpoint.is_none());
+    }
+
+    #[test]
+    fn sse_reset_event_stream_stops_background_worker() {
+        let mut client =
+            LegacySseMcpClient::new("https://example.com/sse", &BTreeMap::new(), Duration::from_secs(1))
+                .expect("client");
+        let (_event_tx, event_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = stop_rx.recv_timeout(Duration::from_secs(1));
+        });
+
+        client.event_rx = Some(event_rx);
+        client.event_stop_tx = Some(stop_tx);
+        client.event_thread = Some(worker);
+        client.message_endpoint = Some("https://example.com/messages".to_string());
+
+        client.reset_event_stream();
+        assert!(client.event_rx.is_none());
+        assert!(client.event_stop_tx.is_none());
+        assert!(client.event_thread.is_none());
+        assert!(client.message_endpoint.is_none());
+    }
+
+    #[test]
+    fn resolve_sse_message_endpoint_supports_relative_paths() {
+        let resolved = resolve_sse_message_endpoint(
+            "https://example.com/mcp/sse",
+            "/messages?session=abc",
+        )
+        .expect("relative endpoint should resolve");
+        assert_eq!(resolved, "https://example.com/messages?session=abc");
+    }
+
+    #[test]
+    fn extract_tools_normalizes_invalid_or_missing_schema_type() {
+        let result = json!({
+            "tools": [
+                {
+                    "name": "weibo_news",
+                    "description": "news",
+                    "inputSchema": {
+                        "type": null
+                    }
+                }
+            ]
+        });
+        let tools = extract_tools("real-time_news", &result);
+        assert_eq!(tools.len(), 1);
+        let schema = &tools[0].parameters;
+        assert_eq!(schema.get("type").and_then(Value::as_str), Some("object"));
+        assert!(schema.get("properties").is_some_and(Value::is_object));
+        assert!(schema.get("additionalProperties").is_some());
+    }
+
+    #[test]
+    fn extract_tools_accepts_nested_json_schema_source() {
+        let result = json!({
+            "tools": [
+                {
+                    "name": "headline",
+                    "inputSchema": {
+                        "jsonSchema": {
+                            "properties": {
+                                "keyword": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+        let tools = extract_tools("real-time_news", &result);
+        assert_eq!(tools.len(), 1);
+        let schema = &tools[0].parameters;
+        assert_eq!(schema.get("type").and_then(Value::as_str), Some("object"));
+        assert_eq!(
+            schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|props| props.get("keyword"))
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str),
+            Some("string")
+        );
     }
 
     #[test]
@@ -1505,4 +2241,5 @@ mod tests {
             Some("value".to_string())
         );
     }
+
 }

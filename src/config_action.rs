@@ -346,7 +346,9 @@ pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
         "mcp.enabled" => Some("false"),
         "mcp.mcp-availability-check-mode" => Some("\"rsync\""),
         "mcp.transport" => None,
+        "mcp.type" => None,
         "mcp.server-url" => None,
+        "mcp.url" => None,
         "mcp.server_url" => None,
         "mcp.serverUrl" => None,
         "mcp.args" => Some("[]"),
@@ -415,7 +417,9 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
         "mcp.enabled",
         "mcp.mcp-availability-check-mode",
         "mcp.transport",
+        "mcp.type",
         "mcp.server-url",
+        "mcp.url",
         "mcp.server_url",
         "mcp.serverUrl",
         "mcp.endpoint",
@@ -430,7 +434,9 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
         "mcp.timeout-seconds",
         "mcp.servers.<name>.enabled",
         "mcp.servers.<name>.transport",
+        "mcp.servers.<name>.type",
         "mcp.servers.<name>.server-url",
+        "mcp.servers.<name>.url",
         "mcp.servers.<name>.server_url",
         "mcp.servers.<name>.serverUrl",
         "mcp.servers.<name>.endpoint",
@@ -467,7 +473,9 @@ fn parse_dynamic_mcp_server_key(key: &str) -> Option<&'static str> {
     match segments[3] {
         "enabled" if segments.len() == 4 => Some("enabled"),
         "transport" if segments.len() == 4 => Some("transport"),
+        "type" if segments.len() == 4 => Some("type"),
         "server-url" if segments.len() == 4 => Some("server-url"),
+        "url" if segments.len() == 4 => Some("url"),
         "server_url" if segments.len() == 4 => Some("server_url"),
         "serverUrl" if segments.len() == 4 => Some("serverUrl"),
         "endpoint" if segments.len() == 4 => Some("endpoint"),
@@ -650,7 +658,9 @@ mod tests {
     #[test]
     fn known_config_keys_include_new_mcp_root_fields() {
         assert!(is_known_config_key("mcp.transport"));
+        assert!(is_known_config_key("mcp.type"));
         assert!(is_known_config_key("mcp.server-url"));
+        assert!(is_known_config_key("mcp.url"));
         assert!(is_known_config_key("mcp.server_url"));
         assert!(is_known_config_key("mcp.serverUrl"));
         assert!(is_known_config_key("mcp.mcp-availability-check-mode"));
@@ -668,9 +678,11 @@ mod tests {
             "mcp.servers.local.headers.Authorization"
         ));
         assert!(is_known_config_key("mcp.servers.local.server-url"));
+        assert!(is_known_config_key("mcp.servers.local.url"));
         assert!(is_known_config_key("mcp.servers.local.server_url"));
         assert!(is_known_config_key("mcp.servers.local.serverUrl"));
         assert!(is_known_config_key("mcp.servers.local.transport"));
+        assert!(is_known_config_key("mcp.servers.local.type"));
         assert!(is_known_config_key("mcp.servers.local.auth-token"));
         assert!(is_known_config_key("mcp.servers.local.auth_token"));
     }

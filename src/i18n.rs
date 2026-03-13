@@ -3002,17 +3002,20 @@ fn localize_detail(detail: &str) -> String {
             }
         }
         _ if detail.starts_with("mcp server '")
-            && detail.ends_with("' transport=http requires endpoint or server-url") =>
+            && detail.ends_with(" requires endpoint or server-url")
+            && (detail.contains("' transport=http ")
+                || detail.contains("' transport=streamable_http ")
+                || detail.contains("' transport=sse ")) =>
         {
             match current_language() {
-                Language::ZhCn => format!("MCP HTTP 服务缺少 endpoint/server-url: {}", detail),
-                Language::ZhTw => format!("MCP HTTP 服務缺少 endpoint/server-url: {}", detail),
-                Language::Fr => format!("Serveur MCP HTTP sans endpoint/server-url: {}", detail),
+                Language::ZhCn => format!("MCP HTTP/SSE 服务缺少 endpoint/server-url: {}", detail),
+                Language::ZhTw => format!("MCP HTTP/SSE 服務缺少 endpoint/server-url: {}", detail),
+                Language::Fr => format!("Serveur MCP HTTP/SSE sans endpoint/server-url: {}", detail),
                 Language::De => {
-                    format!("MCP-HTTP-Server ohne endpoint/server-url konfiguriert: {}", detail)
+                    format!("MCP-HTTP/SSE-Server ohne endpoint/server-url konfiguriert: {}", detail)
                 }
                 Language::Ja => {
-                    format!("MCP HTTP サーバーに endpoint/server-url が不足しています: {}", detail)
+                    format!("MCP HTTP/SSE サーバーに endpoint/server-url が不足しています: {}", detail)
                 }
                 Language::En => detail.to_string(),
             }
@@ -3031,14 +3034,33 @@ fn localize_detail(detail: &str) -> String {
         }
         _ if detail.starts_with("mcp server '")
             && detail.contains(" has invalid transport ")
-            && detail.ends_with(", expected one of: http, stdio") =>
+            && (detail.ends_with(", expected one of: http, stdio")
+                || detail.ends_with(", expected one of: http, sse, stdio")
+                || detail.ends_with(
+                    ", expected one of: http, streamable_http, sse, stdio",
+                )) =>
         {
             match current_language() {
-                Language::ZhCn => format!("MCP transport 无效，仅支持 http/stdio: {}", detail),
-                Language::ZhTw => format!("MCP transport 無效，僅支援 http/stdio: {}", detail),
-                Language::Fr => format!("transport MCP invalide, seulement http/stdio: {}", detail),
-                Language::De => format!("Ungültiger MCP-Transport, nur http/stdio erlaubt: {}", detail),
-                Language::Ja => format!("MCP transport が不正です。http/stdio のみ対応: {}", detail),
+                Language::ZhCn => format!(
+                    "MCP transport 无效，仅支持 http/streamable_http/sse/stdio: {}",
+                    detail
+                ),
+                Language::ZhTw => format!(
+                    "MCP transport 無效，僅支援 http/streamable_http/sse/stdio: {}",
+                    detail
+                ),
+                Language::Fr => format!(
+                    "transport MCP invalide, seulement http/streamable_http/sse/stdio: {}",
+                    detail
+                ),
+                Language::De => format!(
+                    "Ungültiger MCP-Transport, nur http/streamable_http/sse/stdio erlaubt: {}",
+                    detail
+                ),
+                Language::Ja => format!(
+                    "MCP transport が不正です。http/streamable_http/sse/stdio のみ対応: {}",
+                    detail
+                ),
                 Language::En => detail.to_string(),
             }
         }

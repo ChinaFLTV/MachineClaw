@@ -180,8 +180,9 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 
 ### MCP 配置建议
 
-- HTTP 连接建议使用 `server-url = ".../mcp"`（优先 `/mcp`；若服务仅暴露旧 `/sse`，建议在服务侧开启 `/mcp` 兼容入口）。
-- `transport` 支持 `http` / `stdio`；不配置时会按 `command` 或 `endpoint/server-url` 自动推断。
+- HTTP 连接建议使用 `server-url = ".../mcp"`（优先 `/mcp`；若服务仅暴露旧 `/sse`，也可配置 `transport = "sse"` + `/sse` 地址）。
+- `transport` 支持 `http` / `streamable_http` / `sse` / `stdio`；`streamable_http` 等价于 `http`；`sse` 为 legacy SSE 传输（会先连 `/sse` 接收 `endpoint` 事件，再向 message endpoint 发 JSON-RPC）。
+- 兼容 Smithery 风格字段：`type` 可替代 `transport`，`url` 可替代 `server-url`。
 - 鉴权可用 `auth-type` + `auth-token`，或在 `headers` 中显式配置 `Authorization`。
 
 ```toml
@@ -195,6 +196,14 @@ auth-type = "bearer"
 auth-token = "<token>"
 [mcp.servers.deepwiki.headers]
 X-Trace-Id = "machineclaw"
+
+[mcp.servers.real-time_news]
+type = "sse"
+url = "https://mcp.api-inference.modelscope.net/66f1343a15204e/sse"
+
+[mcp.servers.News-Headlines]
+type = "streamable_http"
+url = "https://mcp.api-inference.modelscope.net/66cb8f57d6804f/mcp"
 ```
 
 ## 命令说明
