@@ -363,6 +363,21 @@ pub fn preflight_notice_permission_check() -> &'static str {
     }
 }
 
+pub fn preflight_notice_permission_check_skipped() -> &'static str {
+    match current_language() {
+        Language::ZhCn => "当前命令不强制要求 root/管理员权限，按当前用户继续运行",
+        Language::ZhTw => "目前命令不強制要求 root/管理員權限，將以目前使用者繼續執行",
+        Language::Fr => {
+            "Cette commande ne requiert pas root/admin; exécution avec l'utilisateur courant"
+        }
+        Language::De => {
+            "Für diesen Befehl sind keine Root-/Admin-Rechte erforderlich; Ausführung mit aktuellem Benutzer"
+        }
+        Language::Ja => "このコマンドでは root/管理者権限を必須とせず、現在のユーザーで続行します",
+        Language::En => "This command does not require root/admin; continuing as the current user",
+    }
+}
+
 pub fn preflight_notice_ai_check() -> &'static str {
     match current_language() {
         Language::ZhCn => "校验 AI 连通性（网络不稳定时可能需要更久）...",
@@ -2638,6 +2653,14 @@ fn localize_detail(detail: &str) -> String {
             Language::Fr => "Le champ obligatoire ai.model est manquant".to_string(),
             Language::De => "Pflichtfeld ai.model fehlt".to_string(),
             Language::Ja => "必須設定 ai.model が不足しています".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "ai.type must be one of: openai, claude, gemini, anthropic, google, deepseek, qwen, ollama, openrouter, zhipu, moonshot, doubao, stepfun, siliconflow, groq, together, mistral, azure-openai" => match current_language() {
+            Language::ZhCn => "ai.type 取值不合法，请使用 openai/claude/gemini 或兼容别名".to_string(),
+            Language::ZhTw => "ai.type 取值不合法，請使用 openai/claude/gemini 或相容別名".to_string(),
+            Language::Fr => "Valeur ai.type invalide ; utilisez openai/claude/gemini ou un alias compatible".to_string(),
+            Language::De => "Ungültiger ai.type; verwenden Sie openai/claude/gemini oder kompatible Aliase".to_string(),
+            Language::Ja => "ai.type が不正です。openai/claude/gemini または互換エイリアスを使用してください".to_string(),
             Language::En => detail.to_string(),
         },
         "app.env-mode must be one of: prod, test, dev" => match current_language() {

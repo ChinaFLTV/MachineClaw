@@ -169,7 +169,7 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 主要配置段：
 
 - `[app]`：语言、环境模式（`prod/test/dev`）
-- `[ai]`：API 地址、Token、模型、重试
+- `[ai]`：协议类型（`type`）、API 地址、Token、模型、重试
 - `[ai.chat]`：chat 行为、工具显示、压缩、超时、轮次上限
 - `[cmd]`：命令超时、写命令确认、allow/deny 命令规则
 - `[skills]`：skills 目录与开关

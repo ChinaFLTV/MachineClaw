@@ -227,7 +227,13 @@ fn run() -> Result<ExitCode, AppError> {
     )?;
     let run_ai_connectivity_check =
         !matches!(&command, Commands::Chat) || cfg.ai.connectivity_check;
-    run_preflight_checks(&cfg, &ai_client, run_ai_connectivity_check)?;
+    let require_elevated = !matches!(&command, Commands::Chat);
+    run_preflight_checks(
+        &cfg,
+        &ai_client,
+        run_ai_connectivity_check,
+        require_elevated,
+    )?;
 
     let skills_dir = expand_tilde(&cfg.skills.dir);
     let skill_list = if cfg.skills.enabled {
@@ -309,6 +315,7 @@ fn run_preflight_checks(
     cfg: &config::AppConfig,
     ai_client: &AiClient,
     run_ai_connectivity_check: bool,
+    require_elevated: bool,
 ) -> Result<(), AppError> {
     logging::info("preflight start");
     let started = Instant::now();
@@ -328,7 +335,17 @@ fn run_preflight_checks(
             cfg.console.colorful
         )
     );
-    require_elevated_permissions()?;
+    if require_elevated {
+        require_elevated_permissions()?;
+    } else {
+        println!(
+            "{}",
+            render::render_info_line(
+                i18n::preflight_notice_permission_check_skipped(),
+                cfg.console.colorful
+            )
+        );
+    }
     if run_ai_connectivity_check {
         let mut ai_spinner = PreflightSpinner::start(
             i18n::preflight_notice_ai_check().to_string(),

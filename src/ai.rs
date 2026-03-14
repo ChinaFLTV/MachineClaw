@@ -22,8 +22,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    config::AiConfig, error::AppError, i18n, logging, mask::mask_sensitive, render,
-    shell::take_interactive_input_refresh_hint, tls::ensure_rustls_crypto_provider,
+    config::{AiConfig, normalize_ai_provider_type},
+    error::AppError,
+    i18n, logging,
+    mask::mask_sensitive,
+    render,
+    shell::take_interactive_input_refresh_hint,
+    tls::ensure_rustls_crypto_provider,
 };
 
 const MODEL_PRICE_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -34,6 +39,8 @@ const AI_HTTP_REQUEST_TIMEOUT_SECS: u64 = 60;
 const AI_HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 30;
 const AI_HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
 const CHAT_CANCELLED_ERROR: &str = "chat request cancelled by user";
+const CLAUDE_MAX_TOKENS: u32 = 4096;
+const CLAUDE_API_VERSION: &str = "2023-06-01";
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -135,6 +142,7 @@ pub struct ExternalToolDefinition {
 #[derive(Debug)]
 pub struct AiClient {
     client: RwLock<Client>,
+    provider: AiProviderProtocol,
     base_url: String,
     token: String,
     model: String,
@@ -165,6 +173,7 @@ impl Clone for AiClient {
             .and_then(|guard| *guard);
         Self {
             client: RwLock::new(client),
+            provider: self.provider,
             base_url: self.base_url.clone(),
             token: self.token.clone(),
             model: self.model.clone(),
@@ -178,6 +187,13 @@ impl Clone for AiClient {
             runtime_model_prices: RwLock::new(cached_prices),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiProviderProtocol {
+    OpenAiCompatible,
+    Claude,
+    Gemini,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,9 +390,11 @@ impl AiClient {
         colorful: bool,
     ) -> Result<Self, AppError> {
         let client = Self::build_http_client()?;
+        let provider = provider_protocol_from_config_type(cfg.r#type.as_str());
         Ok(Self {
             client: RwLock::new(client),
-            base_url: build_chat_url(&cfg.base_url),
+            provider,
+            base_url: build_provider_chat_url(&cfg.base_url, provider, &cfg.model),
             token: cfg.token.clone(),
             model: cfg.model.clone(),
             colorful,
@@ -388,6 +406,37 @@ impl AiClient {
             output_price_per_million: cfg.output_price_per_million,
             runtime_model_prices: RwLock::new(None),
         })
+    }
+
+    fn build_provider_request_body(&self, body: &ChatCompletionRequest) -> serde_json::Value {
+        match self.provider {
+            AiProviderProtocol::OpenAiCompatible => {
+                serde_json::to_value(body).unwrap_or_else(|_| json!({}))
+            }
+            AiProviderProtocol::Claude => build_claude_request_body(body),
+            AiProviderProtocol::Gemini => build_gemini_request_body(body),
+        }
+    }
+
+    fn parse_provider_response_text(&self, body: &str) -> Result<ParsedChatResponse, AppError> {
+        match self.provider {
+            AiProviderProtocol::OpenAiCompatible => parse_chat_completion_response_text(body),
+            AiProviderProtocol::Claude => parse_claude_response_text(body),
+            AiProviderProtocol::Gemini => parse_gemini_response_text(body),
+        }
+    }
+
+    fn apply_provider_auth(
+        &self,
+        builder: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        match self.provider {
+            AiProviderProtocol::OpenAiCompatible => builder.bearer_auth(&self.token),
+            AiProviderProtocol::Claude => builder
+                .header("x-api-key", &self.token)
+                .header("anthropic-version", CLAUDE_API_VERSION),
+            AiProviderProtocol::Gemini => builder.header("x-goog-api-key", &self.token),
+        }
     }
 
     pub fn validate_connectivity(&self) -> Result<(), AppError> {
@@ -921,7 +970,19 @@ impl AiClient {
                 ));
             }
 
-            return Err(AppError::Ai("AI returned empty content".to_string()));
+            logging::warn(
+                "assistant returned empty content and no tool calls; using local recoverable fallback response",
+            );
+            return Ok(self.build_recoverable_chat_response(
+                FinalizeWithoutToolsState {
+                    thinking_chunks,
+                    visible_assistant_chunks,
+                    metrics,
+                    tool_rounds_used,
+                    total_tool_calls,
+                },
+                None,
+            ));
         }
 
         self.finalize_without_tools(
@@ -965,7 +1026,10 @@ impl AiClient {
             );
             self.debug_emit(
                 AiDebugLevel::Debug,
-                &format!("AI request body: {}", serialize_debug_json(&effective_body)),
+                &format!(
+                    "AI request body: {}",
+                    serialize_debug_json(&self.build_provider_request_body(&effective_body))
+                ),
             );
             if !refreshed_for_idle_hint && take_interactive_input_refresh_hint() {
                 self.reconnect_http_client()?;
@@ -986,11 +1050,9 @@ impl AiClient {
             } else {
                 self.current_http_client()?
             };
-            let resp = client
-                .post(&self.base_url)
-                .bearer_auth(&self.token)
-                .json(&effective_body)
-                .send();
+            let request_body = self.build_provider_request_body(&effective_body);
+            let request_builder = self.apply_provider_auth(client.post(&self.base_url));
+            let resp = request_builder.json(&request_body).send();
 
             match resp {
                 Ok(resp) => {
@@ -1047,14 +1109,37 @@ impl AiClient {
                     }
 
                     return_if_chat_cancelled(cancel_requested)?;
-                    let response_text = resp.text().map_err(|err| {
-                        AppError::Ai(format!("failed to read AI response body: {err}"))
-                    })?;
+                    let response_text = match resp.text() {
+                        Ok(text) => text,
+                        Err(err) => {
+                            let err_msg = format!(
+                                "failed to read AI response body: {}",
+                                format_reqwest_error(&err)
+                            );
+                            logging::warn(&err_msg);
+                            if attempt <= self.max_retries {
+                                retry_with_fresh_client =
+                                    should_refresh_http_client_after_reqwest_error(&err);
+                                if retry_with_fresh_client {
+                                    maybe_print_ai_reconnect_notice(
+                                        &i18n::chat_ai_reconnecting(attempt, self.max_retries),
+                                        self.colorful,
+                                    );
+                                }
+                                sleep_with_chat_cancel(
+                                    Duration::from_millis(self.backoff_millis),
+                                    cancel_requested,
+                                )?;
+                                continue;
+                            }
+                            return Err(AppError::Ai(err_msg));
+                        }
+                    };
                     self.debug_emit(
                         AiDebugLevel::Debug,
                         &format!("AI response body: {}", mask_sensitive(&response_text)),
                     );
-                    let parsed = parse_chat_completion_response_text(&response_text)?;
+                    let parsed = self.parse_provider_response_text(&response_text)?;
                     logging::info("AI request finished successfully");
                     self.debug_emit(
                         AiDebugLevel::Info,
@@ -1111,6 +1196,26 @@ impl AiClient {
         if !stream_output {
             return self.send_chat_completion(body, cancel_requested);
         }
+        if body.tools.is_some() && model_prefers_non_streaming_tool_rounds(&self.model) {
+            logging::warn(
+                "model prefers non-streaming tool rounds for compatibility; falling back to non-streaming request",
+            );
+            self.debug_emit(
+                AiDebugLevel::Warn,
+                "AI streaming disabled for tool round on current model; fallback to non-streaming mode",
+            );
+            return self.send_chat_completion(body, cancel_requested);
+        }
+        if self.provider != AiProviderProtocol::OpenAiCompatible {
+            logging::warn(
+                "AI provider is using non-OpenAI protocol; streaming mode falls back to non-streaming request",
+            );
+            self.debug_emit(
+                AiDebugLevel::Warn,
+                "AI streaming is not enabled for current provider protocol; fallback to non-streaming mode",
+            );
+            return self.send_chat_completion(body, cancel_requested);
+        }
 
         let mut effective_body = normalize_request_for_provider(body, &self.base_url);
         let mut stripped_reasoning_retry_used = false;
@@ -1158,11 +1263,8 @@ impl AiClient {
             } else {
                 self.current_http_client()?
             };
-            let resp = client
-                .post(&self.base_url)
-                .bearer_auth(&self.token)
-                .json(&stream_body)
-                .send();
+            let request_builder = self.apply_provider_auth(client.post(&self.base_url));
+            let resp = request_builder.json(&stream_body).send();
 
             match resp {
                 Ok(resp) => {
@@ -2455,7 +2557,7 @@ fn shell_tool_definition() -> ApiTool {
         r#type: "function".to_string(),
         function: ApiFunctionDefinition {
             name: "run_shell_command".to_string(),
-            description: "Execute local shell command on current machine. Prefer read-only commands. Use mode=write only when mutation is necessary.".to_string(),
+            description: "Execute local shell command on current machine. Prefer read-only commands. Use mode=write only when mutation is necessary. Arguments must be a strict JSON object.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -2915,6 +3017,15 @@ pub(crate) fn is_transient_ai_error(err: &AppError) -> bool {
         || lowered.contains("http status=502")
         || lowered.contains("http status=503")
         || lowered.contains("http status=504")
+        || lowered.contains("failed to read ai response body")
+        || lowered.contains("error decoding response body")
+        || lowered.contains("failed to read chunk")
+        || lowered.contains("connection closed before message completed")
+        || lowered.contains("ai returned empty content")
+        || lowered.contains("ai returned empty choices")
+        || lowered.contains("ai returned empty candidates")
+        || lowered.contains("ai returned empty content blocks")
+        || lowered.contains("gemini blocked response")
 }
 
 fn should_retry_status(status: StatusCode) -> bool {
@@ -2936,7 +3047,8 @@ fn parse_rate_limit_retry_delay(status: StatusCode, retry_after: Option<&str>) -
 }
 
 fn should_refresh_http_client_after_reqwest_error(err: &reqwest::Error) -> bool {
-    if err.is_timeout() || err.is_connect() || err.is_request() {
+    if err.is_timeout() || err.is_connect() || err.is_request() || err.is_body() || err.is_decode()
+    {
         return true;
     }
     let lowered = err.to_string().to_ascii_lowercase();
@@ -2946,6 +3058,9 @@ fn should_refresh_http_client_after_reqwest_error(err: &reqwest::Error) -> bool 
         || lowered.contains("unexpected eof")
         || lowered.contains("channel closed")
         || lowered.contains("tls handshake eof")
+        || lowered.contains("error decoding response body")
+        || lowered.contains("failed to read chunk")
+        || lowered.contains("connection closed before message completed")
 }
 
 fn maybe_print_ai_reconnect_notice(message: &str, colorful: bool) {
@@ -2964,6 +3079,11 @@ fn maybe_print_ai_reconnect_notice(message: &str, colorful: bool) {
 fn model_prefers_omit_tool_choice(model: &str) -> bool {
     let normalized = model.trim().to_ascii_lowercase();
     normalized == "deepseek-reasoner"
+}
+
+fn model_prefers_non_streaming_tool_rounds(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    normalized == "deepseek-reasoner" || normalized == "deepseek-r1"
 }
 
 fn should_force_continue_with_tools(content: &str) -> bool {
@@ -3015,6 +3135,714 @@ fn build_chat_url(base_url: &str) -> String {
         return trimmed.to_string();
     }
     format!("{trimmed}/chat/completions")
+}
+
+fn provider_protocol_from_config_type(raw: &str) -> AiProviderProtocol {
+    match normalize_ai_provider_type(raw) {
+        "claude" => AiProviderProtocol::Claude,
+        "gemini" => AiProviderProtocol::Gemini,
+        _ => AiProviderProtocol::OpenAiCompatible,
+    }
+}
+
+fn build_provider_chat_url(base_url: &str, provider: AiProviderProtocol, model: &str) -> String {
+    match provider {
+        AiProviderProtocol::OpenAiCompatible => build_chat_url(base_url),
+        AiProviderProtocol::Claude => build_claude_chat_url(base_url),
+        AiProviderProtocol::Gemini => build_gemini_chat_url(base_url, model),
+    }
+}
+
+fn build_claude_chat_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/messages") {
+        return trimmed.to_string();
+    }
+    if trimmed.ends_with("/chat/completions") {
+        let prefix = trimmed.trim_end_matches("/chat/completions");
+        if prefix.ends_with("/v1") {
+            return format!("{prefix}/messages");
+        }
+        return format!("{prefix}/v1/messages");
+    }
+    if trimmed.ends_with("/v1") {
+        return format!("{trimmed}/messages");
+    }
+    format!("{trimmed}/messages")
+}
+
+fn build_gemini_chat_url(base_url: &str, model: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.to_ascii_lowercase().contains(":generatecontent") {
+        return trimmed.to_string();
+    }
+    if trimmed.ends_with("/chat/completions") {
+        let prefix = trimmed.trim_end_matches("/chat/completions");
+        return format!(
+            "{prefix}/models/{}:generateContent",
+            normalize_gemini_model_name(model)
+        );
+    }
+    if trimmed.contains("/models/") {
+        return format!("{trimmed}:generateContent");
+    }
+    format!(
+        "{trimmed}/models/{}:generateContent",
+        normalize_gemini_model_name(model)
+    )
+}
+
+fn normalize_gemini_model_name(model: &str) -> String {
+    let trimmed = model.trim().trim_matches('/');
+    if let Some(stripped) = trimmed.strip_prefix("models/") {
+        return stripped.to_string();
+    }
+    trimmed.to_string()
+}
+
+fn build_claude_request_body(body: &ChatCompletionRequest) -> serde_json::Value {
+    let (system_prompt, messages) = convert_openai_messages_to_claude(&body.messages);
+    let mut payload = json!({
+        "model": body.model,
+        "temperature": body.temperature,
+        "max_tokens": CLAUDE_MAX_TOKENS,
+        "messages": messages,
+    });
+    if let Some(system) = system_prompt {
+        payload["system"] = serde_json::Value::String(system);
+    }
+    if let Some(tools) = body.tools.as_ref() {
+        let tool_defs = tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.function.name,
+                    "description": tool.function.description,
+                    "input_schema": tool.function.parameters,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !tool_defs.is_empty() {
+            payload["tools"] = serde_json::Value::Array(tool_defs);
+            if let Some(tool_choice) = claude_tool_choice_value(body.tool_choice.as_ref()) {
+                payload["tool_choice"] = tool_choice;
+            }
+        }
+    }
+    payload
+}
+
+fn build_gemini_request_body(body: &ChatCompletionRequest) -> serde_json::Value {
+    let (system_prompt, mut contents) = convert_openai_messages_to_gemini(&body.messages);
+    if contents.is_empty() {
+        contents.push(json!({
+            "role": "user",
+            "parts": [{"text": ""}]
+        }));
+    }
+    let mut payload = json!({
+        "contents": contents,
+        "generationConfig": {
+            "temperature": body.temperature
+        }
+    });
+    if let Some(system) = system_prompt {
+        payload["systemInstruction"] = json!({
+            "parts": [{"text": system}]
+        });
+    }
+    if let Some(tools) = body.tools.as_ref() {
+        let function_declarations = tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.function.name,
+                    "description": tool.function.description,
+                    "parameters": tool.function.parameters,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !function_declarations.is_empty() {
+            payload["tools"] = json!([{
+                "functionDeclarations": function_declarations
+            }]);
+            if let Some(tool_config) = gemini_tool_config_value(body.tool_choice.as_ref()) {
+                payload["toolConfig"] = tool_config;
+            }
+        }
+    }
+    payload
+}
+
+fn convert_openai_messages_to_claude(
+    messages: &[ApiMessage],
+) -> (Option<String>, Vec<serde_json::Value>) {
+    let mut system_chunks = Vec::new();
+    let mut converted = Vec::new();
+    for message in messages {
+        match message.role.as_str() {
+            "system" => {
+                if let Some(text) = message.content.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    system_chunks.push(text.to_string());
+                }
+            }
+            "assistant" => {
+                let mut parts = Vec::new();
+                if let Some(text) = message.content.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    parts.push(json!({
+                        "type": "text",
+                        "text": text
+                    }));
+                }
+                if let Some(tool_calls) = message.tool_calls.as_ref() {
+                    for tool_call in tool_calls {
+                        parts.push(json!({
+                            "type": "tool_use",
+                            "id": tool_call.id,
+                            "name": tool_call.function.name,
+                            "input": parse_tool_arguments_object(&tool_call.function.arguments),
+                        }));
+                    }
+                }
+                if !parts.is_empty() {
+                    converted.push(json!({
+                        "role": "assistant",
+                        "content": parts
+                    }));
+                }
+            }
+            "tool" => {
+                let mut parts = Vec::new();
+                if let Some(id) = message.tool_call_id.as_deref()
+                    && !id.trim().is_empty()
+                {
+                    parts.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": id,
+                        "content": message.content.as_deref().unwrap_or_default(),
+                    }));
+                } else if let Some(text) = message.content.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    parts.push(json!({
+                        "type": "text",
+                        "text": text
+                    }));
+                }
+                if !parts.is_empty() {
+                    converted.push(json!({
+                        "role": "user",
+                        "content": parts
+                    }));
+                }
+            }
+            _ => {
+                if let Some(text) = message.content.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    converted.push(json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": text
+                        }]
+                    }));
+                }
+            }
+        }
+    }
+    (optional_text(system_chunks.join("\n\n")), converted)
+}
+
+fn convert_openai_messages_to_gemini(
+    messages: &[ApiMessage],
+) -> (Option<String>, Vec<serde_json::Value>) {
+    let mut system_chunks = Vec::new();
+    let mut converted = Vec::new();
+    let mut tool_names = HashMap::<String, String>::new();
+
+    for message in messages {
+        match message.role.as_str() {
+            "system" => {
+                if let Some(text) = message.content.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    system_chunks.push(text.to_string());
+                }
+            }
+            "assistant" => {
+                let mut parts = Vec::new();
+                if let Some(text) = message.content.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    parts.push(json!({ "text": text }));
+                }
+                if let Some(tool_calls) = message.tool_calls.as_ref() {
+                    for tool_call in tool_calls {
+                        tool_names.insert(tool_call.id.clone(), tool_call.function.name.clone());
+                        parts.push(json!({
+                            "functionCall": {
+                                "name": tool_call.function.name,
+                                "args": parse_tool_arguments_object(&tool_call.function.arguments),
+                            }
+                        }));
+                    }
+                }
+                if !parts.is_empty() {
+                    converted.push(json!({
+                        "role": "model",
+                        "parts": parts
+                    }));
+                }
+            }
+            "tool" => {
+                let mut parts = Vec::new();
+                if let Some(id) = message.tool_call_id.as_deref()
+                    && !id.trim().is_empty()
+                {
+                    let tool_name = tool_names
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| "run_shell_command".to_string());
+                    parts.push(json!({
+                        "functionResponse": {
+                            "name": tool_name,
+                            "response": parse_tool_result_payload(message.content.as_deref().unwrap_or_default())
+                        }
+                    }));
+                } else if let Some(text) = message.content.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    parts.push(json!({ "text": text }));
+                }
+                if !parts.is_empty() {
+                    converted.push(json!({
+                        "role": "user",
+                        "parts": parts
+                    }));
+                }
+            }
+            _ => {
+                if let Some(text) = message.content.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    converted.push(json!({
+                        "role": "user",
+                        "parts": [{ "text": text }]
+                    }));
+                }
+            }
+        }
+    }
+    (optional_text(system_chunks.join("\n\n")), converted)
+}
+
+fn parse_tool_arguments_object(arguments: &str) -> serde_json::Value {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return json!({});
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(object)) => serde_json::Value::Object(object),
+        Ok(value) => json!({ "value": value }),
+        Err(_) => json!({ "raw": trimmed }),
+    }
+}
+
+fn parse_tool_result_payload(raw: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return json!({ "content": "" });
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(object)) => serde_json::Value::Object(object),
+        Ok(value) => json!({ "content": value }),
+        Err(_) => json!({ "content": trimmed }),
+    }
+}
+
+fn claude_tool_choice_value(choice: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let choice = choice?;
+    if let Some(raw) = choice.as_str() {
+        return Some(match raw.trim().to_ascii_lowercase().as_str() {
+            "required" => json!({ "type": "any" }),
+            "none" => json!({ "type": "auto" }),
+            _ => json!({ "type": "auto" }),
+        });
+    }
+    let Some(object) = choice.as_object() else {
+        return Some(json!({ "type": "auto" }));
+    };
+    let choice_type = object
+        .get("type")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if choice_type == "function" {
+        let function_name = object
+            .get("function")
+            .and_then(|value| value.get("name"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        return Some(json!({
+            "type": "tool",
+            "name": function_name
+        }));
+    }
+    Some(match choice_type.as_str() {
+        "none" => json!({ "type": "auto" }),
+        "required" => json!({ "type": "any" }),
+        _ => json!({ "type": "auto" }),
+    })
+}
+
+fn gemini_tool_config_value(choice: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let choice = choice?;
+    let mut function_calling = json!({ "mode": "AUTO" });
+    if let Some(raw) = choice.as_str() {
+        function_calling["mode"] = serde_json::Value::String(
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "required" => "ANY",
+                "none" => "NONE",
+                _ => "AUTO",
+            }
+            .to_string(),
+        );
+        return Some(json!({ "functionCallingConfig": function_calling }));
+    }
+    if let Some(object) = choice.as_object() {
+        let choice_type = object
+            .get("type")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        if choice_type == "function"
+            && let Some(function_name) = object
+                .get("function")
+                .and_then(|value| value.get("name"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        {
+            function_calling["mode"] = serde_json::Value::String("ANY".to_string());
+            function_calling["allowedFunctionNames"] =
+                serde_json::Value::Array(vec![serde_json::Value::String(
+                    function_name.to_string(),
+                )]);
+            return Some(json!({ "functionCallingConfig": function_calling }));
+        }
+        if choice_type == "none" {
+            function_calling["mode"] = serde_json::Value::String("NONE".to_string());
+        }
+    }
+    Some(json!({ "functionCallingConfig": function_calling }))
+}
+
+fn parse_claude_response_text(body: &str) -> Result<ParsedChatResponse, AppError> {
+    let parsed: serde_json::Value = serde_json::from_str(body)
+        .map_err(|err| AppError::Ai(format!("failed to parse AI response: {err}")))?;
+    if let Some(error_message) = extract_provider_error_message(&parsed) {
+        return Err(AppError::Ai(error_message));
+    }
+    let content_items = parsed
+        .get("content")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| AppError::Ai("AI returned empty content blocks".to_string()))?;
+    let mut text_chunks = Vec::new();
+    let mut reasoning_chunks = Vec::new();
+    let mut tool_calls = Vec::new();
+    for (index, item) in content_items.iter().enumerate() {
+        let item_type = item
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        match item_type {
+            "text" => {
+                if let Some(text) = item.get("text").and_then(|value| value.as_str())
+                    && !text.trim().is_empty()
+                {
+                    text_chunks.push(text.to_string());
+                }
+            }
+            "thinking" => {
+                if let Some(thinking) = item
+                    .get("thinking")
+                    .or_else(|| item.get("text"))
+                    .and_then(|value| value.as_str())
+                    && !thinking.trim().is_empty()
+                {
+                    reasoning_chunks.push(thinking.to_string());
+                }
+            }
+            "tool_use" => {
+                let name = item
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    continue;
+                }
+                let id = item
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| format!("claude_call_{}", index + 1));
+                let arguments_value = item.get("input").cloned().unwrap_or_else(|| json!({}));
+                let arguments =
+                    serde_json::to_string(&arguments_value).unwrap_or_else(|_| "{}".to_string());
+                tool_calls.push(ApiToolCall {
+                    id,
+                    r#type: "function".to_string(),
+                    function: ApiToolFunction {
+                        name: name.to_string(),
+                        arguments,
+                    },
+                });
+            }
+            _ => {
+                if let Some(text) = item.get("text").and_then(|value| value.as_str())
+                    && !text.trim().is_empty()
+                {
+                    text_chunks.push(text.to_string());
+                }
+            }
+        }
+    }
+    let usage = parse_claude_usage(&parsed);
+    Ok(ParsedChatResponse {
+        message: AssistantMessage {
+            content: optional_json_text(text_chunks.join("\n")),
+            reasoning_content: optional_text(reasoning_chunks.join("\n")),
+            reasoning: None,
+            tool_calls,
+        },
+        usage,
+    })
+}
+
+fn parse_gemini_response_text(body: &str) -> Result<ParsedChatResponse, AppError> {
+    let parsed: serde_json::Value = serde_json::from_str(body)
+        .map_err(|err| AppError::Ai(format!("failed to parse AI response: {err}")))?;
+    if let Some(error_message) = extract_provider_error_message(&parsed) {
+        return Err(AppError::Ai(error_message));
+    }
+    let candidates = parsed
+        .get("candidates")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            AppError::Ai(
+                extract_gemini_blocked_reason(&parsed)
+                    .unwrap_or_else(|| "AI returned empty candidates".to_string()),
+            )
+        })?;
+    let Some(first_candidate) = candidates.first() else {
+        return Err(AppError::Ai(
+            extract_gemini_blocked_reason(&parsed)
+                .unwrap_or_else(|| "AI returned empty candidates".to_string()),
+        ));
+    };
+    let parts = first_candidate
+        .get("content")
+        .and_then(|value| value.get("parts"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut text_chunks = Vec::new();
+    let mut tool_calls = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        if let Some(text) = part.get("text").and_then(|value| value.as_str())
+            && !text.trim().is_empty()
+        {
+            text_chunks.push(text.to_string());
+        }
+        if let Some(function_call) = part
+            .get("functionCall")
+            .or_else(|| part.get("function_call"))
+        {
+            let name = function_call
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let id = function_call
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| format!("gemini_call_{}", index + 1));
+            let arguments_value = function_call
+                .get("args")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let arguments =
+                serde_json::to_string(&arguments_value).unwrap_or_else(|_| "{}".to_string());
+            tool_calls.push(ApiToolCall {
+                id,
+                r#type: "function".to_string(),
+                function: ApiToolFunction {
+                    name: name.to_string(),
+                    arguments,
+                },
+            });
+        }
+    }
+    let usage = parse_gemini_usage(&parsed);
+    Ok(ParsedChatResponse {
+        message: AssistantMessage {
+            content: optional_json_text(text_chunks.join("\n")),
+            reasoning_content: None,
+            reasoning: None,
+            tool_calls,
+        },
+        usage,
+    })
+}
+
+fn parse_claude_usage(value: &serde_json::Value) -> Usage {
+    let prompt_tokens = value
+        .get("usage")
+        .and_then(|usage| usage.get("input_tokens"))
+        .map(json_value_to_u64)
+        .unwrap_or(0);
+    let completion_tokens = value
+        .get("usage")
+        .and_then(|usage| usage.get("output_tokens"))
+        .map(json_value_to_u64)
+        .unwrap_or(0);
+    let total_tokens = value
+        .get("usage")
+        .and_then(|usage| usage.get("total_tokens"))
+        .map(json_value_to_u64)
+        .unwrap_or(prompt_tokens.saturating_add(completion_tokens));
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+    }
+}
+
+fn parse_gemini_usage(value: &serde_json::Value) -> Usage {
+    let prompt_tokens = value
+        .get("usageMetadata")
+        .and_then(|usage| usage.get("promptTokenCount"))
+        .map(json_value_to_u64)
+        .unwrap_or(0);
+    let completion_tokens = value
+        .get("usageMetadata")
+        .and_then(|usage| {
+            usage
+                .get("candidatesTokenCount")
+                .or_else(|| usage.get("responseTokenCount"))
+        })
+        .map(json_value_to_u64)
+        .unwrap_or(0);
+    let total_tokens = value
+        .get("usageMetadata")
+        .and_then(|usage| usage.get("totalTokenCount"))
+        .map(json_value_to_u64)
+        .unwrap_or(prompt_tokens.saturating_add(completion_tokens));
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+    }
+}
+
+fn extract_gemini_blocked_reason(value: &serde_json::Value) -> Option<String> {
+    let prompt_feedback = value.get("promptFeedback")?;
+    let block_reason = prompt_feedback
+        .get("blockReason")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string());
+    let safety = prompt_feedback
+        .get("safetyRatings")
+        .and_then(|item| item.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let category = item
+                        .get("category")
+                        .and_then(|field| field.as_str())
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    let probability = item
+                        .get("probability")
+                        .and_then(|field| field.as_str())
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if category.is_empty() && probability.is_empty() {
+                        return None;
+                    }
+                    if category.is_empty() {
+                        return Some(probability.to_string());
+                    }
+                    if probability.is_empty() {
+                        return Some(category.to_string());
+                    }
+                    Some(format!("{category}:{probability}"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if block_reason.is_none() && safety.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(reason) = block_reason {
+        parts.push(format!("reason={reason}"));
+    }
+    if !safety.is_empty() {
+        parts.push(format!("safety={}", safety.join(",")));
+    }
+    Some(format!("gemini blocked response ({})", parts.join("; ")))
+}
+
+fn json_value_to_u64(value: &serde_json::Value) -> u64 {
+    if let Some(integer) = value.as_u64() {
+        return integer;
+    }
+    if let Some(integer) = value.as_i64() {
+        return integer.max(0) as u64;
+    }
+    if let Some(number) = value.as_f64()
+        && number.is_finite()
+        && number > 0.0
+    {
+        return number as u64;
+    }
+    if let Some(text) = value.as_str() {
+        return text.trim().parse::<u64>().unwrap_or(0);
+    }
+    0
+}
+
+fn extract_provider_error_message(value: &serde_json::Value) -> Option<String> {
+    let error = value.get("error")?;
+    if let Some(message) = error.get("message").and_then(|item| item.as_str()) {
+        return Some(format!("AI provider error: {}", message.trim()));
+    }
+    if let Some(message) = error.as_str() {
+        return Some(format!("AI provider error: {}", message.trim()));
+    }
+    Some(format!(
+        "AI provider error: {}",
+        serde_json::to_string(error).unwrap_or_else(|_| "<unknown error>".to_string())
+    ))
 }
 
 fn normalize_request_for_provider(
@@ -3165,17 +3993,20 @@ mod tests {
     use std::{env, fs, sync::RwLock, time::Duration};
 
     use super::{
-        AiClient, ApiMessage, ApiToolCall, ApiToolFunction, ChatCompletionRequest,
-        ChatCompletionStreamResponse, ChatMetrics, ChatStopReason, FinalizeWithoutToolsState,
-        ModelPriceSource, PersistedModelPriceCatalog, PersistedModelPriceEntry,
+        AiClient, AiProviderProtocol, ApiMessage, ApiToolCall, ApiToolFunction,
+        ChatCompletionRequest, ChatCompletionStreamResponse, ChatMetrics, ChatStopReason,
+        FinalizeWithoutToolsState, ModelPriceSource, PersistedModelPriceCatalog,
+        PersistedModelPriceEntry, build_claude_request_body, build_provider_chat_url,
         builtin_model_prices, extract_text_delta_from_value, extract_text_from_value,
         fresh_model_price_catalog, is_rate_limited_error, merge_text_delta, merge_visible_chunks,
-        normalize_stepfun_chat_request, parse_model_price_catalog_response,
+        model_prefers_non_streaming_tool_rounds, normalize_stepfun_chat_request,
+        parse_claude_response_text, parse_gemini_response_text, parse_model_price_catalog_response,
         parse_model_price_probe_response, parse_rate_limit_retry_delay,
-        price_probe_candidate_models, provider_requires_reasoning_content_omission,
-        request_contains_reasoning_content, resolve_effective_model_prices,
-        should_fallback_to_non_streaming, should_refresh_http_client_after_reqwest_error,
-        should_retry_without_reasoning_content, strip_reasoning_content_from_request, with_cost,
+        price_probe_candidate_models, provider_protocol_from_config_type,
+        provider_requires_reasoning_content_omission, request_contains_reasoning_content,
+        resolve_effective_model_prices, should_fallback_to_non_streaming,
+        should_refresh_http_client_after_reqwest_error, should_retry_without_reasoning_content,
+        strip_reasoning_content_from_request, with_cost,
     };
     use crate::{error::AppError, tls::ensure_rustls_crypto_provider};
 
@@ -3183,6 +4014,7 @@ mod tests {
         ensure_rustls_crypto_provider();
         AiClient {
             client: RwLock::new(Client::builder().build().expect("test client")),
+            provider: AiProviderProtocol::OpenAiCompatible,
             base_url: "https://example.com/chat/completions".to_string(),
             token: "token".to_string(),
             model: "unknown-model".to_string(),
@@ -3196,6 +4028,114 @@ mod tests {
             output_price_per_million: 0.0,
             runtime_model_prices: RwLock::new(None),
         }
+    }
+
+    #[test]
+    fn resolves_provider_protocol_and_provider_urls() {
+        assert_eq!(
+            provider_protocol_from_config_type("openai"),
+            AiProviderProtocol::OpenAiCompatible
+        );
+        assert_eq!(
+            provider_protocol_from_config_type("anthropic"),
+            AiProviderProtocol::Claude
+        );
+        assert_eq!(
+            provider_protocol_from_config_type("google"),
+            AiProviderProtocol::Gemini
+        );
+        assert_eq!(
+            build_provider_chat_url(
+                "https://api.anthropic.com/v1",
+                AiProviderProtocol::Claude,
+                "claude-sonnet"
+            ),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            build_provider_chat_url(
+                "https://generativelanguage.googleapis.com/v1beta",
+                AiProviderProtocol::Gemini,
+                "gemini-2.0-flash"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        );
+    }
+
+    #[test]
+    fn claude_request_body_converts_tool_choice_and_tool_calls() {
+        let request = ChatCompletionRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![
+                ApiMessage {
+                    role: "system".to_string(),
+                    content: Some("system prompt".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                ApiMessage {
+                    role: "assistant".to_string(),
+                    content: Some("I will call a tool".to_string()),
+                    reasoning_content: None,
+                    tool_calls: Some(vec![ApiToolCall {
+                        id: "call_1".to_string(),
+                        r#type: "function".to_string(),
+                        function: ApiToolFunction {
+                            name: "run_shell_command".to_string(),
+                            arguments: "{\"command\":\"pwd\"}".to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+            ],
+            temperature: 0.2,
+            tools: Some(vec![super::shell_tool_definition()]),
+            tool_choice: Some(json!("required")),
+            stream: None,
+        };
+        let payload = build_claude_request_body(&request);
+        assert_eq!(
+            payload["tool_choice"]["type"].as_str(),
+            Some("any"),
+            "required should map to claude any mode"
+        );
+        assert_eq!(
+            payload["messages"][0]["content"][1]["type"].as_str(),
+            Some("tool_use")
+        );
+    }
+
+    #[test]
+    fn parses_claude_and_gemini_function_calls_into_tool_calls() {
+        let claude = parse_claude_response_text(
+            r#"{"content":[{"type":"text","text":"ok"},{"type":"tool_use","id":"toolu_1","name":"run_shell_command","input":{"command":"ls"}}],"usage":{"input_tokens":12,"output_tokens":34}}"#,
+        )
+        .expect("claude parse");
+        assert_eq!(claude.message.tool_calls.len(), 1);
+        assert_eq!(claude.message.tool_calls[0].id, "toolu_1");
+        assert_eq!(claude.usage.total_tokens, 46);
+
+        let gemini = parse_gemini_response_text(
+            r#"{"candidates":[{"content":{"parts":[{"text":"ok"},{"functionCall":{"name":"run_shell_command","args":{"command":"ls"}}}]}}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":7,"totalTokenCount":12}}"#,
+        )
+        .expect("gemini parse");
+        assert_eq!(gemini.message.tool_calls.len(), 1);
+        assert_eq!(gemini.message.tool_calls[0].id, "gemini_call_2");
+        assert_eq!(gemini.usage.total_tokens, 12);
+    }
+
+    #[test]
+    fn gemini_empty_candidates_reports_block_reason() {
+        let result = parse_gemini_response_text(
+            r#"{"promptFeedback":{"blockReason":"SAFETY","safetyRatings":[{"category":"HARM_CATEGORY_HATE_SPEECH","probability":"HIGH"}]}}"#,
+        );
+        assert!(result.is_err());
+        let Err(AppError::Ai(message)) = result else {
+            panic!("unexpected error variant");
+        };
+        assert!(message.contains("gemini blocked response"));
+        assert!(message.contains("SAFETY"));
     }
 
     #[test]
@@ -3592,12 +4532,28 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_reasoner_prefers_non_streaming_tool_rounds() {
+        assert!(model_prefers_non_streaming_tool_rounds("deepseek-reasoner"));
+        assert!(model_prefers_non_streaming_tool_rounds("deepseek-r1"));
+        assert!(!model_prefers_non_streaming_tool_rounds("deepseek-chat"));
+    }
+
+    #[test]
     fn detects_transient_ai_errors() {
         assert!(super::is_transient_ai_error(&AppError::Ai(
             "AI request failed: kind=timeout, error=operation timed out".to_string()
         )));
         assert!(super::is_transient_ai_error(&AppError::Ai(
             "AI HTTP status=503 Service Unavailable".to_string()
+        )));
+        assert!(super::is_transient_ai_error(&AppError::Ai(
+            "failed to read AI response body: error decoding response body".to_string()
+        )));
+        assert!(super::is_transient_ai_error(&AppError::Ai(
+            "AI returned empty content".to_string()
+        )));
+        assert!(super::is_transient_ai_error(&AppError::Ai(
+            "gemini blocked response (reason=SAFETY)".to_string()
         )));
         assert!(!super::is_transient_ai_error(&AppError::Ai(
             "AI HTTP status=400 Bad Request".to_string()

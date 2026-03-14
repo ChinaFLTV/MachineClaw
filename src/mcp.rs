@@ -8,9 +8,9 @@ use std::{
 };
 
 use reqwest::{
+    Url,
     blocking::{Client, Response},
     header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
-    Url,
 };
 use serde_json::{Map, Value, json};
 
@@ -630,10 +630,10 @@ impl LegacySseMcpClient {
                 }
                 match read_sse_frame(&mut reader) {
                     Ok(Some(frame)) => {
-                        if let Some(parsed) = parse_legacy_sse_event(frame) {
-                            if tx.send(Ok(parsed)).is_err() {
-                                break;
-                            }
+                        if let Some(parsed) = parse_legacy_sse_event(frame)
+                            && tx.send(Ok(parsed)).is_err()
+                        {
+                            break;
                         }
                     }
                     Ok(None) => {
@@ -696,9 +696,7 @@ impl LegacySseMcpClient {
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.reset_event_stream();
-                Err(AppError::Runtime(
-                    "MCP sse stream disconnected".to_string(),
-                ))
+                Err(AppError::Runtime("MCP sse stream disconnected".to_string()))
             }
         }
     }
@@ -1034,19 +1032,18 @@ fn sse_request(
 
     client.ensure_connected(timeout)?;
     let immediate = send_sse_post_request(client, &payload, method, timeout)?;
-    if let Some(body) = immediate {
-        if let Some(resp_id) = body.get("id")
-            && resp_id == &json!(id)
-        {
-            if let Some(err) = body.get("error") {
-                return Err(AppError::Runtime(format!(
-                    "MCP returned error for method {}: {}",
-                    method,
-                    mask_sensitive(&err.to_string())
-                )));
-            }
-            return Ok(body.get("result").cloned().unwrap_or_else(|| json!({})));
+    if let Some(body) = immediate
+        && let Some(resp_id) = body.get("id")
+        && resp_id == &json!(id)
+    {
+        if let Some(err) = body.get("error") {
+            return Err(AppError::Runtime(format!(
+                "MCP returned error for method {}: {}",
+                method,
+                mask_sensitive(&err.to_string())
+            )));
         }
+        return Ok(body.get("result").cloned().unwrap_or_else(|| json!({})));
     }
 
     let started = Instant::now();
@@ -1114,12 +1111,10 @@ fn send_sse_post_request(
     if let Some(session_id) = client.session_id.as_deref() {
         request_builder = request_builder.header("Mcp-Session-Id", session_id);
     }
-    let response = request_builder
-        .send()
-        .map_err(|err| {
-            client.reset_event_stream();
-            AppError::Runtime(format!("MCP sse post failed: {err}"))
-        })?;
+    let response = request_builder.send().map_err(|err| {
+        client.reset_event_stream();
+        AppError::Runtime(format!("MCP sse post failed: {err}"))
+    })?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response
@@ -1134,10 +1129,13 @@ fn send_sse_post_request(
         )));
     }
     update_sse_session_id(&mut client.session_id, response.headers());
-    let body = parse_mcp_http_response(response).map_err(|err| {
-        client.reset_event_stream();
-        err
-    })?;
+    let body = match parse_mcp_http_response(response) {
+        Ok(body) => body,
+        Err(err) => {
+            client.reset_event_stream();
+            return Err(err);
+        }
+    };
     if body.as_object().is_some_and(|obj| obj.is_empty()) {
         return Ok(None);
     }
@@ -1342,7 +1340,10 @@ fn parse_legacy_sse_endpoint_block(data_lines: &[String]) -> Option<String> {
     non_empty_trimmed(Some(trimmed))
 }
 
-fn resolve_sse_message_endpoint(base_endpoint: &str, raw_endpoint: &str) -> Result<String, AppError> {
+fn resolve_sse_message_endpoint(
+    base_endpoint: &str,
+    raw_endpoint: &str,
+) -> Result<String, AppError> {
     let endpoint = non_empty_trimmed(Some(raw_endpoint)).ok_or_else(|| {
         AppError::Runtime("MCP sse handshake failed: endpoint event is empty".to_string())
     })?;
@@ -1731,9 +1732,10 @@ fn normalize_tool_parameters_schema(raw: Option<&Value>) -> Value {
     // OpenAI function calling requires top-level JSON schema to be object.
     let root_is_object = match map.get("type") {
         Some(Value::String(kind)) => kind.eq_ignore_ascii_case("object"),
-        Some(Value::Array(kinds)) => kinds
-            .iter()
-            .any(|item| item.as_str().is_some_and(|kind| kind.eq_ignore_ascii_case("object"))),
+        Some(Value::Array(kinds)) => kinds.iter().any(|item| {
+            item.as_str()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("object"))
+        }),
         _ => false,
     };
     if !root_is_object || !matches!(map.get("type"), Some(Value::String(_))) {
@@ -1817,14 +1819,14 @@ fn parse_mcp_tool_arguments(raw_arguments: &str) -> Result<Value, AppError> {
     }
     let parsed = serde_json::from_str::<Value>(trimmed).map_err(|err| {
         AppError::Runtime(format!(
-            "invalid MCP tool arguments JSON: {}, raw={}",
+            "invalid MCP tool arguments JSON: {}; expected a strict JSON object with double-quoted keys/strings, raw={}",
             err,
             mask_sensitive(&trim_text_preview(trimmed, 240))
         ))
     })?;
     if !parsed.is_object() {
         return Err(AppError::Runtime(
-            "invalid MCP tool arguments JSON: expected a JSON object".to_string(),
+            "invalid MCP tool arguments JSON: expected a strict JSON object".to_string(),
         ));
     }
     Ok(parsed)
@@ -1865,19 +1867,20 @@ fn extract_tool_call_text(result: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
     use std::{
         collections::{BTreeMap, HashMap, HashSet},
         sync::mpsc,
         thread,
         time::Duration,
     };
-    use serde_json::{Value, json};
 
     use super::{
         LegacySseMcpClient, McpGlobalDefaults, McpManager, McpToolInfo, McpTransportMode,
-        ensure_unique_ai_tool_names, extract_tools, mcp_summary, non_empty_trimmed, normalize_server,
-        parse_legacy_sse_endpoint_block, parse_mcp_tool_arguments, parse_sse_jsonrpc_payload,
-        resolve_sse_message_endpoint, resolve_transport_mode, validate_mcp_config,
+        ensure_unique_ai_tool_names, extract_tools, mcp_summary, non_empty_trimmed,
+        normalize_server, parse_legacy_sse_endpoint_block, parse_mcp_tool_arguments,
+        parse_sse_jsonrpc_payload, resolve_sse_message_endpoint, resolve_transport_mode,
+        validate_mcp_config,
     };
     use crate::config::{McpConfig, McpServerConfig};
 
@@ -1898,7 +1901,7 @@ mod tests {
         let err = parse_mcp_tool_arguments("[1,2,3]").expect_err("non-object json must fail");
         assert!(
             err.to_string()
-                .contains("invalid MCP tool arguments JSON: expected a JSON object")
+                .contains("invalid MCP tool arguments JSON: expected a strict JSON object")
         );
     }
 
@@ -1967,9 +1970,10 @@ mod tests {
         let plain = parse_legacy_sse_endpoint_block(&["/messages?session=1".to_string()]);
         assert_eq!(plain.as_deref(), Some("/messages?session=1"));
 
-        let json_endpoint = parse_legacy_sse_endpoint_block(&[
-            "{\"endpoint\":\"/messages?session=2\"}".to_string(),
-        ]);
+        let json_endpoint =
+            parse_legacy_sse_endpoint_block(
+                &["{\"endpoint\":\"/messages?session=2\"}".to_string()],
+            );
         assert_eq!(json_endpoint.as_deref(), Some("/messages?session=2"));
     }
 
@@ -2014,7 +2018,10 @@ mod tests {
         let mut used_tool_names = HashSet::new();
         let mut tool_name_suffixes = HashMap::new();
         ensure_unique_ai_tool_names(&mut tools, &mut used_tool_names, &mut tool_name_suffixes);
-        let names = tools.iter().map(|tool| tool.ai_name.clone()).collect::<Vec<_>>();
+        let names = tools
+            .iter()
+            .map(|tool| tool.ai_name.clone())
+            .collect::<Vec<_>>();
         assert_eq!(
             names,
             vec![
@@ -2027,9 +2034,12 @@ mod tests {
 
     #[test]
     fn sse_recv_event_timeout_resets_stream_state() {
-        let mut client =
-            LegacySseMcpClient::new("https://example.com/sse", &BTreeMap::new(), Duration::from_secs(1))
-                .expect("client");
+        let mut client = LegacySseMcpClient::new(
+            "https://example.com/sse",
+            &BTreeMap::new(),
+            Duration::from_secs(1),
+        )
+        .expect("client");
         let (_tx, rx) = mpsc::channel();
         client.event_rx = Some(rx);
         client.message_endpoint = Some("https://example.com/messages".to_string());
@@ -2044,9 +2054,12 @@ mod tests {
 
     #[test]
     fn sse_reset_event_stream_stops_background_worker() {
-        let mut client =
-            LegacySseMcpClient::new("https://example.com/sse", &BTreeMap::new(), Duration::from_secs(1))
-                .expect("client");
+        let mut client = LegacySseMcpClient::new(
+            "https://example.com/sse",
+            &BTreeMap::new(),
+            Duration::from_secs(1),
+        )
+        .expect("client");
         let (_event_tx, event_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
@@ -2067,11 +2080,9 @@ mod tests {
 
     #[test]
     fn resolve_sse_message_endpoint_supports_relative_paths() {
-        let resolved = resolve_sse_message_endpoint(
-            "https://example.com/mcp/sse",
-            "/messages?session=abc",
-        )
-        .expect("relative endpoint should resolve");
+        let resolved =
+            resolve_sse_message_endpoint("https://example.com/mcp/sse", "/messages?session=abc")
+                .expect("relative endpoint should resolve");
         assert_eq!(resolved, "https://example.com/messages?session=abc");
     }
 
@@ -2241,5 +2252,4 @@ mod tests {
             Some("value".to_string())
         );
     }
-
 }

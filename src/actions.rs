@@ -14,7 +14,6 @@ use std::{
 };
 
 use chrono::{Local, TimeZone};
-use colored::Colorize;
 use dialoguer::{MultiSelect, theme::ColorfulTheme};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -138,6 +137,8 @@ static HISTORY_HTML_HR_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?is)<hr[^>]*>").expect("valid history html hr regex"));
 static HISTORY_HTML_TAG_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?is)</?[a-z][^>]*>").expect("valid history html tag regex"));
+static CHAT_ASYNC_NOTICE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static CHAT_ASYNC_NOTICE_QUEUE: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 pub fn run_prepare(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppError> {
     let started = Instant::now();
@@ -296,6 +297,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(AppError::Command(i18n::chat_requires_interactive_terminal()));
     }
+    reset_queued_async_chat_notices();
 
     let base_system_prompt = render::load_prompt_template(services.assets_dir, "chat_system.md")?;
     let system_prompt = build_chat_system_prompt(services, &base_system_prompt);
@@ -320,13 +322,14 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
     );
 
     loop {
+        flush_queued_async_chat_notices();
         apply_async_mcp_connect_result(
             services,
             &mut async_mcp_connect_rx,
             chat_input_waiting.as_ref(),
         );
         chat_input_waiting.store(true, Ordering::SeqCst);
-        print!(
+        println!(
             "{}",
             render::render_chat_user_prompt(
                 i18n::chat_prompt_user(),
@@ -339,12 +342,14 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
 
         let message_raw = if let Some(next_message) = pending_message.take() {
             chat_input_waiting.store(false, Ordering::SeqCst);
+            flush_queued_async_chat_notices();
             println!("{next_message}");
             next_message
         } else {
             let wait_started = Instant::now();
             let read_result = read_chat_user_input_line();
             chat_input_waiting.store(false, Ordering::SeqCst);
+            flush_queued_async_chat_notices();
             note_interactive_input_wait(wait_started);
             match read_result? {
                 ChatInputReadOutcome::Eof => break,
@@ -841,6 +846,7 @@ pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppE
             pending_message = Some(selected);
         }
     }
+    flush_queued_async_chat_notices();
 
     let final_message_count = services.session.message_count();
     let key_metrics = format!(
@@ -949,6 +955,10 @@ struct ShellToolArguments {
     mode: Option<String>,
 }
 
+fn trim_tool_argument_preview(arguments: &str) -> String {
+    mask_sensitive(&trim_text(arguments.trim(), 400))
+}
+
 fn execute_tool_call(
     services: &mut ActionServices<'_>,
     group_id: &str,
@@ -961,13 +971,23 @@ fn execute_tool_call(
         if services.mcp.has_ai_tool(&tool_call.name) {
             return execute_mcp_tool_call(services, group_id, tool_call, stats);
         }
+        stats.tool_calls += 1;
+        stats.command_failures += 1;
         let error = json!({
             "ok": false,
-            "error": format!("unsupported tool function: {}", tool_call.name)
+            "error": format!("unsupported tool function: {}", tool_call.name),
+            "tool": tool_call.name,
+            "raw_arguments": trim_tool_argument_preview(&tool_call.arguments)
         });
         let text = error.to_string();
         services.session.add_tool_message(
-            format!("tool_call_error={text}"),
+            format!(
+                "tool_call_id={} function={} args={} result={}",
+                tool_call.id,
+                tool_call.name,
+                trim_tool_argument_preview(&tool_call.arguments),
+                trim_text(&text, 2400)
+            ),
             Some(group_id.to_string()),
         );
         let _ = services.session.persist();
@@ -977,13 +997,28 @@ fn execute_tool_call(
     let parsed: ShellToolArguments = match serde_json::from_str(&tool_call.arguments) {
         Ok(value) => value,
         Err(err) => {
+            stats.tool_calls += 1;
+            stats.command_failures += 1;
             let error = json!({
                 "ok": false,
-                "error": format!("invalid function arguments: {err}")
+                "error": format!("invalid function arguments: {err}"),
+                "tool": tool_call.name,
+                "raw_arguments": trim_tool_argument_preview(&tool_call.arguments),
+                "expected_schema": {
+                    "command": "<string>",
+                    "label": "<optional string>",
+                    "mode": "read|write"
+                }
             });
             let text = error.to_string();
             services.session.add_tool_message(
-                format!("tool_call_error={text}"),
+                format!(
+                    "tool_call_id={} function={} args={} result={}",
+                    tool_call.id,
+                    tool_call.name,
+                    trim_tool_argument_preview(&tool_call.arguments),
+                    trim_text(&text, 2400)
+                ),
                 Some(group_id.to_string()),
             );
             let _ = services.session.persist();
@@ -993,13 +1028,23 @@ fn execute_tool_call(
 
     let command = parsed.command.trim().to_string();
     if command.is_empty() {
+        stats.tool_calls += 1;
+        stats.command_failures += 1;
         let error = json!({
             "ok": false,
-            "error": "command is empty"
+            "error": "command is empty",
+            "tool": tool_call.name,
+            "raw_arguments": trim_tool_argument_preview(&tool_call.arguments)
         });
         let text = error.to_string();
         services.session.add_tool_message(
-            format!("tool_call_error={text}"),
+            format!(
+                "tool_call_id={} function={} args={} result={}",
+                tool_call.id,
+                tool_call.name,
+                trim_tool_argument_preview(&tool_call.arguments),
+                trim_text(&text, 2400)
+            ),
             Some(group_id.to_string()),
         );
         let _ = services.session.persist();
@@ -1568,7 +1613,7 @@ fn is_cancel_shortcut_csi_sequence(sequence: &[u8]) -> bool {
 fn read_chat_user_input_line() -> Result<ChatInputReadOutcome, AppError> {
     #[cfg(unix)]
     {
-        return read_chat_user_input_line_unix();
+        read_chat_user_input_line_unix()
     }
     #[cfg(not(unix))]
     {
@@ -2084,21 +2129,26 @@ fn format_fixed_table_with_options(
     rows: &[Vec<String>],
     max_total_width: Option<usize>,
     min_widths: Option<&[usize]>,
-    colorful: bool,
+    _colorful: bool,
 ) -> Vec<String> {
     if headers.is_empty() {
         return Vec::new();
     }
-    let mut widths = headers
+    let sanitized_headers = headers
+        .iter()
+        .map(|value| sanitize_markdown_table_cell(value))
+        .collect::<Vec<_>>();
+    let mut widths = sanitized_headers
         .iter()
         .map(|value| display_width(value))
         .collect::<Vec<_>>();
     for row in rows {
         for (idx, value) in row.iter().enumerate() {
+            let sanitized = sanitize_markdown_table_cell(value);
             if idx >= widths.len() {
-                widths.push(display_width(value));
+                widths.push(display_width(&sanitized));
             } else {
-                widths[idx] = widths[idx].max(display_width(value));
+                widths[idx] = widths[idx].max(display_width(&sanitized));
             }
         }
     }
@@ -2106,26 +2156,12 @@ fn format_fixed_table_with_options(
         let minimums = min_widths.unwrap_or(&[]);
         shrink_table_width_to_limit(&mut widths, limit, minimums);
     }
-    let truncated_headers = headers
+    let truncated_headers = sanitized_headers
         .iter()
         .enumerate()
         .map(|(idx, value)| truncate_display_width(value, widths[idx]))
         .collect::<Vec<_>>();
-    let border_raw = format!(
-        "+{}+",
-        widths
-            .iter()
-            .map(|width| "-".repeat(width + 2))
-            .collect::<Vec<_>>()
-            .join("+")
-    );
-    let border = if colorful {
-        border_raw.bright_black().to_string()
-    } else {
-        border_raw
-    };
     let mut lines = Vec::<String>::new();
-    lines.push(border.clone());
     let header_line = format!(
         "| {} |",
         truncated_headers
@@ -2135,23 +2171,36 @@ fn format_fixed_table_with_options(
             .collect::<Vec<_>>()
             .join(" | ")
     );
-    lines.push(if colorful {
-        header_line.bold().bright_cyan().to_string()
-    } else {
-        header_line
-    });
-    lines.push(border.clone());
+    lines.push(header_line);
+    let separator_line = format!(
+        "| {} |",
+        widths
+            .iter()
+            .map(|width| "-".repeat((*width).max(3)))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    lines.push(separator_line);
     for row in rows {
         let mut padded = Vec::<String>::new();
         for (idx, width) in widths.iter().enumerate() {
             let value = row.get(idx).cloned().unwrap_or_default();
-            let truncated = truncate_display_width(&value, *width);
+            let sanitized = sanitize_markdown_table_cell(&value);
+            let truncated = truncate_display_width(&sanitized, *width);
             padded.push(pad_cell(&truncated, *width));
         }
         lines.push(format!("| {} |", padded.join(" | ")));
     }
-    lines.push(border);
     lines
+}
+
+fn sanitize_markdown_table_cell(text: &str) -> String {
+    let normalized = text.replace('\r', "").replace('\n', "<br>");
+    let escaped = normalized.replace('|', "\\|");
+    if escaped.trim().is_empty() {
+        return "-".to_string();
+    }
+    escaped
 }
 
 fn current_terminal_columns() -> usize {
@@ -2258,13 +2307,13 @@ fn format_chat_skills_markdown(
             let detail = details.get(name);
             vec![
                 format!("{}", idx + 1),
-                name.replace('|', "\\|"),
+                name.to_string(),
                 availability_badge(enabled).to_string(),
                 detail
-                    .map(|item| item.path.replace('|', "\\|"))
+                    .map(|item| item.path.to_string())
                     .unwrap_or_else(|| "-".to_string()),
                 detail
-                    .map(|item| item.summary.replace('|', "\\|"))
+                    .map(|item| item.summary.to_string())
                     .unwrap_or_else(|| "-".to_string()),
                 detail
                     .map(|item| format_human_bytes(item.size_bytes))
@@ -2316,9 +2365,9 @@ fn format_chat_mcps_markdown(enabled: bool, mcp: &McpManager, colorful: bool) ->
             .iter()
             .map(|item| {
                 vec![
-                    item.name.replace('|', "\\|"),
-                    item.transport.replace('|', "\\|"),
-                    item.target.replace('|', "\\|"),
+                    item.name.to_string(),
+                    item.transport.to_string(),
+                    item.target.to_string(),
                     i18n::human_count_u128(item.args_count as u128),
                     i18n::human_count_u128(item.timeout_seconds as u128),
                     i18n::human_count_u128(item.tool_count as u128),
@@ -2327,7 +2376,7 @@ fn format_chat_mcps_markdown(enabled: bool, mcp: &McpManager, colorful: bool) ->
                         .as_deref()
                         .or(item.error.as_deref())
                         .unwrap_or("-")
-                        .replace('|', "\\|"),
+                        .to_string(),
                 ]
             })
             .collect::<Vec<_>>();
@@ -2357,10 +2406,10 @@ fn format_chat_mcps_markdown(enabled: bool, mcp: &McpManager, colorful: bool) ->
             .iter()
             .map(|item| {
                 vec![
-                    item.server_name.replace('|', "\\|"),
-                    item.remote_name.replace('|', "\\|"),
-                    item.ai_name.replace('|', "\\|"),
-                    trim_text(&item.description, 64).replace('|', "\\|"),
+                    item.server_name.to_string(),
+                    item.remote_name.to_string(),
+                    item.ai_name.to_string(),
+                    trim_text(&item.description, 64),
                     availability_badge(item.available).to_string(),
                 ]
             })
@@ -2988,11 +3037,49 @@ fn format_model_price_check_message(result: ModelPriceCheckResult) -> String {
 }
 
 fn print_async_chat_notice(tag: &str, message: &str, colorful: bool, input_waiting: &AtomicBool) {
-    let restore_prompt = io::stdout().is_terminal() && input_waiting.load(Ordering::SeqCst);
-    print!(
-        "{}",
-        render_async_chat_notice_output(tag, message, colorful, restore_prompt)
-    );
+    let Ok(_guard) = CHAT_ASYNC_NOTICE_LOCK.lock() else {
+        return;
+    };
+    let waiting_for_input = io::stdout().is_terminal() && input_waiting.load(Ordering::SeqCst);
+    let rendered = render_async_chat_notice_output(tag, message, colorful, false);
+    if waiting_for_input {
+        if let Ok(mut queue) = CHAT_ASYNC_NOTICE_QUEUE.lock() {
+            queue.push(rendered);
+        }
+        return;
+    }
+    flush_queued_async_chat_notices_locked();
+    print!("{rendered}");
+    let _ = io::stdout().flush();
+}
+
+fn flush_queued_async_chat_notices() {
+    let Ok(_guard) = CHAT_ASYNC_NOTICE_LOCK.lock() else {
+        return;
+    };
+    flush_queued_async_chat_notices_locked();
+}
+
+fn reset_queued_async_chat_notices() {
+    let Ok(_guard) = CHAT_ASYNC_NOTICE_LOCK.lock() else {
+        return;
+    };
+    if let Ok(mut queue) = CHAT_ASYNC_NOTICE_QUEUE.lock() {
+        queue.clear();
+    }
+}
+
+fn flush_queued_async_chat_notices_locked() {
+    let queued = match CHAT_ASYNC_NOTICE_QUEUE.lock() {
+        Ok(mut queue) => std::mem::take(&mut *queue),
+        Err(_) => Vec::new(),
+    };
+    if queued.is_empty() {
+        return;
+    }
+    for line in queued {
+        print!("{line}");
+    }
     let _ = io::stdout().flush();
 }
 
@@ -3003,14 +3090,12 @@ fn render_async_chat_notice_output(
     restore_prompt: bool,
 ) -> String {
     let rendered = render::render_chat_custom_tag_event(tag, message, colorful);
+    let line_clear_prefix = format!("\r{: <160}\r", "");
     if !restore_prompt {
-        return format!("{rendered}\n");
+        return format!("{line_clear_prefix}{rendered}\n");
     }
-    format!(
-        "\r{: <160}\r{rendered}\n{}",
-        "",
-        render::render_chat_user_prompt(i18n::chat_prompt_user(), colorful)
-    )
+    let prompt = render::render_chat_user_prompt(i18n::chat_prompt_user(), colorful);
+    format!("{line_clear_prefix}{rendered}\n{prompt}\n")
 }
 
 fn render_chat_window_header(services: &ActionServices<'_>, after_clear: bool) {
@@ -3122,6 +3207,7 @@ fn build_chat_system_prompt(services: &ActionServices<'_>, base: &str) -> String
     let skills_enabled = services.cfg.skills.enabled;
     let skills_dir = services.cfg.skills.dir.trim();
     prompt.push_str("\n\n[Capability Selection]\n- Shell execution, Skills, and MCP are peer capabilities. Choose the smallest sufficient one; do not systematically bias toward any single category.\n- Prefer Shell for deterministic local inspection, code edits, build/test, log/file/process analysis, and other machine-local operations.\n- Prefer Skills when a detected skill clearly matches the task and provides a reusable workflow or domain guardrails.\n- Prefer MCP when the task needs an integrated external service or dedicated remote capability that Shell/Skill cannot provide cleanly.\n- For MCP HTTP troubleshooting, check endpoint/auth/header config first; `/mcp` is preferred over legacy `/sse` paths.\n- Avoid both extremes: do not stay text-only when evidence is missing, and do not chain tools endlessly when the evidence is already sufficient.\n- After each tool result, reassess whether you should answer in text now or call another tool.\n- If the model returns user-visible text in any round, preserve it and surface it; do not drop, overwrite, or silently ignore earlier assistant text.\n");
+    prompt.push_str("\n[Tool Argument Rules]\n- Every tool call argument MUST be a strict JSON object. Do not emit pseudo-JSON, markdown, comments, or partially written strings.\n- Use double quotes for all JSON keys and string values.\n- For `run_shell_command`, always send at least `{\\\"command\\\":\\\"...\\\"}` and optionally `label` plus `mode=read|write`.\n- If a previous tool result says arguments are invalid, fix the JSON structure directly instead of retrying with another malformed variant.\n");
     prompt.push_str("\n[Skill Workflow]\n- Before complex tasks, scan available skills first.\n- If a matching skill exists, follow its SKILL.md workflow.\n- In responses, explicitly mention which skill is used.\n");
     prompt.push_str(&format!(
         "\n[Runtime Capability Context]\n- shell_tool=run_shell_command\n- skills_enabled={skills_enabled}\n- skills_dir={skills_dir}\n- detected_skills={skills_list}\n- detected_mcp_tools={mcp_tools_list}\n"
@@ -4288,13 +4374,14 @@ mod tests {
     fn async_chat_notice_output_restores_prompt_when_requested() {
         let output = render_async_chat_notice_output("[tag]", "done", false, true);
         assert!(output.contains("[tag] done\n"));
-        assert!(output.ends_with(crate::i18n::chat_prompt_user()));
+        assert!(output.ends_with(&format!("{}\n", crate::i18n::chat_prompt_user().trim_end())));
     }
 
     #[test]
     fn async_chat_notice_output_does_not_append_prompt_by_default() {
         let output = render_async_chat_notice_output("[tag]", "done", false, false);
-        assert_eq!(output, "[tag] done\n");
+        assert!(output.ends_with("[tag] done\n"));
+        assert!(output.starts_with("\r"));
     }
 
     #[test]
@@ -4360,11 +4447,31 @@ mod tests {
     }
 
     #[test]
+    fn skills_output_uses_plain_markdown_table_in_color_mode() {
+        colored::control::set_override(true);
+        let output =
+            format_chat_skills_markdown(true, Path::new("/tmp"), &["doc".to_string()], true);
+        colored::control::unset_override();
+        assert!(output.contains("| ---"));
+        assert!(!output.contains('\u{1b}'));
+    }
+
+    #[test]
     fn mcps_output_includes_target_and_summary_columns() {
         let mcp = crate::mcp::McpManager::pending("enabled, servers=1".to_string());
         let output = format_chat_mcps_markdown(true, &mcp, false);
         assert!(output.contains("MCP Services"));
         assert!(output.contains("MCP 摘要"));
+    }
+
+    #[test]
+    fn mcps_output_uses_plain_markdown_table_in_color_mode() {
+        let mcp = crate::mcp::McpManager::pending("enabled, servers=1".to_string());
+        colored::control::set_override(true);
+        let output = format_chat_mcps_markdown(true, &mcp, true);
+        colored::control::unset_override();
+        assert!(output.contains("MCP Services"));
+        assert!(!output.contains('\u{1b}'));
     }
 
     #[test]
@@ -4384,13 +4491,12 @@ mod tests {
             active: true,
         }];
         let output = format_chat_session_list_markdown(&sessions, false);
-        assert!(output.contains("+"));
         assert!(output.contains("|"));
-        assert!(!output.contains("|---|---|"));
+        assert!(output.contains("| ---"));
     }
 
     #[test]
-    fn session_list_output_supports_colorful_table_style() {
+    fn session_list_output_uses_plain_markdown_table_in_color_mode() {
         let sessions = vec![crate::context::SessionOverview {
             session_id: "1234567890abcdef".to_string(),
             session_name: "dev-chat".to_string(),
@@ -4408,6 +4514,7 @@ mod tests {
         colored::control::set_override(true);
         let output = format_chat_session_list_markdown(&sessions, true);
         colored::control::unset_override();
-        assert!(output.contains('\u{1b}'));
+        assert!(output.contains("| ---"));
+        assert!(!output.contains('\u{1b}'));
     }
 }

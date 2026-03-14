@@ -22,6 +22,7 @@ const DEFAULT_AI_MAX_RETRIES: u32 = 2;
 const DEFAULT_AI_BACKOFF_MILLIS: u64 = 1500;
 const DEFAULT_AI_CONNECTIVITY_CHECK: bool = true;
 const DEFAULT_AI_DEBUG: bool = false;
+const DEFAULT_AI_TYPE: &str = "openai";
 const DEFAULT_AI_INPUT_PRICE_PER_MILLION: f64 = 0.0;
 const DEFAULT_AI_OUTPUT_PRICE_PER_MILLION: f64 = 0.0;
 const DEFAULT_CHAT_SHOW_TOOL: bool = false;
@@ -91,6 +92,8 @@ impl Default for AppSection {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AiConfig {
+    #[serde(rename = "type", default = "default_ai_type")]
+    pub r#type: String,
     #[serde(rename = "base-url")]
     pub base_url: String,
     pub token: String,
@@ -511,6 +514,7 @@ pub fn config_template_example() -> &'static str {
 env-mode = "prod" # optional: prod, test, dev
 
 [ai]
+type = "openai" # optional, default openai; accepted: openai, claude(anthropic), gemini(google), deepseek, qwen, ollama, openrouter, zhipu, moonshot, doubao, stepfun, siliconflow, groq, together, mistral, azure-openai
 base-url = "https://api.deepseek.com/v1" # required
 token = "sk-xxxx" # required
 model = "deepseek-chat" # required
@@ -627,6 +631,13 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
     }
     if cfg.ai.model.trim().is_empty() {
         return Err(AppError::Config("ai.model is required".to_string()));
+    }
+    let ai_type = normalize_ai_provider_type(cfg.ai.r#type.as_str());
+    if !matches!(ai_type, "openai" | "claude" | "gemini") {
+        return Err(AppError::Config(
+            "ai.type must be one of: openai, claude, gemini, anthropic, google, deepseek, qwen, ollama, openrouter, zhipu, moonshot, doubao, stepfun, siliconflow, groq, together, mistral, azure-openai"
+                .to_string(),
+        ));
     }
     if cfg.cmd.command_timeout_seconds == 0 {
         return Err(AppError::Config(
@@ -936,6 +947,10 @@ fn default_ai_debug() -> bool {
     DEFAULT_AI_DEBUG
 }
 
+fn default_ai_type() -> String {
+    DEFAULT_AI_TYPE.to_string()
+}
+
 fn default_ai_input_price_per_million() -> f64 {
     DEFAULT_AI_INPUT_PRICE_PER_MILLION
 }
@@ -1036,6 +1051,17 @@ fn default_app_env_mode() -> String {
     DEFAULT_APP_ENV_MODE.to_string()
 }
 
+pub(crate) fn normalize_ai_provider_type(raw: &str) -> &str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "openai" | "deepseek" | "qwen" | "ollama" | "openrouter" | "zhipu" | "moonshot"
+        | "doubao" | "stepfun" | "siliconflow" | "groq" | "together" | "mistral"
+        | "azure-openai" | "azure" => "openai",
+        "claude" | "anthropic" => "claude",
+        "gemini" | "google" => "gemini",
+        _ => "__invalid__",
+    }
+}
+
 pub(crate) fn normalize_chat_model_price_check_mode(raw: &str) -> &str {
     match raw.trim().to_ascii_lowercase().as_str() {
         "async" => "async",
@@ -1066,9 +1092,20 @@ fn has_file_extension(file_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        McpServerConfig, normalize_chat_model_price_check_mode, normalize_mcp_availability_check_mode,
-        resolve_config_path,
+        McpServerConfig, normalize_ai_provider_type, normalize_chat_model_price_check_mode,
+        normalize_mcp_availability_check_mode, resolve_config_path,
     };
+
+    #[test]
+    fn normalize_ai_provider_type_supports_aliases() {
+        assert_eq!(normalize_ai_provider_type("openai"), "openai");
+        assert_eq!(normalize_ai_provider_type("deepseek"), "openai");
+        assert_eq!(normalize_ai_provider_type("claude"), "claude");
+        assert_eq!(normalize_ai_provider_type("anthropic"), "claude");
+        assert_eq!(normalize_ai_provider_type("gemini"), "gemini");
+        assert_eq!(normalize_ai_provider_type("google"), "gemini");
+        assert_eq!(normalize_ai_provider_type("invalid"), "__invalid__");
+    }
 
     #[test]
     fn normalize_model_price_check_mode_accepts_sync_async_and_rsync_alias() {
@@ -1113,6 +1150,9 @@ url = "https://example.com/sse"
         )
         .expect("toml should parse");
         assert_eq!(server.transport.as_deref(), Some("sse"));
-        assert_eq!(server.server_url.as_deref(), Some("https://example.com/sse"));
+        assert_eq!(
+            server.server_url.as_deref(),
+            Some("https://example.com/sse")
+        );
     }
 }
