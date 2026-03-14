@@ -78,7 +78,7 @@ fn run_test_config(
         } else {
             let syntax_ok = analyze_toml_structure(raw, &mut report);
             if syntax_ok {
-                analyze_semantic(raw, &mut report);
+                analyze_semantic(raw, config_path, &mut report);
             }
         }
     }
@@ -163,7 +163,7 @@ fn analyze_toml_structure(raw: &str, report: &mut ConfigTestReport) -> bool {
     }
 }
 
-fn analyze_semantic(raw: &str, report: &mut ConfigTestReport) {
+fn analyze_semantic(raw: &str, config_path: &Path, report: &mut ConfigTestReport) {
     let parsed = match toml::from_str::<AppConfig>(raw) {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -176,7 +176,7 @@ fn analyze_semantic(raw: &str, report: &mut ConfigTestReport) {
     if let Err(err) = config::validate_config(&parsed) {
         report.semantic_errors.push(localized_app_error(err));
     }
-    if let Err(err) = validate_mcp_config(&parsed.mcp) {
+    if let Err(err) = validate_mcp_config(&parsed.mcp, config_path) {
         report.semantic_errors.push(localized_app_error(err));
     }
 }
@@ -209,10 +209,7 @@ fn collect_leaves(
 }
 
 fn is_allowed_key(key: &str) -> bool {
-    if is_known_config_key(key) {
-        return true;
-    }
-    key.starts_with("mcp.env.") || key.starts_with("mcp.headers.")
+    is_known_config_key(key)
 }
 
 fn item_matches_literal(item: &Item, literal: &str) -> bool {

@@ -36,7 +36,7 @@ use crate::{
     error::{AppError, ExitCode},
     i18n, logging,
     mask::mask_sensitive,
-    mcp::McpManager,
+    mcp::{self, McpManager},
     platform::OsType,
     render::{self, ActionRenderData},
     shell::{CommandMode, CommandResult, CommandSpec, ShellExecutor, note_interactive_input_wait},
@@ -44,6 +44,7 @@ use crate::{
 
 pub struct ActionServices<'a> {
     pub cfg: &'a AppConfig,
+    pub config_path: &'a Path,
     pub assets_dir: &'a Path,
     pub shell: &'a ShellExecutor,
     pub ai: &'a AiClient,
@@ -293,6 +294,13 @@ pub fn run_inspect(
 }
 
 pub fn run_chat(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppError> {
+    if std::env::var_os("MACHINECLAW_CHAT_UI_LEGACY").is_some() {
+        return run_chat_legacy(services);
+    }
+    crate::tui::run_chat_tui(services)
+}
+
+fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, AppError> {
     let started = Instant::now();
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(AppError::Command(i18n::chat_requires_interactive_terminal()));
@@ -994,7 +1002,10 @@ fn execute_tool_call(
         return text;
     }
 
-    let parsed: ShellToolArguments = match serde_json::from_str(&tool_call.arguments) {
+    let parsed: ShellToolArguments = match mcp::parse_json_object_arguments(&tool_call.arguments)
+        .and_then(|value| {
+            serde_json::from_value::<ShellToolArguments>(value).map_err(|err| err.to_string())
+        }) {
         Ok(value) => value,
         Err(err) => {
             stats.tool_calls += 1;
@@ -2923,10 +2934,11 @@ fn maybe_prepare_chat_mcp_availability(
         chat_input_waiting.as_ref(),
     );
     let mcp_cfg = services.cfg.mcp.clone();
+    let mcp_config_path = services.config_path.to_path_buf();
     let (sender, receiver) = mpsc::channel::<Result<McpManager, String>>();
     let chat_input_waiting_cloned = chat_input_waiting.clone();
     thread::spawn(move || {
-        let result = match McpManager::connect(&mcp_cfg) {
+        let result = match McpManager::connect(&mcp_cfg, &mcp_config_path) {
             Ok(manager) => {
                 let summary = manager.summary();
                 let tool_count = manager.external_tool_definitions().len();
@@ -3215,7 +3227,7 @@ fn build_chat_system_prompt(services: &ActionServices<'_>, base: &str) -> String
     prompt
 }
 
-fn append_env_mode_prompt(base: &str, env_mode_raw: &str) -> String {
+pub(crate) fn append_env_mode_prompt(base: &str, env_mode_raw: &str) -> String {
     let env_mode = env_mode_raw.trim().to_ascii_lowercase();
     let policy = match env_mode.as_str() {
         "dev" => {
@@ -3750,24 +3762,17 @@ fn write_string_atomically_local(path: &Path, content: &str) -> Result<(), AppEr
             tmp_path.display()
         ))
     })?;
-    if let Err(err) = fs::rename(&tmp_path, path) {
-        if path.exists() {
-            let _ = fs::remove_file(path);
-            fs::rename(&tmp_path, path).map_err(|rename_err| {
-                AppError::Runtime(format!(
-                    "failed to replace session file {} after rename error {}: {}",
-                    path.display(),
-                    err,
-                    rename_err
-                ))
-            })?;
-        } else {
+    if let Err(rename_err) = fs::rename(&tmp_path, path) {
+        if let Err(copy_err) = fs::copy(&tmp_path, path) {
             let _ = fs::remove_file(&tmp_path);
             return Err(AppError::Runtime(format!(
-                "failed to move temporary file into place {}: {err}",
-                path.display()
+                "failed to replace session file {} (rename: {}; copy fallback: {})",
+                path.display(),
+                rename_err,
+                copy_err
             )));
         }
+        let _ = fs::remove_file(&tmp_path);
     }
     Ok(())
 }

@@ -1,10 +1,12 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fs,
     io::{BufRead, BufReader, ErrorKind, Read, Write},
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread::{self, sleep},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::{
@@ -16,7 +18,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     ai::ExternalToolDefinition,
-    config::{McpConfig, McpServerConfig},
+    config::{McpConfig, McpServerConfig, expand_tilde},
     error::AppError,
     mask::mask_sensitive,
     tls::ensure_rustls_crypto_provider,
@@ -24,6 +26,33 @@ use crate::{
 
 const DEFAULT_MCP_TIMEOUT_SECONDS: u64 = 10;
 const MCP_STDIO_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const MCP_SERVERS_FILE_NAME: &str = "servers.json";
+const MCP_WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const MCP_WRITE_LOCK_STALE_AFTER: Duration = Duration::from_secs(120);
+const MCP_WRITE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+#[derive(Debug, Clone)]
+pub struct McpServerRecord {
+    pub name: String,
+    pub config: McpServerConfig,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+struct McpServersFile {
+    #[serde(default, rename = "mcpServers", alias = "mcp_servers")]
+    mcp_servers: BTreeMap<String, McpServerConfig>,
+}
+
+#[derive(Debug)]
+struct McpWriteLockGuard {
+    lock_path: PathBuf,
+}
+
+impl Drop for McpWriteLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
 
 #[derive(Debug, Clone)]
 struct NormalizedServerConfig {
@@ -44,28 +73,19 @@ enum McpTransportMode {
     Sse,
 }
 
-#[derive(Debug, Clone)]
-struct McpGlobalDefaults {
-    transport: Option<String>,
-    timeout_seconds: Option<u64>,
-    headers: BTreeMap<String, String>,
-    auth_type: Option<String>,
-    auth_token: Option<String>,
-}
-
-pub fn validate_mcp_config(cfg: &McpConfig) -> Result<(), AppError> {
+pub fn validate_mcp_config(cfg: &McpConfig, config_path: &Path) -> Result<(), AppError> {
     if !cfg.enabled {
         return Ok(());
     }
-    let _ = normalized_server_configs(cfg)?;
+    let _ = normalized_server_configs(cfg, config_path)?;
     Ok(())
 }
 
-pub fn mcp_summary(cfg: &McpConfig) -> String {
+pub fn mcp_summary(cfg: &McpConfig, config_path: &Path) -> String {
     if !cfg.enabled {
         return "disabled".to_string();
     }
-    let servers = match normalized_server_configs(cfg) {
+    let servers = match normalized_server_configs(cfg, config_path) {
         Ok(servers) => servers,
         Err(err) => {
             return format!(
@@ -110,6 +130,80 @@ pub fn mcp_summary(cfg: &McpConfig) -> String {
         servers.len(),
         previews.join("; ")
     )
+}
+
+pub fn load_mcp_server_records(
+    cfg: &McpConfig,
+    config_path: &Path,
+) -> Result<Vec<McpServerRecord>, AppError> {
+    let file_path = resolve_mcp_servers_file_path(cfg, config_path);
+    let map = load_mcp_server_map_from_file(file_path.as_path())?;
+    let mut names = map.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    let mut records = Vec::with_capacity(names.len());
+    for name in names {
+        if let Some(config) = map.get(&name) {
+            records.push(McpServerRecord {
+                name,
+                config: config.clone(),
+            });
+        }
+    }
+    Ok(records)
+}
+
+pub fn save_mcp_server_records(
+    cfg: &McpConfig,
+    config_path: &Path,
+    records: &[McpServerRecord],
+) -> Result<PathBuf, AppError> {
+    let mut map = BTreeMap::<String, McpServerConfig>::new();
+    for record in records {
+        let name = record.name.trim();
+        if name.is_empty() {
+            return Err(AppError::Config(
+                "MCP server name must not be empty".to_string(),
+            ));
+        }
+        if map
+            .insert(name.to_string(), record.config.clone())
+            .is_some()
+        {
+            return Err(AppError::Config(format!(
+                "duplicated MCP server name: {name}"
+            )));
+        }
+    }
+    let _ = normalized_server_configs_from_map(&map)?;
+    let file_path = resolve_mcp_servers_file_path(cfg, config_path);
+    write_mcp_server_map_to_file(file_path.as_path(), &map)?;
+    Ok(file_path)
+}
+
+pub fn resolve_mcp_servers_file_path(cfg: &McpConfig, config_path: &Path) -> PathBuf {
+    let expanded = expand_tilde(&cfg.dir);
+    let base_path = if expanded.is_absolute() {
+        expanded
+    } else {
+        let parent = config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(default_config_base_dir);
+        parent.join(expanded)
+    };
+    if base_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    {
+        base_path
+    } else {
+        base_path.join(MCP_SERVERS_FILE_NAME)
+    }
+}
+
+fn default_config_base_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 #[derive(Debug, Clone)]
@@ -223,9 +317,9 @@ impl McpManager {
         }
     }
 
-    pub fn pending_with_config(cfg: &McpConfig, summary: String) -> Self {
+    pub fn pending_with_config(cfg: &McpConfig, config_path: &Path, summary: String) -> Self {
         let mut manager = Self::pending(summary);
-        let service_statuses = normalized_server_configs(cfg)
+        let service_statuses = normalized_server_configs(cfg, config_path)
             .map(|servers| {
                 servers
                     .into_iter()
@@ -250,7 +344,7 @@ impl McpManager {
         manager
     }
 
-    pub fn connect(cfg: &McpConfig) -> Result<Self, AppError> {
+    pub fn connect(cfg: &McpConfig, config_path: &Path) -> Result<Self, AppError> {
         if !cfg.enabled {
             return Ok(Self {
                 enabled: false,
@@ -263,7 +357,7 @@ impl McpManager {
             });
         }
 
-        let server_configs = normalized_server_configs(cfg)?;
+        let server_configs = normalized_server_configs(cfg, config_path)?;
         if server_configs.is_empty() {
             return Ok(Self {
                 enabled: true,
@@ -725,61 +819,289 @@ impl Drop for LegacySseMcpClient {
     }
 }
 
-fn normalized_server_configs(cfg: &McpConfig) -> Result<Vec<NormalizedServerConfig>, AppError> {
-    let defaults = McpGlobalDefaults {
-        transport: cfg.transport.clone(),
-        timeout_seconds: cfg.timeout_seconds,
-        headers: cfg.headers.clone(),
-        auth_type: cfg.auth_type.clone(),
-        auth_token: cfg.auth_token.clone(),
-    };
-    if !cfg.servers.is_empty() {
-        let mut keys = cfg.servers.keys().cloned().collect::<Vec<_>>();
-        keys.sort();
-        let mut out = Vec::new();
-        for name in keys {
-            let Some(item) = cfg.servers.get(&name) else {
-                continue;
-            };
-            if let Some(server) = normalize_server(name, item, &defaults)? {
-                out.push(server);
+fn normalized_server_configs(
+    cfg: &McpConfig,
+    config_path: &Path,
+) -> Result<Vec<NormalizedServerConfig>, AppError> {
+    let file_path = resolve_mcp_servers_file_path(cfg, config_path);
+    let map = load_mcp_server_map_from_file(file_path.as_path())?;
+    normalized_server_configs_from_map(&map)
+}
+
+fn normalized_server_configs_from_map(
+    map: &BTreeMap<String, McpServerConfig>,
+) -> Result<Vec<NormalizedServerConfig>, AppError> {
+    let mut keys = map.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    let mut out = Vec::new();
+    for name in keys {
+        let Some(item) = map.get(&name) else {
+            continue;
+        };
+        if let Some(server) = normalize_server(name, item)? {
+            out.push(server);
+        }
+    }
+    Ok(out)
+}
+
+fn load_mcp_server_map_from_file(
+    path: &Path,
+) -> Result<BTreeMap<String, McpServerConfig>, AppError> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let raw = fs::read_to_string(path).map_err(|err| {
+        AppError::Config(format!(
+            "failed to read MCP servers file {}: {err}",
+            path.display()
+        ))
+    })?;
+    if raw.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let parsed: McpServersFile = serde_json::from_str(&raw).map_err(|err| {
+        AppError::Config(format!(
+            "failed to parse MCP servers JSON {}: {err}",
+            path.display()
+        ))
+    })?;
+    for name in parsed.mcp_servers.keys() {
+        if name.trim().is_empty() {
+            return Err(AppError::Config(format!(
+                "MCP server name must not be empty in {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(parsed.mcp_servers)
+}
+
+fn write_mcp_server_map_to_file(
+    path: &Path,
+    map: &BTreeMap<String, McpServerConfig>,
+) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            AppError::Config(format!(
+                "failed to create MCP directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let _lock = acquire_mcp_write_lock(path)?;
+    let existing = read_existing_mcp_servers_json(path)?;
+    let merged = merge_mcp_servers_json(existing, map)?;
+    let content = serde_json::to_string_pretty(&merged)
+        .map_err(|err| AppError::Config(format!("failed to serialize MCP servers JSON: {err}")))?;
+    write_mcp_servers_atomically(path, &content).map_err(|err| {
+        AppError::Config(format!(
+            "failed to write MCP servers file {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn acquire_mcp_write_lock(path: &Path) -> Result<McpWriteLockGuard, AppError> {
+    let lock_path = mcp_write_lock_path(path);
+    let start = Instant::now();
+    loop {
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(
+                    file,
+                    "pid={} ts={}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                );
+                return Ok(McpWriteLockGuard { lock_path });
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                if is_stale_mcp_lock(&lock_path) {
+                    let _ = fs::remove_file(&lock_path);
+                    continue;
+                }
+                if start.elapsed() >= MCP_WRITE_LOCK_TIMEOUT {
+                    return Err(AppError::Config(format!(
+                        "timeout waiting MCP config write lock: {}",
+                        lock_path.display()
+                    )));
+                }
+                sleep(MCP_WRITE_LOCK_POLL_INTERVAL);
+            }
+            Err(err) => {
+                return Err(AppError::Config(format!(
+                    "failed to create MCP write lock {}: {err}",
+                    lock_path.display()
+                )));
             }
         }
-        return Ok(out);
     }
+}
 
-    let has_legacy_target = non_empty_trimmed(cfg.server_url.as_deref()).is_some()
-        || non_empty_trimmed(cfg.endpoint.as_deref()).is_some()
-        || non_empty_trimmed(cfg.command.as_deref()).is_some();
-    if !has_legacy_target {
-        return Ok(Vec::new());
-    }
+fn mcp_write_lock_path(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_config_base_dir);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("servers.json");
+    parent.join(format!(".{file_name}.lock"))
+}
 
-    let legacy = McpServerConfig {
-        enabled: true,
-        transport: cfg.transport.clone(),
-        server_url: cfg.server_url.clone(),
-        endpoint: cfg.endpoint.clone(),
-        command: cfg.command.clone(),
-        args: cfg.args.clone(),
-        env: cfg.env.clone(),
-        headers: cfg.headers.clone(),
-        auth_type: cfg.auth_type.clone(),
-        auth_token: cfg.auth_token.clone(),
-        timeout_seconds: cfg.timeout_seconds,
+fn is_stale_mcp_lock(lock_path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(lock_path) else {
+        return false;
     };
-    Ok(
-        match normalize_server("root".to_string(), &legacy, &defaults)? {
-            Some(item) => vec![item],
-            None => Vec::new(),
-        },
-    )
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    let Ok(age) = SystemTime::now().duration_since(modified) else {
+        return false;
+    };
+    age >= MCP_WRITE_LOCK_STALE_AFTER
+}
+
+fn read_existing_mcp_servers_json(path: &Path) -> Result<Option<Value>, AppError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path).map_err(|err| {
+        AppError::Config(format!(
+            "failed to read existing MCP servers file {}: {err}",
+            path.display()
+        ))
+    })?;
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let value = serde_json::from_str::<Value>(&raw).map_err(|err| {
+        AppError::Config(format!(
+            "failed to parse existing MCP servers JSON {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(value))
+}
+
+fn merge_mcp_servers_json(
+    existing: Option<Value>,
+    map: &BTreeMap<String, McpServerConfig>,
+) -> Result<Value, AppError> {
+    let mut root = existing
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let existing_servers = root
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut merged_servers = Map::<String, Value>::new();
+    for (name, cfg) in map {
+        let mut merged_obj = existing_servers
+            .get(name)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for key in known_mcp_server_json_keys() {
+            merged_obj.remove(*key);
+        }
+        let known = serde_json::to_value(cfg).map_err(|err| {
+            AppError::Config(format!("failed to encode MCP server '{}': {err}", name))
+        })?;
+        let Some(known_obj) = known.as_object() else {
+            return Err(AppError::Config(format!(
+                "failed to encode MCP server '{}': expected object",
+                name
+            )));
+        };
+        for (key, value) in known_obj {
+            merged_obj.insert(key.to_string(), value.clone());
+        }
+        merged_servers.insert(name.to_string(), Value::Object(merged_obj));
+    }
+    root.insert("mcpServers".to_string(), Value::Object(merged_servers));
+    Ok(Value::Object(root))
+}
+
+fn known_mcp_server_json_keys() -> &'static [&'static str] {
+    &[
+        "enabled",
+        "transport",
+        "type",
+        "server-url",
+        "server_url",
+        "serverUrl",
+        "url",
+        "endpoint",
+        "cmd",
+        "command",
+        "args",
+        "env",
+        "headers",
+        "auth-type",
+        "auth_type",
+        "authType",
+        "auth-token",
+        "auth_token",
+        "authToken",
+        "timeout-seconds",
+        "timeout_seconds",
+        "timeoutSeconds",
+    ]
+}
+
+fn write_mcp_servers_atomically(path: &Path, content: &str) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_config_base_dir);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("servers.json");
+    let temp_path = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name,
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::write(&temp_path, content)?;
+    if let Err(rename_err) = fs::rename(&temp_path, path) {
+        if let Err(copy_err) = fs::copy(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(std::io::Error::new(
+                copy_err.kind(),
+                format!(
+                    "failed to replace MCP servers file {} (rename: {}; copy fallback: {})",
+                    path.display(),
+                    rename_err,
+                    copy_err
+                ),
+            ));
+        }
+        let _ = fs::remove_file(&temp_path);
+    }
+    Ok(())
 }
 
 fn normalize_server(
     name: String,
     server: &McpServerConfig,
-    defaults: &McpGlobalDefaults,
 ) -> Result<Option<NormalizedServerConfig>, AppError> {
     if !server.enabled {
         return Ok(None);
@@ -789,16 +1111,12 @@ fn normalize_server(
     let command = non_empty_trimmed(server.command.as_deref());
     let transport = resolve_transport_mode(
         &name,
-        server
-            .transport
-            .as_deref()
-            .or(defaults.transport.as_deref()),
+        server.transport.as_deref(),
         endpoint.is_some(),
         command.is_some(),
     )?;
     let timeout_seconds = server
         .timeout_seconds
-        .or(defaults.timeout_seconds)
         .unwrap_or(DEFAULT_MCP_TIMEOUT_SECONDS);
     if timeout_seconds == 0 {
         return Err(AppError::Config(format!(
@@ -806,20 +1124,13 @@ fn normalize_server(
             name
         )));
     }
-    let mut headers = defaults.headers.clone();
-    headers.extend(server.headers.clone());
+    let mut headers = server.headers.clone();
     if transport == McpTransportMode::Http || transport == McpTransportMode::Sse {
         apply_auth_to_headers(
             &name,
             &mut headers,
-            server
-                .auth_type
-                .as_deref()
-                .or(defaults.auth_type.as_deref()),
-            server
-                .auth_token
-                .as_deref()
-                .or(defaults.auth_token.as_deref()),
+            server.auth_type.as_deref(),
+            server.auth_token.as_deref(),
         )?;
     }
     Ok(Some(NormalizedServerConfig {
@@ -1812,24 +2123,119 @@ fn sanitize_tool_name(name: &str) -> String {
     normalized
 }
 
-fn parse_mcp_tool_arguments(raw_arguments: &str) -> Result<Value, AppError> {
+pub(crate) fn parse_json_object_arguments(raw_arguments: &str) -> Result<Value, String> {
     let trimmed = raw_arguments.trim();
     if trimmed.is_empty() {
         return Ok(json!({}));
     }
-    let parsed = serde_json::from_str::<Value>(trimmed).map_err(|err| {
+    let stripped = strip_markdown_code_fence(trimmed);
+    let mut last_error: Option<String> = None;
+    for candidate in [trimmed, stripped] {
+        if let Some(parsed) = try_parse_object_candidate(candidate, &mut last_error) {
+            return Ok(parsed);
+        }
+        if let Some(parsed) = try_parse_stringified_object_candidate(candidate, &mut last_error) {
+            return Ok(parsed);
+        }
+    }
+    for candidate in [stripped, trimmed] {
+        if let Some(json_object) = extract_first_balanced_json_object(candidate)
+            && let Some(parsed) = try_parse_object_candidate(json_object, &mut last_error)
+        {
+            return Ok(parsed);
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        "expected a strict JSON object with double-quoted keys/strings".to_string()
+    }))
+}
+
+fn strip_markdown_code_fence(text: &str) -> &str {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed;
+    }
+    let without_prefix = trimmed
+        .trim_start_matches("```json")
+        .trim_start_matches("```JSON")
+        .trim_start_matches("```");
+    without_prefix.trim().trim_end_matches("```").trim()
+}
+
+fn try_parse_object_candidate(candidate: &str, last_error: &mut Option<String>) -> Option<Value> {
+    match serde_json::from_str::<Value>(candidate) {
+        Ok(Value::Object(object)) => Some(Value::Object(object)),
+        Ok(_) => {
+            *last_error = Some("expected a strict JSON object".to_string());
+            None
+        }
+        Err(err) => {
+            *last_error = Some(err.to_string());
+            None
+        }
+    }
+}
+
+fn try_parse_stringified_object_candidate(
+    candidate: &str,
+    last_error: &mut Option<String>,
+) -> Option<Value> {
+    let decoded = match serde_json::from_str::<Value>(candidate) {
+        Ok(Value::String(inner)) => inner,
+        Ok(_) => return None,
+        Err(err) => {
+            *last_error = Some(err.to_string());
+            return None;
+        }
+    };
+    try_parse_object_candidate(decoded.trim(), last_error)
+}
+
+fn extract_first_balanced_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaping = false;
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaping {
+                escaping = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaping = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset;
+                    return Some(&text[start..=end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_mcp_tool_arguments(raw_arguments: &str) -> Result<Value, AppError> {
+    parse_json_object_arguments(raw_arguments).map_err(|err| {
         AppError::Runtime(format!(
             "invalid MCP tool arguments JSON: {}; expected a strict JSON object with double-quoted keys/strings, raw={}",
             err,
-            mask_sensitive(&trim_text_preview(trimmed, 240))
+            mask_sensitive(&trim_text_preview(raw_arguments.trim(), 240))
         ))
-    })?;
-    if !parsed.is_object() {
-        return Err(AppError::Runtime(
-            "invalid MCP tool arguments JSON: expected a strict JSON object".to_string(),
-        ));
-    }
-    Ok(parsed)
+    })
 }
 
 fn trim_text_preview(text: &str, max_chars: usize) -> String {
@@ -1870,17 +2276,20 @@ mod tests {
     use serde_json::{Value, json};
     use std::{
         collections::{BTreeMap, HashMap, HashSet},
+        fs,
+        path::{Path, PathBuf},
         sync::mpsc,
         thread,
-        time::Duration,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use super::{
-        LegacySseMcpClient, McpGlobalDefaults, McpManager, McpToolInfo, McpTransportMode,
-        ensure_unique_ai_tool_names, extract_tools, mcp_summary, non_empty_trimmed,
-        normalize_server, parse_legacy_sse_endpoint_block, parse_mcp_tool_arguments,
-        parse_sse_jsonrpc_payload, resolve_sse_message_endpoint, resolve_transport_mode,
-        validate_mcp_config,
+        LegacySseMcpClient, McpManager, McpServerRecord, McpToolInfo, McpTransportMode,
+        ensure_unique_ai_tool_names, extract_tools, mcp_summary, mcp_write_lock_path,
+        non_empty_trimmed, normalize_server, parse_legacy_sse_endpoint_block,
+        parse_mcp_tool_arguments, parse_sse_jsonrpc_payload, resolve_mcp_servers_file_path,
+        resolve_sse_message_endpoint, resolve_transport_mode, save_mcp_server_records,
+        validate_mcp_config, write_mcp_server_map_to_file, write_mcp_servers_atomically,
     };
     use crate::config::{McpConfig, McpServerConfig};
 
@@ -1906,6 +2315,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_mcp_tool_arguments_accepts_markdown_code_fence() {
+        let parsed = parse_mcp_tool_arguments("```json\n{\"command\":\"pwd\"}\n```")
+            .expect("code fence should be unwrapped");
+        assert_eq!(parsed, json!({"command":"pwd"}));
+    }
+
+    #[test]
+    fn parse_mcp_tool_arguments_accepts_json_string_wrapped_object() {
+        let parsed = parse_mcp_tool_arguments("\"{\\\"command\\\":\\\"pwd\\\"}\"")
+            .expect("stringified object should be decoded");
+        assert_eq!(parsed, json!({"command":"pwd"}));
+    }
+
+    #[test]
+    fn parse_mcp_tool_arguments_accepts_embedded_object_text() {
+        let parsed =
+            parse_mcp_tool_arguments("tool args => {\"command\":\"pwd\",\"mode\":\"read\"} end")
+                .expect("embedded object should be extracted");
+        assert_eq!(parsed, json!({"command":"pwd","mode":"read"}));
+    }
+
+    #[test]
     fn normalize_server_supports_server_url_and_bearer_auth() {
         let server = McpServerConfig {
             enabled: true,
@@ -1920,15 +2351,7 @@ mod tests {
             auth_token: Some("token-value".to_string()),
             timeout_seconds: Some(12),
         };
-        let defaults = McpGlobalDefaults {
-            transport: None,
-            timeout_seconds: None,
-            headers: BTreeMap::new(),
-            auth_type: None,
-            auth_token: None,
-        };
-
-        let normalized = normalize_server("remote".to_string(), &server, &defaults)
+        let normalized = normalize_server("remote".to_string(), &server)
             .expect("normalize should pass")
             .expect("server should stay enabled");
         assert_eq!(normalized.transport, McpTransportMode::Http);
@@ -2138,6 +2561,152 @@ mod tests {
         );
     }
 
+    fn new_temp_dir(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("machineclaw-{prefix}-{stamp}"));
+        fs::create_dir_all(&path).expect("failed to create temp dir");
+        path
+    }
+
+    fn mcp_cfg_with_dir(dir: &Path) -> McpConfig {
+        McpConfig {
+            enabled: true,
+            mcp_availability_check_mode: "rsync".to_string(),
+            dir: dir.display().to_string(),
+        }
+    }
+
+    fn write_servers(
+        cfg: &McpConfig,
+        config_path: &Path,
+        servers: BTreeMap<String, McpServerConfig>,
+    ) {
+        let file_path = resolve_mcp_servers_file_path(cfg, config_path);
+        write_mcp_server_map_to_file(file_path.as_path(), &servers).expect("write servers json");
+    }
+
+    #[test]
+    fn save_mcp_server_records_preserves_unknown_fields() {
+        let dir = new_temp_dir("mcp-preserve-unknown");
+        let config_path = dir.join("claw.toml");
+        let cfg = mcp_cfg_with_dir(&dir);
+        let file_path = resolve_mcp_servers_file_path(&cfg, &config_path);
+        let raw = r#"{
+  "theme": "dark",
+  "mcpServers": {
+    "demo": {
+      "transport": "sse",
+      "url": "https://example.com/sse",
+      "x-meta": {
+        "source": "imported"
+      }
+    }
+  },
+  "x-global": {
+    "keep": true
+  }
+}"#;
+        fs::write(&file_path, raw).expect("seed existing mcp json");
+        let records = vec![McpServerRecord {
+            name: "demo".to_string(),
+            config: McpServerConfig {
+                enabled: true,
+                transport: Some("http".to_string()),
+                server_url: Some("https://example.com/mcp".to_string()),
+                endpoint: None,
+                command: None,
+                args: vec![],
+                env: BTreeMap::new(),
+                headers: BTreeMap::new(),
+                auth_type: None,
+                auth_token: None,
+                timeout_seconds: Some(9),
+            },
+        }];
+
+        save_mcp_server_records(&cfg, &config_path, &records).expect("save records");
+        let updated = fs::read_to_string(&file_path).expect("read updated json");
+        let parsed: Value = serde_json::from_str(&updated).expect("parse updated json");
+        let root = parsed.as_object().expect("root object");
+        assert_eq!(
+            root.get("theme").and_then(Value::as_str),
+            Some("dark"),
+            "top-level unknown field should be preserved"
+        );
+        assert!(
+            root.get("x-global").is_some(),
+            "top-level extension fields should be preserved"
+        );
+        let server = root
+            .get("mcpServers")
+            .and_then(Value::as_object)
+            .and_then(|servers| servers.get("demo"))
+            .and_then(Value::as_object)
+            .expect("demo server");
+        assert!(
+            !server.contains_key("transport"),
+            "legacy alias key should be normalized away"
+        );
+        assert_eq!(server.get("type").and_then(Value::as_str), Some("http"));
+        assert_eq!(
+            server.get("timeoutSeconds").and_then(Value::as_u64),
+            Some(9)
+        );
+        assert!(
+            server.get("x-meta").is_some(),
+            "server-level unknown extension fields should be preserved"
+        );
+    }
+
+    #[test]
+    fn save_mcp_server_records_cleans_up_lock_file() {
+        let dir = new_temp_dir("mcp-lock-cleanup");
+        let config_path = dir.join("claw.toml");
+        let cfg = mcp_cfg_with_dir(&dir);
+        let lock_path =
+            mcp_write_lock_path(resolve_mcp_servers_file_path(&cfg, &config_path).as_path());
+        let records = vec![McpServerRecord {
+            name: "demo".to_string(),
+            config: McpServerConfig {
+                enabled: true,
+                transport: Some("stdio".to_string()),
+                command: Some("echo".to_string()),
+                ..McpServerConfig::default()
+            },
+        }];
+        save_mcp_server_records(&cfg, &config_path, &records).expect("save records");
+        assert!(
+            !lock_path.exists(),
+            "lock file should be removed after write completes"
+        );
+    }
+
+    #[test]
+    fn write_mcp_servers_atomically_does_not_remove_existing_directory_target() {
+        let dir = new_temp_dir("mcp-write-fallback");
+        let target = dir.join("servers.json");
+        fs::create_dir_all(&target).expect("create target directory");
+        let err =
+            write_mcp_servers_atomically(&target, "{}").expect_err("directory target must fail");
+        assert!(
+            err.to_string().contains("copy fallback")
+                || err.to_string().contains("Is a directory")
+                || err.to_string().contains("is a directory")
+        );
+        assert!(target.is_dir(), "target directory must stay untouched");
+        let dangling_tmp = fs::read_dir(&dir)
+            .expect("read dir")
+            .flatten()
+            .any(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                name.starts_with(".servers.json.") && name.ends_with(".tmp")
+            });
+        assert!(!dangling_tmp, "temporary files should be cleaned up");
+    }
+
     #[test]
     fn validate_mcp_config_rejects_invalid_transport_value() {
         let mut servers = BTreeMap::new();
@@ -2157,42 +2726,31 @@ mod tests {
                 timeout_seconds: None,
             },
         );
-        let cfg = McpConfig {
-            enabled: true,
-            mcp_availability_check_mode: "rsync".to_string(),
-            transport: None,
-            server_url: None,
-            endpoint: None,
-            command: None,
-            args: vec![],
-            env: BTreeMap::new(),
-            headers: BTreeMap::new(),
-            auth_type: None,
-            auth_token: None,
-            timeout_seconds: None,
-            servers,
-        };
-        let err = validate_mcp_config(&cfg).expect_err("invalid transport must fail");
+        let dir = new_temp_dir("mcp-invalid-transport");
+        let config_path = dir.join("claw.toml");
+        let cfg = mcp_cfg_with_dir(&dir);
+        write_servers(&cfg, &config_path, servers);
+        let err = validate_mcp_config(&cfg, &config_path).expect_err("invalid transport must fail");
         assert!(err.to_string().contains("invalid transport"));
     }
 
     #[test]
     fn validate_mcp_config_allows_enabled_without_any_server() {
-        let cfg = McpConfig {
-            enabled: true,
-            ..McpConfig::default()
-        };
-        validate_mcp_config(&cfg).expect("enabled mcp without servers should be allowed");
-        assert_eq!(mcp_summary(&cfg), "enabled, servers=0");
+        let dir = new_temp_dir("mcp-empty-validate");
+        let config_path = dir.join("claw.toml");
+        let cfg = mcp_cfg_with_dir(&dir);
+        validate_mcp_config(&cfg, &config_path)
+            .expect("enabled mcp without servers should be allowed");
+        assert_eq!(mcp_summary(&cfg, &config_path), "enabled, servers=0");
     }
 
     #[test]
     fn connect_allows_enabled_without_any_server() {
-        let cfg = McpConfig {
-            enabled: true,
-            ..McpConfig::default()
-        };
-        let manager = McpManager::connect(&cfg).expect("connect should allow empty mcp server set");
+        let dir = new_temp_dir("mcp-empty-connect");
+        let config_path = dir.join("claw.toml");
+        let cfg = mcp_cfg_with_dir(&dir);
+        let manager = McpManager::connect(&cfg, &config_path)
+            .expect("connect should allow empty mcp server set");
         assert_eq!(manager.summary(), "enabled, servers=0");
         assert!(manager.external_tool_definitions().is_empty());
     }
@@ -2216,12 +2774,11 @@ mod tests {
                 timeout_seconds: Some(1),
             },
         );
-        let cfg = McpConfig {
-            enabled: true,
-            servers,
-            ..McpConfig::default()
-        };
-        let manager = McpManager::connect(&cfg)
+        let dir = new_temp_dir("mcp-degrade");
+        let config_path = dir.join("claw.toml");
+        let cfg = mcp_cfg_with_dir(&dir);
+        write_servers(&cfg, &config_path, servers);
+        let manager = McpManager::connect(&cfg, &config_path)
             .expect("all unavailable servers should not block chat startup");
         assert!(
             manager
@@ -2233,15 +2790,31 @@ mod tests {
     }
 
     #[test]
-    fn mcp_summary_uses_root_name_for_legacy_single_server() {
-        let cfg = McpConfig {
-            enabled: true,
-            endpoint: Some("http://127.0.0.1:8080/mcp".to_string()),
-            ..McpConfig::default()
-        };
-        let summary = mcp_summary(&cfg);
-        assert!(summary.contains("root:http="));
-        assert!(!summary.contains("default:http="));
+    fn mcp_summary_uses_json_server_name() {
+        let dir = new_temp_dir("mcp-summary");
+        let config_path = dir.join("claw.toml");
+        let cfg = mcp_cfg_with_dir(&dir);
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "local".to_string(),
+            McpServerConfig {
+                enabled: true,
+                transport: Some("http".to_string()),
+                server_url: Some("http://127.0.0.1:8080/mcp".to_string()),
+                endpoint: None,
+                command: None,
+                args: vec![],
+                env: BTreeMap::new(),
+                headers: BTreeMap::new(),
+                auth_type: None,
+                auth_token: None,
+                timeout_seconds: None,
+            },
+        );
+        write_servers(&cfg, &config_path, servers);
+        let summary = mcp_summary(&cfg, &config_path);
+        assert!(summary.contains("local:http="));
+        assert!(!summary.contains("root:http="));
     }
 
     #[test]

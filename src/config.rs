@@ -53,6 +53,7 @@ const DEFAULT_CONTEXT_RECENT_MESSAGES: usize = 40;
 const MAX_CONTEXT_MESSAGES: usize = 80;
 const DEFAULT_APP_ENV_MODE: &str = "prod";
 const DEFAULT_MCP_AVAILABILITY_CHECK_MODE: &str = "rsync";
+const DEFAULT_MCP_DIR: &str = "~/.machineclaw/mcp";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -270,7 +271,7 @@ pub struct SkillsConfig {
     pub dir: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpConfig {
     #[serde(default = "default_mcp_enabled")]
     pub enabled: bool,
@@ -279,67 +280,64 @@ pub struct McpConfig {
         default = "default_mcp_availability_check_mode"
     )]
     pub mcp_availability_check_mode: String,
-    #[serde(default, alias = "type")]
-    pub transport: Option<String>,
-    #[serde(
-        rename = "server-url",
-        alias = "server_url",
-        alias = "serverUrl",
-        alias = "url",
-        default
-    )]
-    pub server_url: Option<String>,
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-    #[serde(rename = "auth-type", alias = "auth_type", default)]
-    pub auth_type: Option<String>,
-    #[serde(rename = "auth-token", alias = "auth_token", default)]
-    pub auth_token: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "timeout-seconds")]
-    pub timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub servers: BTreeMap<String, McpServerConfig>,
+    #[serde(default = "default_mcp_dir")]
+    pub dir: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct McpServerConfig {
     #[serde(default = "default_mcp_server_enabled")]
     pub enabled: bool,
-    #[serde(default, alias = "type")]
+    #[serde(
+        default,
+        rename = "type",
+        alias = "transport",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub transport: Option<String>,
     #[serde(
-        rename = "server-url",
+        rename = "url",
+        alias = "server-url",
         alias = "server_url",
         alias = "serverUrl",
-        alias = "url",
-        default
+        default,
+        skip_serializing_if = "Option::is_none"
     )]
     pub server_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "cmd", skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
-    #[serde(rename = "auth-type", alias = "auth_type", default)]
+    #[serde(
+        rename = "authType",
+        alias = "auth-type",
+        alias = "auth_type",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub auth_type: Option<String>,
-    #[serde(rename = "auth-token", alias = "auth_token", default)]
+    #[serde(
+        rename = "authToken",
+        alias = "auth-token",
+        alias = "auth_token",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub auth_token: Option<String>,
     #[serde(default)]
-    #[serde(rename = "timeout-seconds")]
+    #[serde(
+        rename = "timeoutSeconds",
+        alias = "timeout-seconds",
+        alias = "timeout_seconds",
+        alias = "timeoutSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub timeout_seconds: Option<u64>,
 }
 
@@ -425,6 +423,16 @@ impl Default for SkillsConfig {
         Self {
             enabled: default_skills_enabled(),
             dir: default_skills_dir(),
+        }
+    }
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_mcp_enabled(),
+            mcp_availability_check_mode: default_mcp_availability_check_mode(),
+            dir: default_mcp_dir(),
         }
     }
 }
@@ -569,32 +577,19 @@ dir = "~/.skills" # optional
 [mcp]
 enabled = false # optional
 mcp-availability-check-mode = "rsync" # optional, default "rsync"; "async" runs MCP availability check in background so chat can start sooner
-# transport = "http" # optional: http, streamable_http, sse, stdio; omitted = auto detect by endpoint/command
-# type = "sse" # optional alias of transport (for smithery-style config)
-# server-url = "http://127.0.0.1:8080/mcp" # optional, same as endpoint
-# url = "http://127.0.0.1:8080/mcp" # optional alias of server-url
-# auth-type = "bearer" # optional, default bearer when auth-token is set
-# auth-token = "<token>" # optional
-[mcp.headers]
-# Authorization = "Bearer <token>"
-
-[mcp.servers.local]
-enabled = true # optional, default true
-# transport = "http" # optional: http, streamable_http, sse, stdio
-# type = "sse" # optional alias of transport
-# server-url = "http://127.0.0.1:8080/mcp" # optional, same as endpoint
-# url = "http://127.0.0.1:8080/mcp" # optional alias of server-url
-# endpoint = "http://127.0.0.1:8080/mcp" # optional (legacy alias)
-# command = "python3" # optional
-# auth-type = "bearer" # optional, default bearer when auth-token is set
-# auth-token = "<token>" # optional
-args = [] # optional
-# timeout-seconds = 10 # optional
-[mcp.servers.local.env]
-# KEY = "VALUE"
-[mcp.servers.local.headers]
-# Authorization = "Bearer <token>"
-# X-API-Key = "<key>"
+dir = "~/.machineclaw/mcp" # optional, MCP JSON directory (or a single json file path)
+# MCP servers are no longer configured in this TOML.
+# Place MCP definitions in `${mcp.dir}/servers.json`, for example:
+# {
+#   "mcpServers": {
+#     "amap-maps": {
+#       "enabled": true,
+#       "type": "streamable_http",
+#       "url": "https://example.com/mcp",
+#       "headers": { "Authorization": "Bearer <token>" }
+#     }
+#   }
+# }
 
 [console]
 colorful = true # optional, default true
@@ -718,6 +713,9 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
         return Err(AppError::Config(
             "mcp.mcp-availability-check-mode must be one of: rsync, async".to_string(),
         ));
+    }
+    if cfg.mcp.dir.trim().is_empty() {
+        return Err(AppError::Config("mcp.dir must not be empty".to_string()));
     }
     if cfg.ai.chat.cmd_run_timout == 0 {
         return Err(AppError::Config(
@@ -905,6 +903,10 @@ fn default_mcp_enabled() -> bool {
 
 fn default_mcp_availability_check_mode() -> String {
     DEFAULT_MCP_AVAILABILITY_CHECK_MODE.to_string()
+}
+
+fn default_mcp_dir() -> String {
+    DEFAULT_MCP_DIR.to_string()
 }
 
 fn default_mcp_server_enabled() -> bool {

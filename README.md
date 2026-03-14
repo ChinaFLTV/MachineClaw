@@ -173,37 +173,39 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 - `[ai.chat]`：chat 行为、工具显示、压缩、超时、轮次上限
 - `[cmd]`：命令超时、写命令确认、allow/deny 命令规则
 - `[skills]`：skills 目录与开关
-- `[mcp]`：MCP 开关与服务配置（含 `mcp.servers.<name>`）
+- `[mcp]`：MCP 开关、可用性检查策略与 JSON 配置目录
 - `[console]`：是否彩色输出
 - `[log]`：日志目录、滚动策略、保留时长
 - `[session]`：上下文窗口相关配置
 
 ### MCP 配置建议
 
-- HTTP 连接建议使用 `server-url = ".../mcp"`（优先 `/mcp`；若服务仅暴露旧 `/sse`，也可配置 `transport = "sse"` + `/sse` 地址）。
-- `transport` 支持 `http` / `streamable_http` / `sse` / `stdio`；`streamable_http` 等价于 `http`；`sse` 为 legacy SSE 传输（会先连 `/sse` 接收 `endpoint` 事件，再向 message endpoint 发 JSON-RPC）。
-- 兼容 Smithery 风格字段：`type` 可替代 `transport`，`url` 可替代 `server-url`。
-- 鉴权可用 `auth-type` + `auth-token`，或在 `headers` 中显式配置 `Authorization`。
+- TOML 仅保留 MCP 开关与目录配置：
 
 ```toml
 [mcp]
 enabled = true
+mcp-availability-check-mode = "rsync"
+dir = "~/.machineclaw/mcp"
+```
 
-[mcp.servers.deepwiki]
-transport = "http"
-server-url = "https://mcp.deepwiki.com/mcp"
-auth-type = "bearer"
-auth-token = "<token>"
-[mcp.servers.deepwiki.headers]
-X-Trace-Id = "machineclaw"
+- MCP 服务定义放在 `${mcp.dir}/servers.json`（或将 `mcp.dir` 直接指向某个 `.json` 文件）：
+- `type` 支持 `http` / `streamable_http` / `sse` / `stdio`；`streamable_http` 等价于 `http`。
+- `url`、`endpoint`、`command`、`args`、`env`、`headers`、`authType`、`authToken`、`timeoutSeconds` 均受支持。
+- 兼容字段别名：`transport/type`、`server-url/url`、`cmd/command`、`auth-type/authType`、`auth-token/authToken`、`timeout-seconds/timeoutSeconds`。
+- 保存 MCP 配置时采用“文件锁 + 原子写入（tmp + rename）”，降低并发写入与中断写入导致的损坏风险。
+- 写回时会保留 JSON 顶层未知扩展字段，以及单个 server 下未知扩展字段（不会被无关覆盖）。
 
-[mcp.servers.real-time_news]
-type = "sse"
-url = "https://mcp.api-inference.modelscope.net/66f1343a15204e/sse"
-
-[mcp.servers.News-Headlines]
-type = "streamable_http"
-url = "https://mcp.api-inference.modelscope.net/66cb8f57d6804f/mcp"
+```json
+{
+  "mcpServers": {
+    "amap-maps": {
+      "enabled": true,
+      "type": "streamable_http",
+      "url": "https://mcp.api-inference.modelscope.net/d182cf1e5bcf40/mcp"
+    }
+  }
+}
 ```
 
 ## 命令说明
@@ -245,12 +247,23 @@ MachineClaw [OPTIONS] <COMMAND>
 
 - `/help`：帮助
 - `/stats`：会话统计
+- `/skills`：查看扫描到的 Skills
+- `/mcps`：查看 MCP 服务与工具状态
 - `/list`：列出会话
 - `/change <id|name>`：切换会话
 - `/name <new-name>`：重命名当前会话
 - `/new`：新建会话
 - `/clear`：清屏（不清历史）
 - `/exit`：退出 chat
+
+## TUI MCP 管理
+
+- 在 TUI 左侧导航中选择 `MCP`，可进入 MCP 服务管理页。
+- 常用操作：
+  - `A`：新增服务
+  - `D`：删除当前服务
+  - `Enter`：编辑/应用当前字段
+  - `Ctrl+S`：保存到 MCP JSON 配置文件并刷新运行态 MCP 服务
 
 ## 退出码
 

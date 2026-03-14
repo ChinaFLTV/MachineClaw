@@ -164,7 +164,7 @@ impl Clone for AiClient {
             .map(|guard| guard.clone())
             .unwrap_or_else(|_| {
                 ensure_rustls_crypto_provider();
-                Client::builder().build().expect("fallback AI client clone")
+                Client::builder().build().unwrap_or_else(|_| Client::new())
             });
         let cached_prices = self
             .runtime_model_prices
@@ -1054,111 +1054,8 @@ impl AiClient {
             let request_builder = self.apply_provider_auth(client.post(&self.base_url));
             let resp = request_builder.json(&request_body).send();
 
-            match resp {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if !status.is_success() {
-                        let retry_after = resp
-                            .headers()
-                            .get(RETRY_AFTER)
-                            .and_then(|value| value.to_str().ok())
-                            .map(|value| value.to_string());
-                        let body = resp
-                            .text()
-                            .unwrap_or_else(|_| "<unreadable body>".to_string());
-                        let safe_body = mask_sensitive(&body);
-                        let err_msg = format!("AI HTTP status={status}, body={safe_body}");
-                        self.debug_emit(
-                            AiDebugLevel::Error,
-                            &format!("AI response error body: {safe_body}"),
-                        );
-                        if !stripped_reasoning_retry_used
-                            && should_retry_without_reasoning_content(status, &body)
-                            && request_contains_reasoning_content(&effective_body)
-                        {
-                            logging::warn(
-                                "AI rejected chat message; retrying once without reasoning_content for compatibility",
-                            );
-                            self.debug_emit(
-                                AiDebugLevel::Warn,
-                                &format!(
-                                    "AI compatibility fallback triggered: retrying without reasoning_content, status={status}, body={safe_body}"
-                                ),
-                            );
-                            strip_reasoning_content_from_request(&mut effective_body);
-                            stripped_reasoning_retry_used = true;
-                            continue;
-                        }
-                        logging::warn(&err_msg);
-                        if attempt <= self.max_retries {
-                            if let Some(delay) =
-                                parse_rate_limit_retry_delay(status, retry_after.as_deref())
-                            {
-                                sleep_with_chat_cancel(delay, cancel_requested)?;
-                                continue;
-                            }
-                            if should_retry_status(status) {
-                                sleep_with_chat_cancel(
-                                    Duration::from_millis(self.backoff_millis),
-                                    cancel_requested,
-                                )?;
-                                continue;
-                            }
-                        }
-                        return Err(AppError::Ai(err_msg));
-                    }
-
-                    return_if_chat_cancelled(cancel_requested)?;
-                    let response_text = match resp.text() {
-                        Ok(text) => text,
-                        Err(err) => {
-                            let err_msg = format!(
-                                "failed to read AI response body: {}",
-                                format_reqwest_error(&err)
-                            );
-                            logging::warn(&err_msg);
-                            if attempt <= self.max_retries {
-                                retry_with_fresh_client =
-                                    should_refresh_http_client_after_reqwest_error(&err);
-                                if retry_with_fresh_client {
-                                    maybe_print_ai_reconnect_notice(
-                                        &i18n::chat_ai_reconnecting(attempt, self.max_retries),
-                                        self.colorful,
-                                    );
-                                }
-                                sleep_with_chat_cancel(
-                                    Duration::from_millis(self.backoff_millis),
-                                    cancel_requested,
-                                )?;
-                                continue;
-                            }
-                            return Err(AppError::Ai(err_msg));
-                        }
-                    };
-                    self.debug_emit(
-                        AiDebugLevel::Debug,
-                        &format!("AI response body: {}", mask_sensitive(&response_text)),
-                    );
-                    let parsed = self.parse_provider_response_text(&response_text)?;
-                    logging::info("AI request finished successfully");
-                    self.debug_emit(
-                        AiDebugLevel::Info,
-                        &format!(
-                            "AI request finished: elapsed_ms={}, prompt_tokens={}, completion_tokens={}, total_tokens={}",
-                            started.elapsed().as_millis(),
-                            parsed.usage.prompt_tokens,
-                            parsed.usage.completion_tokens,
-                            parsed.usage.total_tokens,
-                        ),
-                    );
-                    return Ok(ApiChatCallResult {
-                        assistant: parsed.message,
-                        usage: parsed.usage,
-                        elapsed_ms: started.elapsed().as_millis(),
-                        streamed_content: false,
-                        streamed_thinking: false,
-                    });
-                }
+            let resp = match resp {
+                Ok(resp) => resp,
                 Err(err) => {
                     let err_msg = format!("AI request failed: {}", format_reqwest_error(&err));
                     logging::warn(&err_msg);
@@ -1179,7 +1076,110 @@ impl AiClient {
                     }
                     return Err(AppError::Ai(err_msg));
                 }
+            };
+
+            let status = resp.status();
+            if !status.is_success() {
+                let retry_after = resp
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.to_string());
+                let body = resp
+                    .text()
+                    .unwrap_or_else(|_| "<unreadable body>".to_string());
+                let safe_body = mask_sensitive(&body);
+                let err_msg = format!("AI HTTP status={status}, body={safe_body}");
+                self.debug_emit(
+                    AiDebugLevel::Error,
+                    &format!("AI response error body: {safe_body}"),
+                );
+                if !stripped_reasoning_retry_used
+                    && should_retry_without_reasoning_content(status, &body)
+                    && request_contains_reasoning_content(&effective_body)
+                {
+                    logging::warn(
+                        "AI rejected chat message; retrying once without reasoning_content for compatibility",
+                    );
+                    self.debug_emit(
+                        AiDebugLevel::Warn,
+                        &format!(
+                            "AI compatibility fallback triggered: retrying without reasoning_content, status={status}, body={safe_body}"
+                        ),
+                    );
+                    strip_reasoning_content_from_request(&mut effective_body);
+                    stripped_reasoning_retry_used = true;
+                    continue;
+                }
+                logging::warn(&err_msg);
+                if attempt <= self.max_retries {
+                    if let Some(delay) =
+                        parse_rate_limit_retry_delay(status, retry_after.as_deref())
+                    {
+                        sleep_with_chat_cancel(delay, cancel_requested)?;
+                        continue;
+                    }
+                    if should_retry_status(status) {
+                        sleep_with_chat_cancel(
+                            Duration::from_millis(self.backoff_millis),
+                            cancel_requested,
+                        )?;
+                        continue;
+                    }
+                }
+                return Err(AppError::Ai(err_msg));
             }
+
+            return_if_chat_cancelled(cancel_requested)?;
+            let response_text = match resp.text() {
+                Ok(text) => text,
+                Err(err) => {
+                    let err_msg = format!(
+                        "failed to read AI response body: {}",
+                        format_reqwest_error(&err)
+                    );
+                    logging::warn(&err_msg);
+                    if attempt <= self.max_retries {
+                        retry_with_fresh_client =
+                            should_refresh_http_client_after_reqwest_error(&err);
+                        if retry_with_fresh_client {
+                            maybe_print_ai_reconnect_notice(
+                                &i18n::chat_ai_reconnecting(attempt, self.max_retries),
+                                self.colorful,
+                            );
+                        }
+                        sleep_with_chat_cancel(
+                            Duration::from_millis(self.backoff_millis),
+                            cancel_requested,
+                        )?;
+                        continue;
+                    }
+                    return Err(AppError::Ai(err_msg));
+                }
+            };
+            self.debug_emit(
+                AiDebugLevel::Debug,
+                &format!("AI response body: {}", mask_sensitive(&response_text)),
+            );
+            let parsed = self.parse_provider_response_text(&response_text)?;
+            logging::info("AI request finished successfully");
+            self.debug_emit(
+                AiDebugLevel::Info,
+                &format!(
+                    "AI request finished: elapsed_ms={}, prompt_tokens={}, completion_tokens={}, total_tokens={}",
+                    started.elapsed().as_millis(),
+                    parsed.usage.prompt_tokens,
+                    parsed.usage.completion_tokens,
+                    parsed.usage.total_tokens,
+                ),
+            );
+            return Ok(ApiChatCallResult {
+                assistant: parsed.message,
+                usage: parsed.usage,
+                elapsed_ms: started.elapsed().as_millis(),
+                streamed_content: false,
+                streamed_thinking: false,
+            });
         }
     }
 
@@ -1196,15 +1196,16 @@ impl AiClient {
         if !stream_output {
             return self.send_chat_completion(body, cancel_requested);
         }
-        if body.tools.is_some() && model_prefers_non_streaming_tool_rounds(&self.model) {
+        let allow_tool_round_compat_fallback =
+            body.tools.is_some() && model_prefers_non_streaming_tool_rounds(&self.model);
+        if allow_tool_round_compat_fallback {
             logging::warn(
-                "model prefers non-streaming tool rounds for compatibility; falling back to non-streaming request",
+                "model may have weaker streaming tool-round compatibility; trying streaming first and keeping non-streaming fallback enabled",
             );
             self.debug_emit(
                 AiDebugLevel::Warn,
-                "AI streaming disabled for tool round on current model; fallback to non-streaming mode",
+                "AI streaming tool round compatibility mode: try streaming first, fallback to non-streaming only if needed",
             );
-            return self.send_chat_completion(body, cancel_requested);
         }
         if self.provider != AiProviderProtocol::OpenAiCompatible {
             logging::warn(
@@ -1266,147 +1267,8 @@ impl AiClient {
             let request_builder = self.apply_provider_auth(client.post(&self.base_url));
             let resp = request_builder.json(&stream_body).send();
 
-            match resp {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if !status.is_success() {
-                        let retry_after = resp
-                            .headers()
-                            .get(RETRY_AFTER)
-                            .and_then(|value| value.to_str().ok())
-                            .map(|value| value.to_string());
-                        let response_body = resp
-                            .text()
-                            .unwrap_or_else(|_| "<unreadable body>".to_string());
-                        let safe_body = mask_sensitive(&response_body);
-                        self.debug_emit(
-                            AiDebugLevel::Error,
-                            &format!("AI streaming response error body: {safe_body}"),
-                        );
-                        if !stripped_reasoning_retry_used
-                            && should_retry_without_reasoning_content(status, &response_body)
-                            && request_contains_reasoning_content(&effective_body)
-                        {
-                            logging::warn(
-                                "AI streaming request rejected chat message; retrying once without reasoning_content for compatibility",
-                            );
-                            self.debug_emit(
-                                AiDebugLevel::Warn,
-                                &format!(
-                                    "AI streaming compatibility fallback triggered: retrying without reasoning_content, status={status}, body={safe_body}"
-                                ),
-                            );
-                            strip_reasoning_content_from_request(&mut effective_body);
-                            stripped_reasoning_retry_used = true;
-                            continue;
-                        }
-                        if should_fallback_to_non_streaming(status, &response_body) {
-                            logging::warn(&format!(
-                                "AI streaming unsupported, fallback to non-streaming, status={status}, body={safe_body}"
-                            ));
-                            self.debug_emit(
-                                AiDebugLevel::Warn,
-                                &format!(
-                                    "AI streaming fallback to non-streaming triggered: status={status}, body={safe_body}"
-                                ),
-                            );
-                            return self.send_chat_completion(body, cancel_requested);
-                        }
-                        let err_msg = format!("AI HTTP status={status}, body={safe_body}");
-                        logging::warn(&err_msg);
-                        if attempt <= self.max_retries {
-                            if let Some(delay) =
-                                parse_rate_limit_retry_delay(status, retry_after.as_deref())
-                            {
-                                sleep_with_chat_cancel(delay, cancel_requested)?;
-                                continue;
-                            }
-                            if should_retry_status(status) {
-                                sleep_with_chat_cancel(
-                                    Duration::from_millis(self.backoff_millis),
-                                    cancel_requested,
-                                )?;
-                                continue;
-                            }
-                        }
-                        return Err(AppError::Ai(err_msg));
-                    }
-
-                    match parse_streaming_chat_response(
-                        resp,
-                        on_stream_event,
-                        self.debug,
-                        cancel_requested,
-                    ) {
-                        Ok(parsed) => {
-                            logging::info("AI streaming request finished successfully");
-                            self.debug_emit(
-                                AiDebugLevel::Info,
-                                &format!(
-                                    "AI streaming request finished: elapsed_ms={}, streamed_content={}, streamed_thinking={}, prompt_tokens={}, completion_tokens={}, total_tokens={}",
-                                    started.elapsed().as_millis(),
-                                    parsed.streamed_content,
-                                    parsed.streamed_thinking,
-                                    parsed.usage.prompt_tokens,
-                                    parsed.usage.completion_tokens,
-                                    parsed.usage.total_tokens,
-                                ),
-                            );
-                            return Ok(ApiChatCallResult {
-                                assistant: parsed.assistant,
-                                usage: parsed.usage,
-                                elapsed_ms: started.elapsed().as_millis(),
-                                streamed_content: parsed.streamed_content,
-                                streamed_thinking: parsed.streamed_thinking,
-                            });
-                        }
-                        Err(StreamParseResult::FallbackJson(body_text)) => {
-                            logging::warn(
-                                "AI streaming response was not SSE; fallback to non-streaming JSON parsing",
-                            );
-                            self.debug_emit(
-                                AiDebugLevel::Warn,
-                                &format!(
-                                    "AI streaming response fallback to JSON body: {}",
-                                    mask_sensitive(&body_text)
-                                ),
-                            );
-                            let parsed = parse_chat_completion_response_text(&body_text)?;
-                            return Ok(ApiChatCallResult {
-                                assistant: parsed.message,
-                                usage: parsed.usage,
-                                elapsed_ms: started.elapsed().as_millis(),
-                                streamed_content: false,
-                                streamed_thinking: false,
-                            });
-                        }
-                        Err(StreamParseResult::Retryable(err_msg)) => {
-                            self.debug_emit(AiDebugLevel::Warn, &err_msg);
-                            logging::warn(&err_msg);
-                            if attempt <= self.max_retries {
-                                retry_with_fresh_client = true;
-                                maybe_print_ai_reconnect_notice(
-                                    &i18n::chat_ai_reconnecting(attempt, self.max_retries),
-                                    self.colorful,
-                                );
-                                sleep_with_chat_cancel(
-                                    Duration::from_millis(self.backoff_millis),
-                                    cancel_requested,
-                                )?;
-                                continue;
-                            }
-                            return Err(AppError::Ai(err_msg));
-                        }
-                        Err(StreamParseResult::Cancelled) => {
-                            return Err(AppError::Ai(CHAT_CANCELLED_ERROR.to_string()));
-                        }
-                        Err(StreamParseResult::Fatal(err_msg)) => {
-                            self.debug_emit(AiDebugLevel::Error, &err_msg);
-                            logging::warn(&err_msg);
-                            return Err(AppError::Ai(err_msg));
-                        }
-                    }
-                }
+            let resp = match resp {
+                Ok(resp) => resp,
                 Err(err) => {
                     let err_msg = format!("AI request failed: {}", format_reqwest_error(&err));
                     self.debug_emit(AiDebugLevel::Error, &err_msg);
@@ -1426,9 +1288,178 @@ impl AiClient {
                         )?;
                         continue;
                     }
+                    if allow_tool_round_compat_fallback {
+                        logging::warn(
+                            "AI streaming transport retries exhausted on compatibility model; fallback to non-streaming mode",
+                        );
+                        self.debug_emit(
+                            AiDebugLevel::Warn,
+                            "AI streaming transport retries exhausted on compatibility model; fallback to non-streaming mode",
+                        );
+                        return self.send_chat_completion(body, cancel_requested);
+                    }
                     return Err(AppError::Ai(err_msg));
                 }
+            };
+
+            let status = resp.status();
+            if !status.is_success() {
+                let retry_after = resp
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.to_string());
+                let response_body = resp
+                    .text()
+                    .unwrap_or_else(|_| "<unreadable body>".to_string());
+                let safe_body = mask_sensitive(&response_body);
+                self.debug_emit(
+                    AiDebugLevel::Error,
+                    &format!("AI streaming response error body: {safe_body}"),
+                );
+                if !stripped_reasoning_retry_used
+                    && should_retry_without_reasoning_content(status, &response_body)
+                    && request_contains_reasoning_content(&effective_body)
+                {
+                    logging::warn(
+                        "AI streaming request rejected chat message; retrying once without reasoning_content for compatibility",
+                    );
+                    self.debug_emit(
+                        AiDebugLevel::Warn,
+                        &format!(
+                            "AI streaming compatibility fallback triggered: retrying without reasoning_content, status={status}, body={safe_body}"
+                        ),
+                    );
+                    strip_reasoning_content_from_request(&mut effective_body);
+                    stripped_reasoning_retry_used = true;
+                    continue;
+                }
+                if should_fallback_to_non_streaming(status, &response_body) {
+                    logging::warn(&format!(
+                        "AI streaming unsupported, fallback to non-streaming, status={status}, body={safe_body}"
+                    ));
+                    self.debug_emit(
+                        AiDebugLevel::Warn,
+                        &format!(
+                            "AI streaming fallback to non-streaming triggered: status={status}, body={safe_body}"
+                        ),
+                    );
+                    return self.send_chat_completion(body, cancel_requested);
+                }
+                let err_msg = format!("AI HTTP status={status}, body={safe_body}");
+                logging::warn(&err_msg);
+                if attempt <= self.max_retries {
+                    if let Some(delay) =
+                        parse_rate_limit_retry_delay(status, retry_after.as_deref())
+                    {
+                        sleep_with_chat_cancel(delay, cancel_requested)?;
+                        continue;
+                    }
+                    if should_retry_status(status) {
+                        sleep_with_chat_cancel(
+                            Duration::from_millis(self.backoff_millis),
+                            cancel_requested,
+                        )?;
+                        continue;
+                    }
+                }
+                return Err(AppError::Ai(err_msg));
             }
+
+            return match parse_streaming_chat_response(
+                resp,
+                on_stream_event,
+                self.debug,
+                cancel_requested,
+            ) {
+                Ok(parsed) => {
+                    logging::info("AI streaming request finished successfully");
+                    self.debug_emit(
+                        AiDebugLevel::Info,
+                        &format!(
+                            "AI streaming request finished: elapsed_ms={}, streamed_content={}, streamed_thinking={}, prompt_tokens={}, completion_tokens={}, total_tokens={}",
+                            started.elapsed().as_millis(),
+                            parsed.streamed_content,
+                            parsed.streamed_thinking,
+                            parsed.usage.prompt_tokens,
+                            parsed.usage.completion_tokens,
+                            parsed.usage.total_tokens,
+                        ),
+                    );
+                    Ok(ApiChatCallResult {
+                        assistant: parsed.assistant,
+                        usage: parsed.usage,
+                        elapsed_ms: started.elapsed().as_millis(),
+                        streamed_content: parsed.streamed_content,
+                        streamed_thinking: parsed.streamed_thinking,
+                    })
+                }
+                Err(StreamParseResult::FallbackJson(body_text)) => {
+                    logging::warn(
+                        "AI streaming response was not SSE; fallback to non-streaming JSON parsing",
+                    );
+                    self.debug_emit(
+                        AiDebugLevel::Warn,
+                        &format!(
+                            "AI streaming response fallback to JSON body: {}",
+                            mask_sensitive(&body_text)
+                        ),
+                    );
+                    let parsed = parse_chat_completion_response_text(&body_text)?;
+                    Ok(ApiChatCallResult {
+                        assistant: parsed.message,
+                        usage: parsed.usage,
+                        elapsed_ms: started.elapsed().as_millis(),
+                        streamed_content: false,
+                        streamed_thinking: false,
+                    })
+                }
+                Err(StreamParseResult::Retryable(err_msg)) => {
+                    self.debug_emit(AiDebugLevel::Warn, &err_msg);
+                    logging::warn(&err_msg);
+                    if attempt <= self.max_retries {
+                        retry_with_fresh_client = true;
+                        maybe_print_ai_reconnect_notice(
+                            &i18n::chat_ai_reconnecting(attempt, self.max_retries),
+                            self.colorful,
+                        );
+                        sleep_with_chat_cancel(
+                            Duration::from_millis(self.backoff_millis),
+                            cancel_requested,
+                        )?;
+                        continue;
+                    }
+                    if allow_tool_round_compat_fallback {
+                        logging::warn(
+                            "AI streaming tool round retries exhausted; fallback to non-streaming compatibility mode",
+                        );
+                        self.debug_emit(
+                            AiDebugLevel::Warn,
+                            "AI streaming retries exhausted on compatibility model; fallback to non-streaming mode",
+                        );
+                        return self.send_chat_completion(body, cancel_requested);
+                    }
+                    Err(AppError::Ai(err_msg))
+                }
+                Err(StreamParseResult::Cancelled) => {
+                    Err(AppError::Ai(CHAT_CANCELLED_ERROR.to_string()))
+                }
+                Err(StreamParseResult::Fatal(err_msg)) => {
+                    self.debug_emit(AiDebugLevel::Error, &err_msg);
+                    logging::warn(&err_msg);
+                    if allow_tool_round_compat_fallback {
+                        logging::warn(
+                            "AI streaming parse failed on compatibility model; fallback to non-streaming mode",
+                        );
+                        self.debug_emit(
+                            AiDebugLevel::Warn,
+                            "AI streaming parse failed on compatibility model; fallback to non-streaming mode",
+                        );
+                        return self.send_chat_completion(body, cancel_requested);
+                    }
+                    Err(AppError::Ai(err_msg))
+                }
+            };
         }
     }
 
@@ -1862,14 +1893,12 @@ static DSML_FUNCTION_CALLS_BLOCK_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid dsml function call block regex")
 });
 static DSML_INVOKE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
-        r#"(?is)<[|｜]dsml[|｜]invoke\s+name=\"([^\"]+)\"[^>]*>(.*?)</[|｜]dsml[|｜]invoke>"#,
-    )
-    .expect("valid dsml invoke regex")
+    Regex::new(r#"(?is)<[|｜]dsml[|｜]invoke\s+name="([^"]+)"[^>]*>(.*?)</[|｜]dsml[|｜]invoke>"#)
+        .expect("valid dsml invoke regex")
 });
 static DSML_PARAMETER_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"(?is)<[|｜]dsml[|｜]parameter\s+name=\"([^\"]+)\"[^>]*>(.*?)</[|｜]dsml[|｜]parameter>"#,
+        r#"(?is)<[|｜]dsml[|｜]parameter\s+name="([^"]+)"[^>]*>(.*?)</[|｜]dsml[|｜]parameter>"#,
     )
     .expect("valid dsml parameter regex")
 });
@@ -2242,6 +2271,9 @@ fn collect_visible_text_from_value(value: &serde_json::Value, output: &mut Vec<S
             }
         }
         serde_json::Value::Object(map) => {
+            if map_contains_reasoning_type(map) {
+                return;
+            }
             for key in [
                 "text",
                 "output_text",
@@ -2271,6 +2303,9 @@ fn collect_visible_text_delta_from_value(value: &serde_json::Value, output: &mut
             }
         }
         serde_json::Value::Object(map) => {
+            if map_contains_reasoning_type(map) {
+                return;
+            }
             for key in [
                 "text",
                 "output_text",
@@ -2317,11 +2352,7 @@ fn collect_reasoning_from_value(value: &serde_json::Value, output: &mut Vec<Stri
             }
         }
         serde_json::Value::Object(map) => {
-            let is_reasoning_block = map
-                .get("type")
-                .and_then(|v| v.as_str())
-                .map(|t| t.to_ascii_lowercase().contains("reasoning"))
-                .unwrap_or(false);
+            let is_reasoning_block = map_contains_reasoning_type(map);
             if is_reasoning_block {
                 for key in [
                     "text",
@@ -2338,7 +2369,7 @@ fn collect_reasoning_from_value(value: &serde_json::Value, output: &mut Vec<Stri
                     }
                 }
             }
-            for key in ["reasoning", "reasoning_content", "summary"] {
+            for key in ["reasoning", "reasoning_content"] {
                 if let Some(value) = map.get(key) {
                     let text = extract_text_from_value(value);
                     if !text.trim().is_empty() {
@@ -2351,6 +2382,16 @@ fn collect_reasoning_from_value(value: &serde_json::Value, output: &mut Vec<Stri
             }
         }
     }
+}
+
+fn map_contains_reasoning_type(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    map.get("type")
+        .and_then(|v| v.as_str())
+        .map(|t| {
+            let normalized = t.trim().to_ascii_lowercase();
+            normalized.contains("reasoning") || normalized.contains("thinking")
+        })
+        .unwrap_or(false)
 }
 
 fn append_unique_thinking_chunk(chunks: &mut Vec<String>, chunk: String) {
@@ -2889,24 +2930,17 @@ fn write_string_atomically(path: &Path, content: &str) -> Result<(), AppError> {
             temp_path.display()
         ))
     })?;
-    if let Err(err) = fs::rename(&temp_path, path) {
-        if path.exists() {
-            let _ = fs::remove_file(path);
-            fs::rename(&temp_path, path).map_err(|rename_err| {
-                AppError::Runtime(format!(
-                    "failed to replace file {} after rename error {}: {}",
-                    path.display(),
-                    err,
-                    rename_err
-                ))
-            })?;
-        } else {
+    if let Err(rename_err) = fs::rename(&temp_path, path) {
+        if let Err(copy_err) = fs::copy(&temp_path, path) {
             let _ = fs::remove_file(&temp_path);
             return Err(AppError::Runtime(format!(
-                "failed to move temporary file into place {}: {err}",
-                path.display()
+                "failed to replace file {} (rename: {}; copy fallback: {})",
+                path.display(),
+                rename_err,
+                copy_err
             )));
         }
+        let _ = fs::remove_file(&temp_path);
     }
     Ok(())
 }
@@ -3993,20 +4027,20 @@ mod tests {
     use std::{env, fs, sync::RwLock, time::Duration};
 
     use super::{
-        AiClient, AiProviderProtocol, ApiMessage, ApiToolCall, ApiToolFunction,
+        AiClient, AiProviderProtocol, ApiMessage, ApiToolCall, ApiToolFunction, AssistantMessage,
         ChatCompletionRequest, ChatCompletionStreamResponse, ChatMetrics, ChatStopReason,
         FinalizeWithoutToolsState, ModelPriceSource, PersistedModelPriceCatalog,
-        PersistedModelPriceEntry, build_claude_request_body, build_provider_chat_url,
-        builtin_model_prices, extract_text_delta_from_value, extract_text_from_value,
-        fresh_model_price_catalog, is_rate_limited_error, merge_text_delta, merge_visible_chunks,
-        model_prefers_non_streaming_tool_rounds, normalize_stepfun_chat_request,
-        parse_claude_response_text, parse_gemini_response_text, parse_model_price_catalog_response,
-        parse_model_price_probe_response, parse_rate_limit_retry_delay,
-        price_probe_candidate_models, provider_protocol_from_config_type,
-        provider_requires_reasoning_content_omission, request_contains_reasoning_content,
-        resolve_effective_model_prices, should_fallback_to_non_streaming,
-        should_refresh_http_client_after_reqwest_error, should_retry_without_reasoning_content,
-        strip_reasoning_content_from_request, with_cost,
+        PersistedModelPriceEntry, assistant_reasoning_text, build_claude_request_body,
+        build_provider_chat_url, builtin_model_prices, extract_text_delta_from_value,
+        extract_text_from_value, fresh_model_price_catalog, is_rate_limited_error,
+        merge_text_delta, merge_visible_chunks, model_prefers_non_streaming_tool_rounds,
+        normalize_stepfun_chat_request, parse_claude_response_text, parse_gemini_response_text,
+        parse_model_price_catalog_response, parse_model_price_probe_response,
+        parse_rate_limit_retry_delay, price_probe_candidate_models,
+        provider_protocol_from_config_type, provider_requires_reasoning_content_omission,
+        request_contains_reasoning_content, resolve_effective_model_prices,
+        should_fallback_to_non_streaming, should_refresh_http_client_after_reqwest_error,
+        should_retry_without_reasoning_content, strip_reasoning_content_from_request, with_cost,
     };
     use crate::{error::AppError, tls::ensure_rustls_crypto_provider};
 
@@ -4178,6 +4212,27 @@ mod tests {
             extract_text_delta_from_value(&payload),
             "\nfn main() {\n    println!(\"hi\");\n}"
         );
+    }
+
+    #[test]
+    fn excludes_reasoning_blocks_from_visible_text_extraction() {
+        let payload = json!([
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"hidden chain"}]},
+            {"type":"output_text","text":"final answer"}
+        ]);
+        assert_eq!(extract_text_from_value(&payload), "final answer");
+        assert_eq!(extract_text_delta_from_value(&payload), "final answer");
+    }
+
+    #[test]
+    fn reasoning_extraction_ignores_plain_summary_without_reasoning_type() {
+        let message = AssistantMessage {
+            content: Some(json!({"summary":"final answer"})),
+            reasoning_content: None,
+            reasoning: None,
+            tool_calls: Vec::new(),
+        };
+        assert_eq!(assistant_reasoning_text(&message), "");
     }
 
     #[test]
@@ -4563,7 +4618,7 @@ mod tests {
     #[test]
     fn refreshes_http_client_for_transient_transport_errors() {
         ensure_rustls_crypto_provider();
-        let connect_err = reqwest::blocking::Client::builder()
+        let connect_err = Client::builder()
             .build()
             .expect("test client")
             .get("http://127.0.0.1:1")
@@ -4575,7 +4630,7 @@ mod tests {
     #[test]
     fn does_not_refresh_http_client_for_builder_validation_errors() {
         ensure_rustls_crypto_provider();
-        let invalid_url_err = reqwest::blocking::Client::builder()
+        let invalid_url_err = Client::builder()
             .build()
             .expect("test client")
             .get("://bad-url")

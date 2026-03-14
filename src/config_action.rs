@@ -247,24 +247,17 @@ fn write_config_atomically(path: &Path, content: &str) -> Result<(), AppError> {
             temp_path.display()
         ))
     })?;
-    if let Err(err) = fs::rename(&temp_path, path) {
-        if path.exists() {
-            let _ = fs::remove_file(path);
-            fs::rename(&temp_path, path).map_err(|rename_err| {
-                AppError::Config(format!(
-                    "failed to replace config file {} after rename error {}: {}",
-                    path.display(),
-                    err,
-                    rename_err
-                ))
-            })?;
-        } else {
+    if let Err(rename_err) = fs::rename(&temp_path, path) {
+        if let Err(copy_err) = fs::copy(&temp_path, path) {
             let _ = fs::remove_file(&temp_path);
             return Err(AppError::Config(format!(
-                "failed to move temporary config file into place {}: {err}",
-                path.display()
+                "failed to replace config file {} (rename: {}; copy fallback: {})",
+                path.display(),
+                rename_err,
+                copy_err
             )));
         }
+        let _ = fs::remove_file(&temp_path);
     }
     Ok(())
 }
@@ -290,12 +283,7 @@ fn validate_known_key(key: &str) -> Result<(), AppError> {
 }
 
 pub(crate) fn is_known_config_key(key: &str) -> bool {
-    if known_config_keys().contains(&key) {
-        return true;
-    }
-    parse_dynamic_mcp_server_key(key).is_some()
-        || parse_dynamic_mcp_root_map_key(key, "env")
-        || parse_dynamic_mcp_root_map_key(key, "headers")
+    known_config_keys().contains(&key)
 }
 
 fn is_required_key(key: &str) -> bool {
@@ -346,19 +334,7 @@ pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
         "skills.dir" => Some("\"~/.skills\""),
         "mcp.enabled" => Some("false"),
         "mcp.mcp-availability-check-mode" => Some("\"rsync\""),
-        "mcp.transport" => None,
-        "mcp.type" => None,
-        "mcp.server-url" => None,
-        "mcp.url" => None,
-        "mcp.server_url" => None,
-        "mcp.serverUrl" => None,
-        "mcp.args" => Some("[]"),
-        "mcp.env" => Some("{}"),
-        "mcp.headers" => Some("{}"),
-        "mcp.auth-type" => None,
-        "mcp.auth-token" => None,
-        "mcp.auth_type" => None,
-        "mcp.auth_token" => None,
+        "mcp.dir" => Some("\"~/.machineclaw/mcp\""),
         "console.colorful" => Some("true"),
         "log.dir" => Some("\"logs\""),
         "log.log-file-name" => Some("\"session-{session-id}.log\""),
@@ -418,39 +394,7 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
         "skills.dir",
         "mcp.enabled",
         "mcp.mcp-availability-check-mode",
-        "mcp.transport",
-        "mcp.type",
-        "mcp.server-url",
-        "mcp.url",
-        "mcp.server_url",
-        "mcp.serverUrl",
-        "mcp.endpoint",
-        "mcp.command",
-        "mcp.args",
-        "mcp.env",
-        "mcp.headers",
-        "mcp.auth-type",
-        "mcp.auth-token",
-        "mcp.auth_type",
-        "mcp.auth_token",
-        "mcp.timeout-seconds",
-        "mcp.servers.<name>.enabled",
-        "mcp.servers.<name>.transport",
-        "mcp.servers.<name>.type",
-        "mcp.servers.<name>.server-url",
-        "mcp.servers.<name>.url",
-        "mcp.servers.<name>.server_url",
-        "mcp.servers.<name>.serverUrl",
-        "mcp.servers.<name>.endpoint",
-        "mcp.servers.<name>.command",
-        "mcp.servers.<name>.args",
-        "mcp.servers.<name>.env",
-        "mcp.servers.<name>.headers",
-        "mcp.servers.<name>.auth-type",
-        "mcp.servers.<name>.auth-token",
-        "mcp.servers.<name>.auth_type",
-        "mcp.servers.<name>.auth_token",
-        "mcp.servers.<name>.timeout-seconds",
+        "mcp.dir",
         "console.colorful",
         "log.dir",
         "log.log-file-name",
@@ -459,47 +403,6 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
         "session.recent_messages",
         "session.max_messages",
     ]
-}
-
-fn parse_dynamic_mcp_server_key(key: &str) -> Option<&'static str> {
-    let segments = split_key_path(key);
-    if segments.len() < 4 {
-        return None;
-    }
-    if segments[0] != "mcp" || segments[1] != "servers" {
-        return None;
-    }
-    if segments[2].trim().is_empty() {
-        return None;
-    }
-    match segments[3] {
-        "enabled" if segments.len() == 4 => Some("enabled"),
-        "transport" if segments.len() == 4 => Some("transport"),
-        "type" if segments.len() == 4 => Some("type"),
-        "server-url" if segments.len() == 4 => Some("server-url"),
-        "url" if segments.len() == 4 => Some("url"),
-        "server_url" if segments.len() == 4 => Some("server_url"),
-        "serverUrl" if segments.len() == 4 => Some("serverUrl"),
-        "endpoint" if segments.len() == 4 => Some("endpoint"),
-        "command" if segments.len() == 4 => Some("command"),
-        "args" if segments.len() == 4 => Some("args"),
-        "auth-type" if segments.len() == 4 => Some("auth-type"),
-        "auth-token" if segments.len() == 4 => Some("auth-token"),
-        "auth_type" if segments.len() == 4 => Some("auth_type"),
-        "auth_token" if segments.len() == 4 => Some("auth_token"),
-        "timeout-seconds" if segments.len() == 4 => Some("timeout-seconds"),
-        "env" if segments.len() >= 4 => Some("env"),
-        "headers" if segments.len() >= 4 => Some("headers"),
-        _ => None,
-    }
-}
-
-fn parse_dynamic_mcp_root_map_key(key: &str, map_name: &str) -> bool {
-    let segments = split_key_path(key);
-    if segments.len() < 3 {
-        return false;
-    }
-    segments[0] == "mcp" && segments[1] == map_name && !segments[2].trim().is_empty()
 }
 
 fn render_get_output(key: &str, value: &str, source: ValueSource, path: &Path) -> String {
@@ -658,34 +561,15 @@ mod tests {
     use super::is_known_config_key;
 
     #[test]
-    fn known_config_keys_include_new_mcp_root_fields() {
-        assert!(is_known_config_key("mcp.transport"));
-        assert!(is_known_config_key("mcp.type"));
-        assert!(is_known_config_key("mcp.server-url"));
-        assert!(is_known_config_key("mcp.url"));
-        assert!(is_known_config_key("mcp.server_url"));
-        assert!(is_known_config_key("mcp.serverUrl"));
+    fn known_config_keys_include_mcp_root_fields() {
         assert!(is_known_config_key("mcp.mcp-availability-check-mode"));
-        assert!(is_known_config_key("mcp.headers"));
-        assert!(is_known_config_key("mcp.auth-type"));
-        assert!(is_known_config_key("mcp.auth-token"));
-        assert!(is_known_config_key("mcp.auth_type"));
-        assert!(is_known_config_key("mcp.auth_token"));
+        assert!(is_known_config_key("mcp.enabled"));
+        assert!(is_known_config_key("mcp.dir"));
     }
 
     #[test]
-    fn dynamic_mcp_map_keys_are_supported() {
-        assert!(is_known_config_key("mcp.headers.Authorization"));
-        assert!(is_known_config_key(
-            "mcp.servers.local.headers.Authorization"
-        ));
-        assert!(is_known_config_key("mcp.servers.local.server-url"));
-        assert!(is_known_config_key("mcp.servers.local.url"));
-        assert!(is_known_config_key("mcp.servers.local.server_url"));
-        assert!(is_known_config_key("mcp.servers.local.serverUrl"));
-        assert!(is_known_config_key("mcp.servers.local.transport"));
-        assert!(is_known_config_key("mcp.servers.local.type"));
-        assert!(is_known_config_key("mcp.servers.local.auth-token"));
-        assert!(is_known_config_key("mcp.servers.local.auth_token"));
+    fn dynamic_mcp_map_keys_are_not_supported_anymore() {
+        assert!(!is_known_config_key("mcp.headers.Authorization"));
+        assert!(!is_known_config_key("mcp.servers.local.server-url"));
     }
 }

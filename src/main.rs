@@ -16,6 +16,7 @@ mod skills;
 mod snapshot;
 mod test_action;
 mod tls;
+mod tui;
 
 use std::{
     io::{self, IsTerminal, Write},
@@ -30,6 +31,8 @@ use std::{
 
 use clap::Parser;
 use clap::error::ErrorKind;
+use crossterm as _;
+use ratatui as _;
 
 use crate::{
     actions::ActionServices,
@@ -141,12 +144,13 @@ fn run() -> Result<ExitCode, AppError> {
 
     let effective = load_effective_config(cli.conf.clone())?;
     let mut cfg = effective.cfg;
+    let is_chat_command = matches!(&command, Commands::Chat);
     let config_source_desc = effective.source.describe();
     let selected_language = resolve_language(cfg.app.language.as_deref());
     set_language(selected_language);
     cfg.console.colorful = render::resolve_colorful_enabled(cfg.console.colorful);
     validate_config(&cfg)?;
-    validate_mcp_config(&cfg.mcp)?;
+    validate_mcp_config(&cfg.mcp, &config_path)?;
     let language_warning = cfg.app.language.as_deref().and_then(|raw| {
         if parse_language(raw).is_none() {
             Some(i18n::unsupported_language_notice(raw))
@@ -200,10 +204,12 @@ fn run() -> Result<ExitCode, AppError> {
         language_code(selected_language)
     ));
     if let Some(notice) = language_warning {
-        eprintln!(
-            "{}",
-            render::render_warn_line(&notice, cfg.console.colorful)
-        );
+        if !is_chat_command {
+            eprintln!(
+                "{}",
+                render::render_warn_line(&notice, cfg.console.colorful)
+            );
+        }
         logging::warn(&notice);
     }
 
@@ -213,10 +219,12 @@ fn run() -> Result<ExitCode, AppError> {
     let assets_dir = assets_setup.path;
     logging::info(&format!("assets directory={}", assets_dir.display()));
     for notice in assets_setup.notices {
-        println!(
-            "{}",
-            render::render_info_line(&notice, cfg.console.colorful)
-        );
+        if !is_chat_command {
+            println!(
+                "{}",
+                render::render_info_line(&notice, cfg.console.colorful)
+            );
+        }
         logging::info(&notice);
     }
 
@@ -228,12 +236,14 @@ fn run() -> Result<ExitCode, AppError> {
     let run_ai_connectivity_check =
         !matches!(&command, Commands::Chat) || cfg.ai.connectivity_check;
     let require_elevated = !matches!(&command, Commands::Chat);
-    run_preflight_checks(
-        &cfg,
-        &ai_client,
-        run_ai_connectivity_check,
-        require_elevated,
-    )?;
+    if !is_chat_command {
+        run_preflight_checks(
+            &cfg,
+            &ai_client,
+            run_ai_connectivity_check,
+            require_elevated,
+        )?;
+    }
 
     let skills_dir = expand_tilde(&cfg.skills.dir);
     let skill_list = if cfg.skills.enabled {
@@ -254,10 +264,13 @@ fn run() -> Result<ExitCode, AppError> {
         && normalize_mcp_availability_check_mode(cfg.mcp.mcp_availability_check_mode.as_str())
             == "async";
     let mut mcp_manager = if use_async_mcp_availability_check {
-        let pending_summary = format!("{}, availability=checking(async)", mcp_summary(&cfg.mcp));
-        mcp::McpManager::pending_with_config(&cfg.mcp, pending_summary)
+        let pending_summary = format!(
+            "{}, availability=checking(async)",
+            mcp_summary(&cfg.mcp, &config_path)
+        );
+        mcp::McpManager::pending_with_config(&cfg.mcp, &config_path, pending_summary)
     } else {
-        mcp::McpManager::connect(&cfg.mcp)?
+        mcp::McpManager::connect(&cfg.mcp, &config_path)?
     };
 
     let os_type = current_os();
@@ -265,11 +278,12 @@ fn run() -> Result<ExitCode, AppError> {
     let mcp_desc = if cfg.mcp.enabled {
         mcp_manager.summary()
     } else {
-        mcp_summary(&cfg.mcp)
+        mcp_summary(&cfg.mcp, &config_path)
     };
 
     let mut services = ActionServices {
         cfg: &cfg,
+        config_path: &config_path,
         assets_dir: &assets_dir,
         shell: &shell,
         ai: &ai_client,

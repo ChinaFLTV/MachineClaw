@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -334,62 +333,7 @@ fn derive_key(base_bytes: &[u8], salt: &[u8; 16]) -> [u8; 32] {
 fn sanitize_config_for_display(cfg: &AppConfig) -> AppConfig {
     let mut safe = cfg.clone();
     safe.ai.token = sanitize_secret_value(&safe.ai.token);
-    sanitize_map_values(&mut safe.mcp.env);
-    sanitize_map_values(&mut safe.mcp.headers);
-    if !safe
-        .mcp
-        .auth_token
-        .as_deref()
-        .unwrap_or_default()
-        .trim()
-        .is_empty()
-    {
-        safe.mcp.auth_token = Some(sanitize_secret_value(
-            safe.mcp.auth_token.as_deref().unwrap_or_default(),
-        ));
-    }
-    for server in safe.mcp.servers.values_mut() {
-        sanitize_map_values(&mut server.env);
-        sanitize_map_values(&mut server.headers);
-        if !server
-            .auth_token
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-        {
-            server.auth_token = Some(sanitize_secret_value(
-                server.auth_token.as_deref().unwrap_or_default(),
-            ));
-        }
-    }
     safe
-}
-
-fn sanitize_map_values(map: &mut BTreeMap<String, String>) {
-    for (key, value) in map.iter_mut() {
-        if is_sensitive_key(key) {
-            *value = sanitize_secret_value(value);
-        }
-    }
-}
-
-fn is_sensitive_key(key: &str) -> bool {
-    let lowered = key.to_ascii_lowercase();
-    [
-        "token",
-        "authorization",
-        "api_key",
-        "apikey",
-        "cookie",
-        "password",
-        "passwd",
-        "secret",
-        "private_key",
-        "privatekey",
-    ]
-    .iter()
-    .any(|item| lowered.contains(item))
 }
 
 fn sanitize_secret_value(raw: &str) -> String {

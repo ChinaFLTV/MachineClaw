@@ -292,24 +292,59 @@ impl SessionStore {
 
     pub fn recent_messages_for_display(&self, limit: usize) -> Vec<SessionMessage> {
         let mut items = Vec::<SessionMessage>::new();
+        for idx in self.recent_display_state_indices(limit) {
+            if let Some(item) = self.state.messages.get(idx) {
+                items.push(item.clone());
+            }
+        }
+        items
+    }
+
+    pub fn remove_recent_display_message_by_signature(
+        &mut self,
+        limit: usize,
+        role: &str,
+        content: &str,
+        occurrence_from_end: usize,
+    ) -> Option<SessionMessage> {
+        if occurrence_from_end == 0 {
+            return None;
+        }
+        let display_indices = self.recent_display_state_indices(limit);
+        let mut matched = 0usize;
+        let mut target_index = None;
+        for idx in display_indices.into_iter().rev() {
+            let Some(message) = self.state.messages.get(idx) else {
+                continue;
+            };
+            if message.role == role && message.content == content {
+                matched = matched.saturating_add(1);
+                if matched == occurrence_from_end {
+                    target_index = Some(idx);
+                    break;
+                }
+            }
+        }
+        let idx = target_index?;
+        let removed = self.state.messages.remove(idx);
+        self.update_compass_on_remove(&removed);
+        Some(removed)
+    }
+
+    fn recent_display_state_indices(&self, limit: usize) -> Vec<usize> {
+        let mut indices = Vec::<usize>::new();
         let wanted = limit.max(1);
-        for item in self.state.messages.iter().rev() {
-            if item.role.trim().is_empty() && item.content.trim().is_empty() {
+        for (idx, item) in self.state.messages.iter().enumerate().rev() {
+            if !is_visible_display_message(item) {
                 continue;
             }
-            if item.role == "system"
-                && (item.content.trim_start().starts_with(AI_COMPRESSION_MARKER)
-                    || item.content.trim_start().starts_with(CHAT_PROFILE_MARKER))
-            {
-                continue;
-            }
-            items.push(item.clone());
-            if items.len() >= wanted {
+            indices.push(idx);
+            if indices.len() >= wanted {
                 break;
             }
         }
-        items.reverse();
-        items
+        indices.reverse();
+        indices
     }
 
     pub fn summary_len(&self) -> usize {
@@ -727,6 +762,52 @@ impl SessionStore {
         }
     }
 
+    fn update_compass_on_remove(&mut self, removed: &SessionMessage) {
+        self.state.compass.last_updated_epoch_ms = now_epoch_ms();
+        match removed.role.as_str() {
+            "user" => {
+                self.state.compass.total_user_messages =
+                    self.state.compass.total_user_messages.saturating_sub(1);
+                self.state.compass.last_user_topic = self
+                    .state
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|msg| msg.role == "user")
+                    .map(|msg| extract_topic(&msg.content))
+                    .unwrap_or_default();
+                self.state.compass.last_action = self
+                    .state
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|msg| msg.role == "user" && msg.content.starts_with("action="))
+                    .map(|msg| trim_chars(&msg.content, 80))
+                    .unwrap_or_default();
+            }
+            "assistant" => {
+                self.state.compass.total_assistant_messages = self
+                    .state
+                    .compass
+                    .total_assistant_messages
+                    .saturating_sub(1);
+                self.state.compass.last_assistant_focus = self
+                    .state
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|msg| msg.role == "assistant")
+                    .map(|msg| first_sentence(&msg.content, 120))
+                    .unwrap_or_default();
+            }
+            "tool" => {
+                self.state.compass.total_tool_messages =
+                    self.state.compass.total_tool_messages.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
     fn compass_snapshot(&self) -> String {
         let last_action = fallback_dash(&self.state.compass.last_action);
         let last_topic = fallback_dash(&self.state.compass.last_user_topic);
@@ -869,6 +950,19 @@ impl SessionStore {
         self.path = target_path;
         self.persist()
     }
+}
+
+fn is_visible_display_message(item: &SessionMessage) -> bool {
+    if item.role.trim().is_empty() && item.content.trim().is_empty() {
+        return false;
+    }
+    if item.role == "system"
+        && (item.content.trim_start().starts_with(AI_COMPRESSION_MARKER)
+            || item.content.trim_start().starts_with(CHAT_PROFILE_MARKER))
+    {
+        return false;
+    }
+    true
 }
 
 fn compute_keep_recent_messages(max_history_messages: usize) -> usize {
@@ -1435,24 +1529,17 @@ fn write_string_atomically(path: &Path, content: &str) -> Result<(), AppError> {
             temp_path.display()
         ))
     })?;
-    if let Err(err) = fs::rename(&temp_path, path) {
-        if path.exists() {
-            let _ = fs::remove_file(path);
-            fs::rename(&temp_path, path).map_err(|rename_err| {
-                AppError::Runtime(format!(
-                    "failed to replace file {} after rename error {}: {}",
-                    path.display(),
-                    err,
-                    rename_err
-                ))
-            })?;
-        } else {
+    if let Err(rename_err) = fs::rename(&temp_path, path) {
+        if let Err(copy_err) = fs::copy(&temp_path, path) {
             let _ = fs::remove_file(&temp_path);
             return Err(AppError::Runtime(format!(
-                "failed to move temporary file into place {}: {err}",
-                path.display()
+                "failed to replace file {} (rename: {}; copy fallback: {})",
+                path.display(),
+                rename_err,
+                copy_err
             )));
         }
+        let _ = fs::remove_file(&temp_path);
     }
     Ok(())
 }
@@ -1563,6 +1650,35 @@ mod tests {
                 && !item.content.starts_with(CHAT_PROFILE_MARKER)
         }));
         assert!(items.iter().any(|item| item.content == "assistant ok"));
+    }
+
+    #[test]
+    fn remove_recent_display_message_by_signature_removes_target_occurrence() {
+        let mut store = build_store("");
+        store.add_user_message("dup".to_string(), None);
+        store.add_user_message("dup".to_string(), None);
+        store.add_user_message("dup".to_string(), None);
+        let removed = store.remove_recent_display_message_by_signature(20, "user", "dup", 2);
+        assert!(removed.is_some());
+        let user_dups = store
+            .recent_messages_for_display(20)
+            .into_iter()
+            .filter(|item| item.role == "user" && item.content == "dup")
+            .count();
+        assert_eq!(user_dups, 2);
+    }
+
+    #[test]
+    fn remove_recent_display_message_by_signature_ignores_internal_markers() {
+        let mut store = build_store("");
+        store.add_system_message(format!("{AI_COMPRESSION_MARKER}\nsummary"), None);
+        let removed = store.remove_recent_display_message_by_signature(
+            20,
+            "system",
+            format!("{AI_COMPRESSION_MARKER}\nsummary").as_str(),
+            1,
+        );
+        assert!(removed.is_none());
     }
 
     #[test]

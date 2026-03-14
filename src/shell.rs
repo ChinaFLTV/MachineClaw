@@ -216,7 +216,7 @@ impl ShellExecutor {
     }
 
     pub fn run(&self, spec: &CommandSpec) -> Result<CommandResult, AppError> {
-        self.run_with_effective_timeout(spec, self.timeout)
+        self.run_with_effective_timeout(spec, self.timeout, true)
     }
 
     pub fn run_with_timeout(
@@ -224,13 +224,22 @@ impl ShellExecutor {
         spec: &CommandSpec,
         timeout: Duration,
     ) -> Result<CommandResult, AppError> {
-        self.run_with_effective_timeout(spec, timeout)
+        self.run_with_effective_timeout(spec, timeout, true)
+    }
+
+    pub fn run_with_timeout_skip_write_confirm(
+        &self,
+        spec: &CommandSpec,
+        timeout: Duration,
+    ) -> Result<CommandResult, AppError> {
+        self.run_with_effective_timeout(spec, timeout, false)
     }
 
     fn run_with_effective_timeout(
         &self,
         spec: &CommandSpec,
         effective_timeout: Duration,
+        enforce_write_confirm: bool,
     ) -> Result<CommandResult, AppError> {
         let command = spec.command.trim();
         if command.is_empty() {
@@ -364,7 +373,7 @@ impl ShellExecutor {
             });
         }
 
-        if effective_mode == CommandMode::Write && self.write_confirm {
+        if effective_mode == CommandMode::Write && self.write_confirm && enforce_write_confirm {
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
                 return Err(AppError::Command(
                     i18n::command_write_confirm_non_interactive(),
@@ -645,6 +654,11 @@ pub fn note_interactive_input_wait(wait_started: Instant) {
 
 pub fn take_interactive_input_refresh_hint() -> bool {
     INTERACTIVE_INPUT_IDLE_REFRESH_HINT.swap(false, Ordering::SeqCst)
+}
+
+pub fn looks_like_write_command_hint(command: &str) -> bool {
+    let lowered = format!(" {} ", command.trim().to_ascii_lowercase());
+    looks_like_write_command(&lowered)
 }
 
 fn shell_command(command: &str) -> Command {
