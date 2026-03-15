@@ -962,7 +962,7 @@ impl AiClient {
                 forced_retry_used = true;
                 messages.push(ApiMessage {
                     role: "system".to_string(),
-                    content: Some("You are running locally with direct tool access. You MUST call run_shell_command at least once before giving a final answer for this request.".to_string()),
+                    content: Some("You are running locally with direct tool access. You MUST call at least one relevant tool before giving a final answer for this request. Do not default to run_shell_command when a matching MCP tool exists.".to_string()),
                     reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -1018,7 +1018,7 @@ impl AiClient {
                 });
                 messages.push(ApiMessage {
                     role: "system".to_string(),
-                    content: Some("Policy requires at least one local tool call in this round. You must call a tool now instead of giving a final text-only response.".to_string()),
+                    content: Some("Policy requires at least one tool call in this round. Choose the most relevant available tool now (MCP when it clearly matches, otherwise run_shell_command) instead of giving a final text-only response.".to_string()),
                     reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -1759,6 +1759,7 @@ impl AiClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finalize_without_tools(
         &self,
         mut messages: Vec<ApiMessage>,

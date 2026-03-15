@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    borrow::Cow,
+    collections::{BTreeMap, HashSet, VecDeque},
     fs,
     io::{self, IsTerminal, Stdout, Write},
     path::{Path, PathBuf},
@@ -42,7 +43,7 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 
 use crate::{
-    actions::{ActionOutcome, ActionServices, append_env_mode_prompt},
+    actions::{ActionOutcome, ActionServices, build_chat_system_prompt},
     ai::{
         ChatRoundEvent, ChatStreamEvent, ChatStreamEventKind, ChatToolResponse, ToolCallRequest,
         ToolUsePolicy,
@@ -69,6 +70,7 @@ const CONVERSATION_TAIL_PADDING_LINES: usize = 1;
 const THREAD_DOUBLE_CLICK_WINDOW_MS: u128 = 320;
 const STARTUP_SPLASH_MIN_DURATION_MS: u64 = 280;
 const STARTUP_SPLASH_FRAME_INTERVAL_MS: u64 = 56;
+const STREAM_RENDER_BATCH_CHARS: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiRole {
@@ -83,6 +85,12 @@ enum UiRole {
 struct UiMessage {
     role: UiRole,
     text: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionConversationCache {
+    messages: Vec<UiMessage>,
+    message_persisted: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -527,6 +535,8 @@ struct ChatUiState {
     status: String,
     messages: VecDeque<UiMessage>,
     message_persisted: VecDeque<bool>,
+    current_session_id: String,
+    session_conversation_cache: BTreeMap<String, SessionConversationCache>,
     conversation_lines: Vec<ConversationLine>,
     conversation_line_count: usize,
     conversation_wrap_width: u16,
@@ -560,11 +570,21 @@ impl ChatUiState {
     fn new(
         messages: Vec<UiMessage>,
         threads: Vec<SessionOverview>,
+        active_session_id: String,
         theme_idx: usize,
         prefs_path: PathBuf,
         cfg: &AppConfig,
         config_path: &Path,
     ) -> Self {
+        let initial_persisted = std::iter::repeat_n(true, messages.len()).collect::<Vec<_>>();
+        let mut session_conversation_cache = BTreeMap::new();
+        session_conversation_cache.insert(
+            active_session_id.clone(),
+            SessionConversationCache {
+                messages: messages.clone(),
+                message_persisted: initial_persisted.clone(),
+            },
+        );
         let mut state = Self {
             mode: UiMode::Chat,
             focus: FocusPanel::Input,
@@ -579,8 +599,10 @@ impl ChatUiState {
             skills_selected_row: 0,
             skill_doc_modal: None,
             status: ui_text_ready().to_string(),
-            message_persisted: std::iter::repeat_n(true, messages.len()).collect(),
+            message_persisted: initial_persisted.into(),
             messages: messages.into(),
+            current_session_id: active_session_id,
+            session_conversation_cache,
             conversation_lines: Vec::new(),
             conversation_line_count: 0,
             conversation_wrap_width: 0,
@@ -760,9 +782,57 @@ impl ChatUiState {
         true
     }
 
+    fn remember_current_session_messages(&mut self) {
+        let cache = SessionConversationCache {
+            messages: self.messages.iter().cloned().collect(),
+            message_persisted: self.message_persisted.iter().copied().collect(),
+        };
+        self.session_conversation_cache
+            .insert(self.current_session_id.clone(), cache);
+    }
+
+    fn set_active_session(&mut self, session_id: String) {
+        self.current_session_id = session_id;
+    }
+
+    fn session_messages_or_fallback(
+        &self,
+        session_id: &str,
+        fallback: Vec<UiMessage>,
+    ) -> Vec<(UiMessage, bool)> {
+        if let Some(cache) = self.session_conversation_cache.get(session_id) {
+            let mut persisted = cache.message_persisted.clone();
+            if persisted.len() < cache.messages.len() {
+                persisted.resize(cache.messages.len(), true);
+            } else if persisted.len() > cache.messages.len() {
+                persisted.truncate(cache.messages.len());
+            }
+            return cache.messages.iter().cloned().zip(persisted).collect();
+        }
+        fallback.into_iter().map(|item| (item, true)).collect()
+    }
+
+    fn drop_session_cache(&mut self, session_id: &str) {
+        self.session_conversation_cache.remove(session_id);
+    }
+
+    fn prune_session_cache_for_known_threads(&mut self) {
+        if self.threads.is_empty() {
+            return;
+        }
+        let mut keep = HashSet::<String>::new();
+        keep.insert(self.current_session_id.clone());
+        for item in &self.threads {
+            keep.insert(item.session_id.clone());
+        }
+        self.session_conversation_cache
+            .retain(|session_id, _| keep.contains(session_id));
+    }
+
     fn set_threads(&mut self, threads: Vec<SessionOverview>) {
         if self.threads.is_empty() {
             self.threads = threads;
+            self.prune_session_cache_for_known_threads();
             self.sync_thread_selection_to_active();
             return;
         }
@@ -782,6 +852,7 @@ impl ChatUiState {
         }
         ordered.extend(incoming);
         self.threads = ordered;
+        self.prune_session_cache_for_known_threads();
         if self.threads.is_empty() {
             self.thread_selected = 0;
             return;
@@ -832,8 +903,9 @@ impl ChatUiState {
             let header_label = role_tag(item.role).to_string();
             let header_label = trim_ui_text(header_label.as_str(), conversation_width.max(1));
             let header_width = text_display_width(header_label.as_str());
+            let render_source = conversation_render_source_text(item);
             let rendered = render_conversation_markdown(
-                item.text.trim(),
+                render_source.trim(),
                 live_streaming
                     && idx == last_message_idx
                     && matches!(item.role, UiRole::Assistant | UiRole::Thinking),
@@ -1056,8 +1128,7 @@ pub fn run_chat_tui(services: &mut ActionServices<'_>) -> Result<ActionOutcome, 
     }
     let (theme_idx, prefs_path) = load_theme_preferences()?;
     let base_system_prompt = render::load_prompt_template(services.assets_dir, "chat_system.md")?;
-    let system_prompt =
-        append_env_mode_prompt(&base_system_prompt, services.cfg.app.env_mode.as_str());
+    let system_prompt = build_chat_system_prompt(services, &base_system_prompt);
     let recent_messages = services
         .session
         .recent_messages_for_display(CHAT_RENDER_LIMIT);
@@ -1066,6 +1137,7 @@ pub fn run_chat_tui(services: &mut ActionServices<'_>) -> Result<ActionOutcome, 
     let mut state = ChatUiState::new(
         initial_messages,
         initial_threads,
+        services.session.session_id().to_string(),
         theme_idx,
         prefs_path,
         services.cfg,
@@ -1182,6 +1254,7 @@ fn run_startup_checks_in_tui(
     Ok(ai_connectivity_check)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     services: &mut ActionServices<'_>,
@@ -1384,7 +1457,7 @@ fn draw_startup_splash_frame(frame: &mut Frame<'_>, palette: ThemePalette, tick:
         area,
     );
     let splash = centered_rect(area, 72, 13);
-    let pulse = tick % 2 == 0;
+    let pulse = tick.is_multiple_of(2);
     let border_color = if pulse {
         palette.border_focus
     } else {
@@ -2719,8 +2792,10 @@ fn switch_selected_thread(
     if state.threads.is_empty() || state.thread_selected >= state.threads.len() {
         return Ok(());
     }
+    state.remember_current_session_messages();
     let target = state.threads[state.thread_selected].session_id.clone();
     let switched = services.session.switch_session_by_query(&target)?;
+    state.set_active_session(switched.session_id.clone());
     state.pending_thread_action_menu = None;
     state.pending_thread_rename = None;
     state.pending_thread_delete_confirm = None;
@@ -2737,9 +2812,14 @@ fn switch_selected_thread(
     let current = services
         .session
         .recent_messages_for_display(CHAT_RENDER_LIMIT);
-    for item in recent_messages_to_ui_messages(&current) {
-        state.push_persisted(item.role, item.text);
+    let restored = state.session_messages_or_fallback(
+        switched.session_id.as_str(),
+        recent_messages_to_ui_messages(&current),
+    );
+    for (item, persisted) in restored {
+        state.push_with_persisted(item.role, item.text, persisted);
     }
+    state.remember_current_session_messages();
     state.set_threads(services.session.list_sessions().unwrap_or_default());
     services.session.persist()?;
     Ok(())
@@ -3035,14 +3115,17 @@ fn delete_thread_session_by_index(
         state.status = ui_text_thread_not_found().to_string();
         return Ok(());
     };
+    state.remember_current_session_messages();
     let previous_active_id = services.session.session_id().to_string();
     let active_after = services.session.delete_session_by_id(&target.session_id)?;
+    state.drop_session_cache(&target.session_id);
     state.pending_thread_rename = None;
     state.pending_thread_action_menu = None;
     state.pending_thread_delete_confirm = None;
     state.pending_thread_metadata_modal = None;
     state.set_threads(services.session.list_sessions().unwrap_or_default());
     if previous_active_id != services.session.session_id() {
+        state.set_active_session(active_after.session_id.clone());
         state.clear_conversation_viewport_only();
         state.push(
             UiRole::System,
@@ -3055,9 +3138,14 @@ fn delete_thread_session_by_index(
         let current = services
             .session
             .recent_messages_for_display(CHAT_RENDER_LIMIT);
-        for item in recent_messages_to_ui_messages(&current) {
-            state.push_persisted(item.role, item.text);
+        let restored = state.session_messages_or_fallback(
+            active_after.session_id.as_str(),
+            recent_messages_to_ui_messages(&current),
+        );
+        for (item, persisted) in restored {
+            state.push_with_persisted(item.role, item.text, persisted);
         }
+        state.remember_current_session_messages();
     }
     state.status = format!("{}: {}", ui_text_thread_deleted(), target.session_name);
     Ok(())
@@ -3267,6 +3355,11 @@ fn submit_chat_message(
 ) -> Result<bool, AppError> {
     state.mode = UiMode::Chat;
     state.pending_choice = None;
+    if state.ai_live.is_some() {
+        stage_blocked_pending_message(state, &message);
+        mark_pending_ai_send_blocked(state);
+        return Ok(false);
+    }
     if let Some(command) = parse_builtin_command(&message) {
         if execute_builtin_command(command, services, state)? {
             return Ok(true);
@@ -3283,9 +3376,7 @@ fn submit_chat_message(
         return Ok(false);
     }
     if state.ai_connectivity_checking {
-        state.input.text = message.clone();
-        state.input.cursor_char = state.input.char_count();
-        state.input.view_char_offset = 0;
+        stage_blocked_pending_message(state, &message);
         state.status = ui_text_status_ai_connectivity_pending_send_blocked().to_string();
         let already_reported = state.messages.back().is_some_and(|item| {
             item.role == UiRole::System
@@ -3406,6 +3497,22 @@ fn submit_chat_message(
     Ok(false)
 }
 
+fn stage_blocked_pending_message(state: &mut ChatUiState, message: &str) {
+    state.input.text = message.to_string();
+    state.input.cursor_char = state.input.char_count();
+    state.input.view_char_offset = 0;
+}
+
+fn mark_pending_ai_send_blocked(state: &mut ChatUiState) {
+    state.status = ui_text_status_ai_pending_send_blocked().to_string();
+    let already_reported = state.messages.back().is_some_and(|item| {
+        item.role == UiRole::System && item.text == ui_text_status_ai_pending_send_blocked()
+    });
+    if !already_reported {
+        state.push(UiRole::System, ui_text_status_ai_pending_send_blocked());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_chat_worker(
     ai: crate::ai::AiClient,
@@ -3484,20 +3591,23 @@ fn wait_chat_worker_result(
     let mut thinking_rendered_in_ui = false;
     let mut last_round_content = String::new();
     let mut saw_stream_events = false;
+    let mut last_idle_draw = Instant::now();
     while finished.is_none() {
+        let mut ui_dirty = false;
+        let mut stream_draw_happened = false;
         loop {
             match event_rx.try_recv() {
                 Ok(PendingAiEvent::Round(event)) => {
+                    ui_dirty = true;
                     if let Some(thinking) = event.thinking.as_deref()
                         && !thinking.trim().is_empty()
+                        && !event.streamed_thinking
                     {
-                        if !event.streamed_thinking {
-                            state.push(UiRole::Thinking, thinking.trim());
-                            thinking_rendered_in_ui = true;
-                            state.add_live_token_estimate(estimate_tokens_from_text_delta(
-                                thinking.trim(),
-                            ));
-                        }
+                        state.push(UiRole::Thinking, thinking.trim());
+                        thinking_rendered_in_ui = true;
+                        state.add_live_token_estimate(estimate_tokens_from_text_delta(
+                            thinking.trim(),
+                        ));
                     }
                     if !event.content.trim().is_empty() {
                         last_round_content = event.content.trim().to_string();
@@ -3511,6 +3621,8 @@ fn wait_chat_worker_result(
                 }
                 Ok(PendingAiEvent::Stream(event)) => match event.kind {
                     ChatStreamEventKind::Content => {
+                        ui_dirty = true;
+                        stream_draw_happened = true;
                         saw_stream_events = true;
                         state.add_live_token_estimate(estimate_tokens_from_text_delta(&event.text));
                         render_stream_event_typewriter(
@@ -3523,6 +3635,8 @@ fn wait_chat_worker_result(
                         )?;
                     }
                     ChatStreamEventKind::Thinking => {
+                        ui_dirty = true;
+                        stream_draw_happened = true;
                         saw_stream_events = true;
                         if !event.text.is_empty() {
                             thinking_rendered_in_ui = true;
@@ -3539,6 +3653,7 @@ fn wait_chat_worker_result(
                     }
                 },
                 Ok(PendingAiEvent::ToolCall { request, reply_tx }) => {
+                    ui_dirty = true;
                     if let Some(live) = state.ai_live.as_mut() {
                         live.tool_calls = live.tool_calls.saturating_add(1);
                         live.last_tool_label = format_live_tool_label(&request.name);
@@ -3548,17 +3663,22 @@ fn wait_chat_worker_result(
                     let _ = reply_tx.send(payload);
                 }
                 Ok(PendingAiEvent::Finished(result)) => {
+                    ui_dirty = true;
                     finished = Some(result);
                     break;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    ui_dirty = true;
                     finished = Some(Err(ui_text_ai_channel_closed().to_string()));
                     break;
                 }
             }
         }
-        draw_once(terminal, services, state)?;
+        if (!stream_draw_happened && ui_dirty) || last_idle_draw.elapsed() >= Duration::from_millis(120) {
+            draw_once(terminal, services, state)?;
+            last_idle_draw = Instant::now();
+        }
         if finished.is_some() {
             break;
         }
@@ -3567,19 +3687,29 @@ fn wait_chat_worker_result(
         {
             continue;
         }
+        let mut redraw_after_input = false;
         match event::read()
             .map_err(|err| AppError::Command(format!("failed to read event: {err}")))?
         {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                redraw_after_input = true;
                 if handle_pending_ai_key_event(key, terminal, services, state, cancel_requested)? {
                     break;
                 }
             }
-            Event::Mouse(mouse) => handle_pending_ai_mouse_event(mouse, terminal, services, state)?,
+            Event::Mouse(mouse) => {
+                redraw_after_input = true;
+                handle_pending_ai_mouse_event(mouse, terminal, services, state)?
+            }
             Event::Resize(_, _) => {
                 handle_tui_resize_redraw(terminal, services, state)?;
+                last_idle_draw = Instant::now();
             }
             _ => {}
+        }
+        if redraw_after_input {
+            draw_once(terminal, services, state)?;
+            last_idle_draw = Instant::now();
         }
     }
     Ok(PendingAiWaitOutcome {
@@ -3605,16 +3735,55 @@ fn render_stream_event_typewriter(
     if text.is_empty() {
         return Ok(());
     }
+    let mut batch = String::new();
+    let mut batch_chars = 0usize;
     for ch in text.chars() {
         if cancel_requested.load(Ordering::SeqCst) {
             break;
         }
-        let mut buf = [0u8; 4];
-        state.push_stream_chunk(role, ch.encode_utf8(&mut buf), None);
-        draw_once(terminal, services, state)?;
-        pump_pending_ai_input_events(terminal, services, state, cancel_requested)?;
+        batch.push(ch);
+        batch_chars += 1;
+        let should_flush = batch_chars >= STREAM_RENDER_BATCH_CHARS || ch == '\n';
+        if should_flush {
+            flush_stream_batch(
+                terminal,
+                services,
+                state,
+                role,
+                batch.as_str(),
+                cancel_requested,
+            )?;
+            batch.clear();
+            batch_chars = 0;
+        }
+    }
+    if !batch.is_empty() {
+        flush_stream_batch(
+            terminal,
+            services,
+            state,
+            role,
+            batch.as_str(),
+            cancel_requested,
+        )?;
     }
     Ok(())
+}
+
+fn flush_stream_batch(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+    role: UiRole,
+    chunk: &str,
+    cancel_requested: &AtomicBool,
+) -> Result<(), AppError> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    state.push_stream_chunk(role, chunk, None);
+    draw_once(terminal, services, state)?;
+    pump_pending_ai_input_events(terminal, services, state, cancel_requested)
 }
 
 fn pump_pending_ai_input_events(
@@ -3694,34 +3863,12 @@ fn handle_pending_ai_key_event(
         state.cycle_focus_backward();
         return Ok(false);
     }
-    if matches!(
-        key.code,
-        KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::PageUp
-            | KeyCode::PageDown
-            | KeyCode::Home
-            | KeyCode::End
-    ) {
-        let viewport = conversation_viewport_height(terminal)?;
-        match key.code {
-            KeyCode::Up => state.scroll_by(-1, viewport),
-            KeyCode::Down => state.scroll_by(1, viewport),
-            KeyCode::PageUp => state.scroll_by(-(viewport as i16), viewport),
-            KeyCode::PageDown => state.scroll_by(viewport as i16, viewport),
-            KeyCode::Home => {
-                state.follow_tail = false;
-                state.conversation_scroll = 0;
-            }
-            KeyCode::End => {
-                state.follow_tail = true;
-                state.ensure_conversation_cache();
-                state.clamp_scroll(viewport);
-            }
-            _ => {}
-        }
+    match state.focus {
+        FocusPanel::Nav => handle_pending_ai_nav_key(key, services, state),
+        FocusPanel::Threads => handle_pending_ai_threads_key(key, state),
+        FocusPanel::Conversation => handle_conversation_key(key, terminal, services, state),
+        FocusPanel::Input => handle_pending_ai_input_key(key, state),
     }
-    Ok(false)
 }
 
 fn handle_pending_ai_mouse_event(
@@ -3748,68 +3895,114 @@ fn handle_pending_ai_mouse_event(
         return Ok(());
     }
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-        if let Some(button) = conversation_copy_button_data(state, layout)
-            && rect_contains(button.rect, mouse.column, mouse.row)
-        {
-            if let Some(message) = state.messages.get(button.message_index) {
-                match copy_text_to_clipboard(&message.text) {
-                    Ok(()) => state.status = ui_text_message_copy_success().to_string(),
-                    Err(err) => {
-                        state.status = format!(
-                            "{}: {}",
-                            ui_text_message_copy_failed(),
-                            trim_ui_text(&i18n::localize_error(&err), 84)
-                        );
-                    }
-                }
-            } else {
-                state.status = ui_text_message_copy_failed().to_string();
+        if rect_contains(layout.nav, mouse.column, mouse.row) {
+            let nav_idx = mouse.row.saturating_sub(layout.nav.y.saturating_add(1)) as usize;
+            if nav_idx == 0 {
+                state.focus = FocusPanel::Nav;
+                state.nav_selected = 0;
+                state.status = ui_text_status_ai_pending_session_switch_blocked().to_string();
+                return Ok(());
             }
-            return Ok(());
         }
-        if let Some(button) = conversation_delete_button_data(state, layout)
-            && rect_contains(button.rect, mouse.column, mouse.row)
-        {
-            state.pending_delete_confirm = Some(DeleteMessageConfirmState {
-                message_index: button.message_index,
-                selected: 1,
-            });
-            state.status = ui_text_message_delete_confirm_prompt().to_string();
+        if rect_contains(layout.threads_body, mouse.column, mouse.row) {
+            state.focus = FocusPanel::Threads;
+            let row = mouse.row.saturating_sub(layout.threads_body.y) as usize;
+            if row < state.threads.len() {
+                state.thread_selected = row;
+            }
+            state.status = ui_text_status_ai_pending_session_switch_blocked().to_string();
             return Ok(());
         }
     }
-    match mouse.kind {
-        MouseEventKind::Moved
-            if rect_contains(layout.conversation_body, mouse.column, mouse.row) =>
-        {
-            refresh_hovered_message_from_mouse(state, layout, mouse);
+    handle_mouse_event(mouse, terminal, services, state)
+}
+
+fn handle_pending_ai_nav_key(
+    key: KeyEvent,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+) -> Result<bool, AppError> {
+    match key.code {
+        KeyCode::Up => state.nav_selected = state.nav_selected.saturating_sub(1),
+        KeyCode::Down => state.nav_selected = (state.nav_selected + 1).min(NAV_ITEMS_COUNT - 1),
+        KeyCode::Enter => {
+            if state.nav_selected == 0 {
+                state.status = ui_text_status_ai_pending_session_switch_blocked().to_string();
+            } else {
+                activate_nav_item(services, state)?;
+            }
         }
-        MouseEventKind::Moved => {
-            state.hovered_message_idx = None;
-        }
-        MouseEventKind::ScrollUp if rect_contains(layout.conversation, mouse.column, mouse.row) => {
-            let viewport = layout.conversation_body.height.max(1);
-            state.scroll_by(-2, viewport);
-            state.focus = FocusPanel::Conversation;
-            refresh_hovered_message_from_mouse(state, layout, mouse);
-        }
-        MouseEventKind::ScrollDown
-            if rect_contains(layout.conversation, mouse.column, mouse.row) =>
-        {
-            let viewport = layout.conversation_body.height.max(1);
-            state.scroll_by(2, viewport);
-            state.focus = FocusPanel::Conversation;
-            refresh_hovered_message_from_mouse(state, layout, mouse);
-        }
-        MouseEventKind::Down(MouseButton::Left)
-            if rect_contains(layout.conversation, mouse.column, mouse.row) =>
-        {
-            state.focus = FocusPanel::Conversation;
-            refresh_hovered_message_from_mouse(state, layout, mouse);
+        KeyCode::Char('/') if state.mode == UiMode::Chat => {
+            state.focus = FocusPanel::Input;
+            state.input.clear();
+            state.input.insert_char('/');
         }
         _ => {}
     }
-    Ok(())
+    Ok(false)
+}
+
+fn handle_pending_ai_threads_key(
+    key: KeyEvent,
+    state: &mut ChatUiState,
+) -> Result<bool, AppError> {
+    match key.code {
+        KeyCode::Up => {
+            state.thread_selected = state.thread_selected.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            if !state.threads.is_empty() {
+                state.thread_selected = (state.thread_selected + 1).min(state.threads.len() - 1);
+            }
+        }
+        KeyCode::Enter => {
+            state.status = ui_text_status_ai_pending_session_switch_blocked().to_string();
+        }
+        KeyCode::Char('/') if state.mode == UiMode::Chat => {
+            state.focus = FocusPanel::Input;
+            state.input.clear();
+            state.input.insert_char('/');
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_pending_ai_input_key(key: KeyEvent, state: &mut ChatUiState) -> Result<bool, AppError> {
+    if state.mode != UiMode::Chat {
+        if key.code == KeyCode::Esc {
+            state.focus = FocusPanel::Conversation;
+            state.status = ui_text_focus_hint(state.focus).to_string();
+        }
+        return Ok(false);
+    }
+    match key.code {
+        KeyCode::Esc => {
+            state.input.clear();
+        }
+        KeyCode::Left => state.input.move_left(),
+        KeyCode::Right => state.input.move_right(),
+        KeyCode::Home => state.input.move_home(),
+        KeyCode::End => state.input.move_end(),
+        KeyCode::Backspace => state.input.backspace(),
+        KeyCode::Delete => state.input.delete(),
+        KeyCode::Up => {
+            state.focus = FocusPanel::Conversation;
+            state.status = ui_text_focus_hint(state.focus).to_string();
+        }
+        KeyCode::Enter => {
+            if !state.input.text.trim().is_empty() {
+                mark_pending_ai_send_blocked(state);
+            }
+        }
+        KeyCode::Char(ch) => {
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                state.input.insert_char(ch);
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
 }
 
 fn detect_pending_choice(reply: &str) -> Option<PendingChoice> {
@@ -3945,8 +4138,10 @@ fn execute_builtin_command(
             state.push(UiRole::System, services.mcp.summary());
         }
         BuiltinCommand::New => {
+            state.remember_current_session_messages();
             services.session.start_new_session_with_new_file()?;
             services.session.persist()?;
+            state.set_active_session(services.session.session_id().to_string());
             state.clear_conversation_viewport_only();
             state.push(
                 UiRole::System,
@@ -3955,6 +4150,7 @@ fn execute_builtin_command(
                     services.session.file_path(),
                 ),
             );
+            state.remember_current_session_messages();
             state.set_threads(services.session.list_sessions().unwrap_or_default());
         }
         BuiltinCommand::Clear => {
@@ -3982,6 +4178,8 @@ fn execute_builtin_command(
         }
         BuiltinCommand::Change(query) => match services.session.switch_session_by_query(&query) {
             Ok(switched) => {
+                state.remember_current_session_messages();
+                state.set_active_session(switched.session_id.clone());
                 state.clear_conversation_viewport_only();
                 state.push(
                     UiRole::System,
@@ -3994,9 +4192,14 @@ fn execute_builtin_command(
                 let current = services
                     .session
                     .recent_messages_for_display(CHAT_RENDER_LIMIT);
-                for item in recent_messages_to_ui_messages(&current) {
-                    state.push_persisted(item.role, item.text);
+                let restored = state.session_messages_or_fallback(
+                    switched.session_id.as_str(),
+                    recent_messages_to_ui_messages(&current),
+                );
+                for (item, persisted) in restored {
+                    state.push_with_persisted(item.role, item.text, persisted);
                 }
+                state.remember_current_session_messages();
                 state.set_threads(services.session.list_sessions().unwrap_or_default());
                 services.session.persist()?;
             }
@@ -4868,6 +5071,7 @@ fn execute_mcp_tool_call_tui(
             "ok": false,
             "tool": tool_call.name,
             "error": err.to_string(),
+            "troubleshooting": mcp_troubleshooting_hints_tui(),
         })
         .to_string(),
     };
@@ -4883,6 +5087,14 @@ fn execute_mcp_tool_call_tui(
     );
     let _ = services.session.persist();
     payload
+}
+
+fn mcp_troubleshooting_hints_tui() -> Vec<&'static str> {
+    vec![
+        "Check ai.tools.mcp.enabled and confirm target MCP server is enabled in config.",
+        "Verify MCP endpoint/auth/header settings; for HTTP mode prefer /mcp over legacy /sse paths.",
+        "Run /mcps to inspect server and tool availability, then retry with valid JSON arguments.",
+    ]
 }
 
 fn format_live_tool_label(name: &str) -> String {
@@ -5761,15 +5973,64 @@ fn conversation_text(state: &ChatUiState, palette: ThemePalette) -> Text<'static
                 )));
             }
             ConversationLineKind::Body => {
-                lines.push(Line::from(Span::styled(
-                    line.text.clone(),
-                    Style::default().fg(role_body_color(line.role, palette)),
-                )));
+                lines.push(styled_bubble_body_line(
+                    line.text.as_str(),
+                    line.role,
+                    palette,
+                ));
             }
             ConversationLineKind::Spacer => lines.push(Line::from(String::new())),
         }
     }
     Text::from(lines)
+}
+
+fn styled_bubble_body_line(text: &str, role: UiRole, palette: ThemePalette) -> Line<'static> {
+    let border_char = '│';
+    let Some(left_idx) = text.find(border_char) else {
+        return Line::from(Span::styled(
+            text.to_string(),
+            Style::default().fg(role_body_color(role, palette)),
+        ));
+    };
+    let Some(right_idx) = text.rfind(border_char) else {
+        return Line::from(Span::styled(
+            text.to_string(),
+            Style::default().fg(role_body_color(role, palette)),
+        ));
+    };
+    if left_idx >= right_idx {
+        return Line::from(Span::styled(
+            text.to_string(),
+            Style::default().fg(role_body_color(role, palette)),
+        ));
+    }
+    let border_len = border_char.len_utf8();
+    let leading = &text[..left_idx];
+    let middle = &text[left_idx + border_len..right_idx];
+    let trailing = &text[right_idx + border_len..];
+    Line::from(vec![
+        Span::styled(
+            leading.to_string(),
+            Style::default().fg(role_body_color(role, palette)),
+        ),
+        Span::styled(
+            border_char.to_string(),
+            Style::default().fg(role_border_color(role, palette)),
+        ),
+        Span::styled(
+            middle.to_string(),
+            Style::default().fg(role_body_color(role, palette)),
+        ),
+        Span::styled(
+            border_char.to_string(),
+            Style::default().fg(role_border_color(role, palette)),
+        ),
+        Span::styled(
+            trailing.to_string(),
+            Style::default().fg(role_body_color(role, palette)),
+        ),
+    ])
 }
 
 fn draw_conversation_hover_copy_button(
@@ -9717,6 +9978,62 @@ fn recent_messages_to_ui_messages(items: &[SessionMessage]) -> Vec<UiMessage> {
         .collect()
 }
 
+fn conversation_render_source_text(item: &UiMessage) -> Cow<'_, str> {
+    if item.role != UiRole::Tool {
+        return Cow::Borrowed(item.text.as_str());
+    }
+    format_persisted_tool_message_for_display(item.text.as_str())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PersistedToolMessageParts<'a> {
+    tool_call_id: &'a str,
+    function: &'a str,
+    args: &'a str,
+    result: &'a str,
+}
+
+fn parse_persisted_tool_message(raw: &str) -> Option<PersistedToolMessageParts<'_>> {
+    let body = raw.trim();
+    let rest = body.strip_prefix("tool_call_id=")?;
+    let (tool_call_id, rest) = rest.split_once(" function=")?;
+    let (function, rest) = rest.split_once(" args=")?;
+    let (args, result) = rest.rsplit_once(" result=")?;
+    Some(PersistedToolMessageParts {
+        tool_call_id: tool_call_id.trim(),
+        function: function.trim(),
+        args: args.trim(),
+        result: result.trim(),
+    })
+}
+
+fn tool_payload_to_display_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return trimmed.to_string();
+    };
+    match value {
+        serde_json::Value::String(text) => text,
+        other => serde_json::to_string_pretty(&other).unwrap_or_else(|_| trimmed.to_string()),
+    }
+}
+
+fn format_persisted_tool_message_for_display(raw: &str) -> Cow<'_, str> {
+    let Some(parts) = parse_persisted_tool_message(raw) else {
+        return Cow::Borrowed(raw);
+    };
+    Cow::Owned(format!(
+        "tool_call_id={}\nfunction={}\nargs={}\nresult={}",
+        parts.tool_call_id,
+        parts.function,
+        tool_payload_to_display_text(parts.args),
+        tool_payload_to_display_text(parts.result)
+    ))
+}
+
 fn char_to_byte_idx(text: &str, char_idx: usize) -> usize {
     if char_idx == 0 {
         return 0;
@@ -9774,11 +10091,115 @@ fn normalize_conversation_line(text: &str) -> String {
 }
 
 fn render_conversation_markdown(raw: &str, streaming_inflight: bool) -> String {
-    let rendered = render::render_markdown_for_terminal(raw, false);
-    if streaming_inflight && rendered.trim().is_empty() && !raw.trim().is_empty() {
+    if streaming_inflight && !might_need_markdown_render(raw) {
         return normalize_conversation_markdown_for_bubble(raw);
     }
+    let rendered = render::render_markdown_for_terminal(raw, false);
+    if streaming_inflight {
+        if rendered.trim().is_empty() && !raw.trim().is_empty() {
+            return normalize_conversation_markdown_for_bubble(raw);
+        }
+        if has_unfinished_inline_markdown_link(raw) {
+            return normalize_conversation_markdown_for_bubble(raw);
+        }
+    }
     normalize_conversation_markdown_for_bubble(&rendered)
+}
+
+fn might_need_markdown_render(text: &str) -> bool {
+    text.bytes().any(|b| {
+        matches!(
+            b,
+            b'`' | b'*'
+                | b'_'
+                | b'['
+                | b']'
+                | b'('
+                | b')'
+                | b'#'
+                | b'>'
+                | b'!'
+                | b'~'
+                | b'|'
+                | b'<'
+                | b'-'
+        )
+    })
+}
+
+fn has_unfinished_inline_markdown_link(text: &str) -> bool {
+    if !text.contains("](") {
+        return false;
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() < 4 {
+        return false;
+    }
+    let mut label_stack = Vec::<usize>::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' {
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        if ch == '`' {
+            let mut tick_len = 1usize;
+            while i + tick_len < chars.len() && chars[i + tick_len] == '`' {
+                tick_len += 1;
+            }
+            i += tick_len;
+            while i < chars.len() {
+                if chars[i] == '\\' {
+                    i = (i + 2).min(chars.len());
+                    continue;
+                }
+                let mut closing_ticks = 0usize;
+                while i + closing_ticks < chars.len() && chars[i + closing_ticks] == '`' {
+                    closing_ticks += 1;
+                }
+                if closing_ticks >= tick_len {
+                    i += tick_len;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        match ch {
+            '[' => label_stack.push(i),
+            ']' => {
+                let has_label = label_stack.pop().is_some();
+                let starts_link = i + 1 < chars.len() && chars[i + 1] == '(';
+                if has_label && starts_link {
+                    let mut depth = 1usize;
+                    i += 2;
+                    while i < chars.len() {
+                        let current = chars[i];
+                        if current == '\\' {
+                            i = (i + 2).min(chars.len());
+                            continue;
+                        }
+                        if current == '(' {
+                            depth += 1;
+                        } else if current == ')' {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                    if depth > 0 {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 fn normalize_conversation_markdown_for_bubble(rendered: &str) -> String {
@@ -10628,6 +11049,18 @@ fn ui_text_status_ai_connectivity_pending_send_blocked() -> &'static str {
         "AI connectivity check in progress, message not sent yet",
     )
 }
+fn ui_text_status_ai_pending_send_blocked() -> &'static str {
+    zh_or_en(
+        "AI 正在处理中，可继续输入与浏览，当前消息暂未发送",
+        "AI is still processing; you can keep typing and browsing, but this message is not sent yet",
+    )
+}
+fn ui_text_status_ai_pending_session_switch_blocked() -> &'static str {
+    zh_or_en(
+        "AI 正在处理中，暂不允许新建或切换会话",
+        "AI is still processing; creating or switching sessions is temporarily disabled",
+    )
+}
 fn ui_text_status_ai_connectivity_ok() -> &'static str {
     zh_or_en("AI 连通性检查通过", "AI connectivity check passed")
 }
@@ -10685,6 +11118,7 @@ model = "test-model"
         ChatUiState::new(
             Vec::new(),
             Vec::new(),
+            "session-test".to_string(),
             0,
             PathBuf::from("/tmp/ui-preferences.json"),
             &cfg,
@@ -10820,6 +11254,49 @@ model = "test-model"
             .collect::<Vec<_>>();
         assert_eq!(order, vec!["a", "b", "c"]);
         assert_eq!(state.thread_selected, 1);
+    }
+
+    #[test]
+    fn set_threads_prunes_orphaned_session_cache_entries() {
+        let mut state = new_state();
+        state.set_active_session("a".to_string());
+        state.threads = vec![mock_overview("a", "A", true), mock_overview("b", "B", false)];
+        state.session_conversation_cache.insert(
+            "a".to_string(),
+            SessionConversationCache {
+                messages: vec![UiMessage {
+                    role: UiRole::System,
+                    text: "active".to_string(),
+                }],
+                message_persisted: vec![true],
+            },
+        );
+        state.session_conversation_cache.insert(
+            "b".to_string(),
+            SessionConversationCache {
+                messages: vec![UiMessage {
+                    role: UiRole::System,
+                    text: "known".to_string(),
+                }],
+                message_persisted: vec![true],
+            },
+        );
+        state.session_conversation_cache.insert(
+            "orphan".to_string(),
+            SessionConversationCache {
+                messages: vec![UiMessage {
+                    role: UiRole::System,
+                    text: "stale".to_string(),
+                }],
+                message_persisted: vec![true],
+            },
+        );
+
+        state.set_threads(vec![mock_overview("a", "A", true), mock_overview("b", "B", false)]);
+
+        assert!(state.session_conversation_cache.contains_key("a"));
+        assert!(state.session_conversation_cache.contains_key("b"));
+        assert!(!state.session_conversation_cache.contains_key("orphan"));
     }
 
     #[test]
@@ -11100,6 +11577,29 @@ model = "test-model"
     }
 
     #[test]
+    fn conversation_body_side_borders_use_same_border_color_as_top_and_bottom() {
+        let mut state = new_state();
+        state.set_conversation_wrap_width(80);
+        state.push(UiRole::Tool, "tool output");
+        state.ensure_conversation_cache();
+
+        let rendered = conversation_text(&state, palette_by_index(0));
+        let Some((body_idx, _)) = state
+            .conversation_lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.kind == ConversationLineKind::Body)
+        else {
+            panic!("body line not found");
+        };
+        let spans = &rendered.lines[body_idx].spans;
+        assert!(spans.len() >= 4);
+        let expected = Some(role_border_color(UiRole::Tool, palette_by_index(0)));
+        assert_eq!(spans[1].style.fg, expected);
+        assert_eq!(spans[3].style.fg, expected);
+    }
+
+    #[test]
     fn conversation_copy_button_aligns_to_hovered_user_message() {
         let mut state = new_state();
         state.push(UiRole::User, "hello");
@@ -11144,6 +11644,42 @@ model = "test-model"
         assert_eq!(delete.message_index, 0);
         assert_eq!(delete.rect.y, copy.rect.y);
         assert!(delete.rect.x > copy.rect.x);
+    }
+
+    #[test]
+    fn pending_ai_send_block_notice_is_deduplicated_and_keeps_input() {
+        let mut state = new_state();
+        stage_blocked_pending_message(&mut state, "next message");
+        mark_pending_ai_send_blocked(&mut state);
+        mark_pending_ai_send_blocked(&mut state);
+
+        assert_eq!(state.input.text, "next message");
+        let notices = state
+            .messages
+            .iter()
+            .filter(|item| {
+                item.role == UiRole::System && item.text == ui_text_status_ai_pending_send_blocked()
+            })
+            .count();
+        assert_eq!(notices, 1);
+    }
+
+    #[test]
+    fn pending_ai_input_enter_does_not_send_and_preserves_text() {
+        let mut state = new_state();
+        state.mode = UiMode::Chat;
+        state.input.text = "queued question".to_string();
+        state.input.cursor_char = state.input.char_count();
+        state.focus = FocusPanel::Input;
+
+        let handled = handle_pending_ai_input_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+        )
+        .expect("pending ai input handler should not fail");
+        assert!(!handled);
+        assert_eq!(state.input.text, "queued question");
+        assert_eq!(state.status, ui_text_status_ai_pending_send_blocked());
     }
 
     #[test]
@@ -11197,6 +11733,55 @@ model = "test-model"
             .collect::<Vec<_>>();
         assert_eq!(thinking_messages.len(), 1);
         assert_eq!(thinking_messages[0].text, "step-1 + step-2");
+    }
+
+    #[test]
+    fn session_cache_restores_transient_thinking_messages() {
+        let mut state = new_state();
+        state.set_active_session("session-a".to_string());
+        state.push_persisted(UiRole::User, "u1");
+        state.push(UiRole::Thinking, "step-a");
+        state.remember_current_session_messages();
+
+        state.set_active_session("session-b".to_string());
+        state.clear_conversation_viewport_only();
+        state.push_persisted(UiRole::Assistant, "b1");
+
+        let restored = state.session_messages_or_fallback(
+            "session-a",
+            vec![UiMessage {
+                role: UiRole::User,
+                text: "fallback".to_string(),
+            }],
+        );
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].0.role, UiRole::User);
+        assert!(restored[0].1);
+        assert_eq!(restored[1].0.role, UiRole::Thinking);
+        assert!(!restored[1].1);
+    }
+
+    #[test]
+    fn persisted_tool_message_is_rendered_with_multiline_fields() {
+        let item = UiMessage {
+            role: UiRole::Tool,
+            text: r#"tool_call_id=call_1 function=run_shell_command args={"command":"pwd"} result={"ok":true,"stdout":"line1\nline2"}"#.to_string(),
+        };
+        let rendered = conversation_render_source_text(&item).into_owned();
+        assert!(rendered.contains("tool_call_id=call_1\nfunction=run_shell_command"));
+        assert!(rendered.contains("\"command\": \"pwd\""));
+        assert!(rendered.contains("\"stdout\": \"line1\\nline2\""));
+    }
+
+    #[test]
+    fn persisted_tool_message_parsing_uses_last_result_delimiter() {
+        let item = UiMessage {
+            role: UiRole::Tool,
+            text: r#"tool_call_id=call_9 function=run_shell_command args={"command":"echo \" result=marker\""} result={"ok":true,"stdout":"done"}"#.to_string(),
+        };
+        let rendered = conversation_render_source_text(&item).into_owned();
+        assert!(rendered.contains("\"command\": \"echo \\\" result=marker\\\"\""));
+        assert!(rendered.contains("\"stdout\": \"done\""));
     }
 
     #[test]
@@ -11260,6 +11845,36 @@ model = "test-model"
         assert!(finalized.contains("title"));
         assert!(finalized.contains("• item") || finalized.contains("- item"));
         assert_eq!(inflight, finalized);
+    }
+
+    #[test]
+    fn streaming_inflight_plain_text_uses_normalized_raw_fast_path() {
+        let raw = "plain stream line 1\nplain stream line 2";
+        let inflight = render_conversation_markdown(raw, true);
+        let expected = normalize_conversation_markdown_for_bubble(raw);
+        assert_eq!(inflight, expected);
+    }
+
+    #[test]
+    fn streaming_inflight_incomplete_inline_link_keeps_raw_text() {
+        let raw = "visit [OpenAI](https://platform.openai.com/doc";
+        let inflight = render_conversation_markdown(raw, true);
+        assert!(inflight.contains("[OpenAI](https://platform.openai.com/doc"));
+    }
+
+    #[test]
+    fn streaming_inflight_complete_inline_link_still_uses_markdown_renderer() {
+        let raw = "visit [OpenAI](https://platform.openai.com/docs)";
+        let inflight = render_conversation_markdown(raw, true);
+        assert!(inflight.contains("OpenAI"));
+        assert!(!inflight.contains("[OpenAI]("));
+    }
+
+    #[test]
+    fn unfinished_inline_link_detector_ignores_code_span() {
+        assert!(!has_unfinished_inline_markdown_link(
+            "`[OpenAI](https://platform.openai.com/doc`"
+        ));
     }
 
     #[test]

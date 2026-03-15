@@ -1411,7 +1411,8 @@ fn execute_mcp_tool_call(
             let payload = json!({
                 "ok": false,
                 "tool": tool_call.name,
-                "error": err.to_string()
+                "error": err.to_string(),
+                "troubleshooting": mcp_troubleshooting_hints()
             })
             .to_string();
             services.session.add_tool_message(
@@ -1428,6 +1429,14 @@ fn execute_mcp_tool_call(
             payload
         }
     }
+}
+
+fn mcp_troubleshooting_hints() -> Vec<&'static str> {
+    vec![
+        "Check ai.tools.mcp.enabled and confirm target MCP server is enabled in config.",
+        "Verify MCP endpoint/auth/header settings; for HTTP mode prefer /mcp over legacy /sse paths.",
+        "Run /mcps to inspect server and tool availability, then retry with valid JSON arguments.",
+    ]
 }
 
 fn parse_mode(mode: Option<&str>) -> CommandMode {
@@ -3211,7 +3220,7 @@ fn render_chat_window_header(services: &ActionServices<'_>, after_clear: bool) {
     }
 }
 
-fn build_chat_system_prompt(services: &ActionServices<'_>, base: &str) -> String {
+pub(crate) fn build_chat_system_prompt(services: &ActionServices<'_>, base: &str) -> String {
     let mut prompt = append_env_mode_prompt(base, services.cfg.app.env_mode.as_str());
     let skills_list = if services.skills.is_empty() {
         "none".to_string()
@@ -3230,14 +3239,58 @@ fn build_chat_system_prompt(services: &ActionServices<'_>, base: &str) -> String
         mcp_tools.join(", ")
     };
     let skills_enabled = services.cfg.ai.tools.skills.enabled;
-    let skills_dir = services.cfg.ai.tools.skills.dir.trim();
-    prompt.push_str("\n\n[Capability Selection]\n- Bash Tool execution, Skills, and MCP are peer capabilities. Choose the smallest sufficient one; do not systematically bias toward any single category.\n- Prefer Bash Tool for deterministic local inspection, code edits, build/test, log/file/process analysis, and other machine-local operations.\n- Prefer Skills when a detected skill clearly matches the task and provides a reusable workflow or domain guardrails.\n- Prefer MCP when the task needs an integrated external service or dedicated remote capability that Bash Tool/Skill cannot provide cleanly.\n- For MCP HTTP troubleshooting, check endpoint/auth/header config first; `/mcp` is preferred over legacy `/sse` paths.\n- Avoid both extremes: do not stay text-only when evidence is missing, and do not chain tools endlessly when the evidence is already sufficient.\n- After each tool result, reassess whether you should answer in text now or call another tool.\n- If the model returns user-visible text in any round, preserve it and surface it; do not drop, overwrite, or silently ignore earlier assistant text.\n");
+    let skills_dir_raw = services.cfg.ai.tools.skills.dir.trim();
+    let skills_dir_path = expand_tilde(skills_dir_raw);
+    let skills_catalog = format_prompt_skill_catalog(skills_dir_path.as_path(), services.skills);
+    let mcp_tool_catalog = format_prompt_mcp_catalog(&services.mcp.external_tool_definitions());
+    prompt.push_str("\n\n[Capability Routing Protocol]\n- Bash Tool execution, Skills, and MCP are peer capabilities. Never default to Bash out of habit.\n- Before first tool call, decide capability in this order: (1) matching Skill workflow, (2) matching MCP tool, (3) Bash.\n- If a detected MCP tool clearly matches the task intent, call MCP first. Use Bash fallback only when MCP is unavailable or insufficient.\n- If a detected skill clearly matches, read its `SKILL.md` first (via read-only Bash command) and execute according to that workflow.\n- Prefer Bash for deterministic local inspection/edit/build/test/log/file/process operations.\n- For MCP HTTP troubleshooting, verify endpoint/auth/header config first; `/mcp` is preferred over legacy `/sse` paths.\n- After each tool result, reassess whether enough evidence exists to answer. Stop tool-chaining once evidence is sufficient.\n- If any round already produced user-visible assistant text, preserve and surface it. Do not drop earlier valid text.\n");
     prompt.push_str("\n[Tool Argument Rules]\n- Every tool call argument MUST be a strict JSON object. Do not emit pseudo-JSON, markdown, comments, or partially written strings.\n- Use double quotes for all JSON keys and string values.\n- For Bash Tool `run_shell_command`, always send at least `{\\\"command\\\":\\\"...\\\"}` and optionally `label` plus `mode=read|write`.\n- If a previous tool result says arguments are invalid, fix the JSON structure directly instead of retrying with another malformed variant.\n");
-    prompt.push_str("\n[Skill Workflow]\n- Before complex tasks, scan available skills first.\n- If a matching skill exists, follow its SKILL.md workflow.\n- In responses, explicitly mention which skill is used.\n");
+    prompt.push_str("\n[Skill Workflow]\n- Before complex tasks, scan available skills first.\n- If a matching skill exists, follow its SKILL.md workflow.\n- In responses, explicitly mention which skill is used.\n- If no skill matches, explicitly state that no matching skill is found and continue with the smallest sufficient capability.\n");
     prompt.push_str(&format!(
-        "\n[Runtime Capability Context]\n- bash_tool=run_shell_command\n- skills_enabled={skills_enabled}\n- skills_dir={skills_dir}\n- detected_skills={skills_list}\n- detected_mcp_tools={mcp_tools_list}\n"
+        "\n[Runtime Capability Context]\n- bash_tool=run_shell_command\n- skills_enabled={skills_enabled}\n- skills_dir={}\n- detected_skills={skills_list}\n- detected_mcp_tools={mcp_tools_list}\n- skill_catalog={skills_catalog}\n- mcp_tool_catalog={mcp_tool_catalog}\n",
+        skills_dir_path.display()
     ));
     prompt
+}
+
+fn format_prompt_skill_catalog(skills_dir: &Path, skills: &[String]) -> String {
+    if skills.is_empty() {
+        return "none".to_string();
+    }
+    let mut names = skills.to_vec();
+    names.sort();
+    let mut rows = Vec::<String>::new();
+    for name in names.iter().take(12) {
+        let path = skills_dir.join(name);
+        let summary = read_skill_summary(path.as_path()).unwrap_or_else(|| "-".to_string());
+        rows.push(format!(
+            "{}({}; path={})",
+            name,
+            trim_text(&summary, 80),
+            path.display()
+        ));
+    }
+    if names.len() > 12 {
+        rows.push(format!("...(+{} more)", names.len() - 12));
+    }
+    rows.join(" | ")
+}
+
+fn format_prompt_mcp_catalog(tools: &[ExternalToolDefinition]) -> String {
+    if tools.is_empty() {
+        return "none".to_string();
+    }
+    let mut rows = tools
+        .iter()
+        .map(|tool| format!("{}({})", tool.name, trim_text(&tool.description, 96)))
+        .collect::<Vec<_>>();
+    rows.sort();
+    if rows.len() > 16 {
+        let extra = rows.len() - 16;
+        rows.truncate(16);
+        rows.push(format!("...(+{} more)", extra));
+    }
+    rows.join(" | ")
 }
 
 pub(crate) fn append_env_mode_prompt(base: &str, env_mode_raw: &str) -> String {
