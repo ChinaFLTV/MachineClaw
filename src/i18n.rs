@@ -2673,6 +2673,35 @@ fn localize_detail(detail: &str) -> String {
             Language::Ja => "app.env-mode は prod / test / dev のいずれかである必要があります".to_string(),
             Language::En => detail.to_string(),
         },
+        "ai.chat.mode must be one of: chat, task" => match current_language() {
+            Language::ZhCn => "ai.chat.mode 取值必须是 chat、task".to_string(),
+            Language::ZhTw => "ai.chat.mode 取值必須是 chat、task".to_string(),
+            Language::Fr => "ai.chat.mode doit être chat ou task".to_string(),
+            Language::De => "ai.chat.mode muss chat oder task sein".to_string(),
+            Language::Ja => "ai.chat.mode は chat または task である必要があります".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "ai.chat.model-price-check-mode must be one of: sync, async" => {
+            match current_language() {
+                Language::ZhCn => {
+                    "ai.chat.model-price-check-mode 取值必须是 sync、async".to_string()
+                }
+                Language::ZhTw => {
+                    "ai.chat.model-price-check-mode 取值必須是 sync、async".to_string()
+                }
+                Language::Fr => {
+                    "ai.chat.model-price-check-mode doit être sync ou async".to_string()
+                }
+                Language::De => {
+                    "ai.chat.model-price-check-mode muss sync oder async sein".to_string()
+                }
+                Language::Ja => {
+                    "ai.chat.model-price-check-mode は sync または async である必要があります"
+                        .to_string()
+                }
+                Language::En => detail.to_string(),
+            }
+        }
         "ai.tools.bash.command-timeout-seconds must be greater than 0" => {
             match current_language() {
                 Language::ZhCn => "ai.tools.bash.command-timeout-seconds 必须大于 0".to_string(),
@@ -2963,6 +2992,82 @@ fn localize_detail(detail: &str) -> String {
             Language::Ja => "ai.tools.mcp.dir は空にできません".to_string(),
             Language::En => detail.to_string(),
         },
+        "ai.tools.builtin.web-search-timeout-seconds must be greater than 0" => {
+            match current_language() {
+                Language::ZhCn => {
+                    "ai.tools.builtin.web-search-timeout-seconds 必须大于 0".to_string()
+                }
+                Language::ZhTw => {
+                    "ai.tools.builtin.web-search-timeout-seconds 必須大於 0".to_string()
+                }
+                Language::Fr => {
+                    "ai.tools.builtin.web-search-timeout-seconds doit être supérieur à 0"
+                        .to_string()
+                }
+                Language::De => {
+                    "ai.tools.builtin.web-search-timeout-seconds muss größer als 0 sein"
+                        .to_string()
+                }
+                Language::Ja => {
+                    "ai.tools.builtin.web-search-timeout-seconds は 0 より大きい必要があります"
+                        .to_string()
+                }
+                Language::En => detail.to_string(),
+            }
+        }
+        "ai.tools.builtin.web-search-max-results must be greater than 0" => {
+            match current_language() {
+                Language::ZhCn => {
+                    "ai.tools.builtin.web-search-max-results 必须大于 0".to_string()
+                }
+                Language::ZhTw => {
+                    "ai.tools.builtin.web-search-max-results 必須大於 0".to_string()
+                }
+                Language::Fr => {
+                    "ai.tools.builtin.web-search-max-results doit être supérieur à 0".to_string()
+                }
+                Language::De => {
+                    "ai.tools.builtin.web-search-max-results muss größer als 0 sein".to_string()
+                }
+                Language::Ja => {
+                    "ai.tools.builtin.web-search-max-results は 0 より大きい必要があります"
+                        .to_string()
+                }
+                Language::En => detail.to_string(),
+            }
+        }
+        "ai.tools.builtin.max-read-bytes must be >= 1024" => {
+            match current_language() {
+                Language::ZhCn => "ai.tools.builtin.max-read-bytes 必须大于等于 1024".to_string(),
+                Language::ZhTw => "ai.tools.builtin.max-read-bytes 必須大於等於 1024".to_string(),
+                Language::Fr => {
+                    "ai.tools.builtin.max-read-bytes doit être >= 1024".to_string()
+                }
+                Language::De => "ai.tools.builtin.max-read-bytes muss >= 1024 sein".to_string(),
+                Language::Ja => {
+                    "ai.tools.builtin.max-read-bytes は 1024 以上である必要があります"
+                        .to_string()
+                }
+                Language::En => detail.to_string(),
+            }
+        }
+        "ai.tools.builtin.max-search-results must be greater than 0" => {
+            match current_language() {
+                Language::ZhCn => "ai.tools.builtin.max-search-results 必须大于 0".to_string(),
+                Language::ZhTw => "ai.tools.builtin.max-search-results 必須大於 0".to_string(),
+                Language::Fr => {
+                    "ai.tools.builtin.max-search-results doit être supérieur à 0".to_string()
+                }
+                Language::De => {
+                    "ai.tools.builtin.max-search-results muss größer als 0 sein".to_string()
+                }
+                Language::Ja => {
+                    "ai.tools.builtin.max-search-results は 0 より大きい必要があります"
+                        .to_string()
+                }
+                Language::En => detail.to_string(),
+            }
+        }
         "legacy [cmd] is not supported; use [ai.tools.bash]" => match current_language() {
             Language::ZhCn => "旧版 [cmd] 配置已废弃，请改用 [ai.tools.bash]".to_string(),
             Language::ZhTw => "舊版 [cmd] 設定已廢棄，請改用 [ai.tools.bash]".to_string(),

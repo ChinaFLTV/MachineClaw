@@ -33,6 +33,7 @@ const DEFAULT_CHAT_SHOW_TIPS: bool = false;
 const DEFAULT_CHAT_COMMAND_CACHE_TTL_SECONDS: u64 = 30;
 const DEFAULT_CHAT_SHOW_ROUND_METRICS: bool = true;
 const DEFAULT_CHAT_SHOW_TOKEN_COST: bool = true;
+const DEFAULT_CHAT_MODE: &str = "chat";
 const DEFAULT_CHAT_CONTEXT_WARN_PERCENT: u8 = 80;
 const DEFAULT_CHAT_CONTEXT_CRITICAL_PERCENT: u8 = 95;
 const DEFAULT_CHAT_SKIP_MODEL_PRICE_CHECK: bool = false;
@@ -54,6 +55,14 @@ const MAX_CONTEXT_MESSAGES: usize = 80;
 const DEFAULT_APP_ENV_MODE: &str = "prod";
 const DEFAULT_MCP_AVAILABILITY_CHECK_MODE: &str = "rsync";
 const DEFAULT_MCP_DIR: &str = "~/.machineclaw/mcp";
+const DEFAULT_BUILTIN_TOOLS_ENABLED: bool = true;
+const DEFAULT_BUILTIN_WEB_SEARCH_ENABLED: bool = true;
+const DEFAULT_BUILTIN_WEB_SEARCH_TIMEOUT_SECONDS: u64 = 10;
+const DEFAULT_BUILTIN_WEB_SEARCH_MAX_RESULTS: usize = 5;
+const DEFAULT_BUILTIN_MAX_READ_BYTES: usize = 131_072;
+const DEFAULT_BUILTIN_MAX_SEARCH_RESULTS: usize = 100;
+const DEFAULT_BUILTIN_WRITE_TOOLS_ENABLED: bool = false;
+const DEFAULT_BUILTIN_WORKSPACE_ONLY: bool = true;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -121,6 +130,8 @@ pub struct AiConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AiToolsConfig {
     #[serde(default)]
+    pub builtin: BuiltinToolsConfig,
+    #[serde(default)]
     pub bash: CmdConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
@@ -129,7 +140,44 @@ pub struct AiToolsConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BuiltinToolsConfig {
+    #[serde(default = "default_builtin_tools_enabled")]
+    pub enabled: bool,
+    #[serde(
+        rename = "web-search-enabled",
+        default = "default_builtin_web_search_enabled"
+    )]
+    pub web_search_enabled: bool,
+    #[serde(
+        rename = "web-search-timeout-seconds",
+        default = "default_builtin_web_search_timeout_seconds"
+    )]
+    pub web_search_timeout_seconds: u64,
+    #[serde(
+        rename = "web-search-max-results",
+        default = "default_builtin_web_search_max_results"
+    )]
+    pub web_search_max_results: usize,
+    #[serde(rename = "max-read-bytes", default = "default_builtin_max_read_bytes")]
+    pub max_read_bytes: usize,
+    #[serde(
+        rename = "max-search-results",
+        default = "default_builtin_max_search_results"
+    )]
+    pub max_search_results: usize,
+    #[serde(
+        rename = "write-tools-enabled",
+        default = "default_builtin_write_tools_enabled"
+    )]
+    pub write_tools_enabled: bool,
+    #[serde(rename = "workspace-only", default = "default_builtin_workspace_only")]
+    pub workspace_only: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AiChatConfig {
+    #[serde(rename = "mode", default = "default_chat_mode")]
+    pub mode: String,
     #[serde(rename = "show-tool", default = "default_chat_show_tool")]
     pub show_tool: bool,
     #[serde(rename = "show-tool-ok", default = "default_chat_show_tool_ok")]
@@ -385,6 +433,7 @@ impl Default for RetryConfig {
 impl Default for AiChatConfig {
     fn default() -> Self {
         Self {
+            mode: default_chat_mode(),
             show_tool: default_chat_show_tool(),
             show_tool_ok: default_chat_show_tool_ok(),
             show_tool_err: default_chat_show_tool_err(),
@@ -420,6 +469,21 @@ impl Default for CmdConfig {
             write_cmd_allow_patterns: Vec::new(),
             write_cmd_deny_patterns: Vec::new(),
             command_output_max_bytes: default_command_output_max_bytes(),
+        }
+    }
+}
+
+impl Default for BuiltinToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_builtin_tools_enabled(),
+            web_search_enabled: default_builtin_web_search_enabled(),
+            web_search_timeout_seconds: default_builtin_web_search_timeout_seconds(),
+            web_search_max_results: default_builtin_web_search_max_results(),
+            max_read_bytes: default_builtin_max_read_bytes(),
+            max_search_results: default_builtin_max_search_results(),
+            write_tools_enabled: default_builtin_write_tools_enabled(),
+            workspace_only: default_builtin_workspace_only(),
         }
     }
 }
@@ -548,6 +612,7 @@ max-retries = 2 # optional, default 2
 backoff-millis = 1500 # optional, default 1500
 
 [ai.chat]
+mode = "chat" # optional, default "chat"; accepted: chat, task
 show-tool = false # optional
 show-tool-ok = false # optional
 show-tool-err = false # optional
@@ -572,6 +637,16 @@ max-history-messages = 40 # optional, default 40
 max-chars-count = 80000 # optional, default 80000
 
 [ai.tools]
+
+[ai.tools.builtin]
+enabled = true # optional, default true
+web-search-enabled = true # optional, default true
+web-search-timeout-seconds = 10 # optional, default 10
+web-search-max-results = 5 # optional, default 5
+max-read-bytes = 131072 # optional, default 131072
+max-search-results = 100 # optional, default 100
+write-tools-enabled = false # optional, default false; enables Edit/Replace/NotebookEditCell write operations
+workspace-only = true # optional, default true; deny access outside current working directory
 
 [ai.tools.bash]
 write-cmd-run-confirm = true # optional, default true
@@ -621,7 +696,8 @@ max_messages = 80 # optional, default 80
 
 ## Notes
 - `config set` only updates one key and preserves other sections.
-- In chat mode, risky write commands still depend on command confirmation policy.
+- `ai.chat.mode` supports `chat` (default) and `task`.
+- Risky write commands still depend on command confirmation policy.
 "#
 }
 
@@ -714,6 +790,12 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
             "ai.chat context-warn-percent cannot exceed context-critical-percent".to_string(),
         ));
     }
+    let chat_mode = normalize_chat_interaction_mode(cfg.ai.chat.mode.as_str());
+    if !matches!(chat_mode, "chat" | "task") {
+        return Err(AppError::Config(
+            "ai.chat.mode must be one of: chat, task".to_string(),
+        ));
+    }
     let model_price_check_mode =
         normalize_chat_model_price_check_mode(cfg.ai.chat.model_price_check_mode.as_str());
     if !matches!(model_price_check_mode, "sync" | "async") {
@@ -732,6 +814,27 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
     if mcp_cfg.dir.trim().is_empty() {
         return Err(AppError::Config(
             "ai.tools.mcp.dir must not be empty".to_string(),
+        ));
+    }
+    let builtin_cfg = &cfg.ai.tools.builtin;
+    if builtin_cfg.web_search_timeout_seconds == 0 {
+        return Err(AppError::Config(
+            "ai.tools.builtin.web-search-timeout-seconds must be greater than 0".to_string(),
+        ));
+    }
+    if builtin_cfg.web_search_max_results == 0 {
+        return Err(AppError::Config(
+            "ai.tools.builtin.web-search-max-results must be greater than 0".to_string(),
+        ));
+    }
+    if builtin_cfg.max_read_bytes < 1024 {
+        return Err(AppError::Config(
+            "ai.tools.builtin.max-read-bytes must be >= 1024".to_string(),
+        ));
+    }
+    if builtin_cfg.max_search_results == 0 {
+        return Err(AppError::Config(
+            "ai.tools.builtin.max-search-results must be greater than 0".to_string(),
         ));
     }
     if cfg.ai.chat.cmd_run_timout == 0 {
@@ -948,6 +1051,38 @@ fn default_mcp_dir() -> String {
     DEFAULT_MCP_DIR.to_string()
 }
 
+fn default_builtin_tools_enabled() -> bool {
+    DEFAULT_BUILTIN_TOOLS_ENABLED
+}
+
+fn default_builtin_web_search_enabled() -> bool {
+    DEFAULT_BUILTIN_WEB_SEARCH_ENABLED
+}
+
+fn default_builtin_web_search_timeout_seconds() -> u64 {
+    DEFAULT_BUILTIN_WEB_SEARCH_TIMEOUT_SECONDS
+}
+
+fn default_builtin_web_search_max_results() -> usize {
+    DEFAULT_BUILTIN_WEB_SEARCH_MAX_RESULTS
+}
+
+fn default_builtin_max_read_bytes() -> usize {
+    DEFAULT_BUILTIN_MAX_READ_BYTES
+}
+
+fn default_builtin_max_search_results() -> usize {
+    DEFAULT_BUILTIN_MAX_SEARCH_RESULTS
+}
+
+fn default_builtin_write_tools_enabled() -> bool {
+    DEFAULT_BUILTIN_WRITE_TOOLS_ENABLED
+}
+
+fn default_builtin_workspace_only() -> bool {
+    DEFAULT_BUILTIN_WORKSPACE_ONLY
+}
+
 fn default_mcp_server_enabled() -> bool {
     true
 }
@@ -1002,6 +1137,10 @@ fn default_ai_output_price_per_million() -> f64 {
 
 fn default_chat_show_tool() -> bool {
     DEFAULT_CHAT_SHOW_TOOL
+}
+
+fn default_chat_mode() -> String {
+    DEFAULT_CHAT_MODE.to_string()
 }
 
 fn default_chat_show_tool_ok() -> bool {
@@ -1111,6 +1250,14 @@ pub(crate) fn normalize_chat_model_price_check_mode(raw: &str) -> &str {
     }
 }
 
+pub(crate) fn normalize_chat_interaction_mode(raw: &str) -> &str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "task" => "task",
+        "chat" | "" => "chat",
+        _ => "__invalid__",
+    }
+}
+
 pub(crate) fn normalize_mcp_availability_check_mode(raw: &str) -> &str {
     match raw.trim().to_ascii_lowercase().as_str() {
         "async" => "async",
@@ -1133,8 +1280,9 @@ fn has_file_extension(file_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        McpServerConfig, normalize_ai_provider_type, normalize_chat_model_price_check_mode,
-        normalize_mcp_availability_check_mode, parse_config_text, resolve_config_path,
+        McpServerConfig, normalize_ai_provider_type, normalize_chat_interaction_mode,
+        normalize_chat_model_price_check_mode, normalize_mcp_availability_check_mode,
+        parse_config_text, resolve_config_path,
     };
 
     #[test]
@@ -1157,6 +1305,14 @@ mod tests {
             normalize_chat_model_price_check_mode("invalid"),
             "__invalid__"
         );
+    }
+
+    #[test]
+    fn normalize_chat_interaction_mode_accepts_chat_and_task() {
+        assert_eq!(normalize_chat_interaction_mode("chat"), "chat");
+        assert_eq!(normalize_chat_interaction_mode("task"), "task");
+        assert_eq!(normalize_chat_interaction_mode(""), "chat");
+        assert_eq!(normalize_chat_interaction_mode("invalid"), "__invalid__");
     }
 
     #[test]
@@ -1213,6 +1369,27 @@ command-timeout-seconds = 12
         )
         .expect("config should parse");
         assert_eq!(cfg.ai.tools.bash.command_timeout_seconds, 12);
+    }
+
+    #[test]
+    fn parse_config_text_supports_chat_mode_task() {
+        let cfg = parse_config_text(
+            r#"
+[ai]
+base-url = "https://example.com/v1"
+token = "sk-test"
+model = "test-model"
+
+[ai.chat]
+mode = "task"
+"#,
+            "inline",
+        )
+        .expect("config should parse");
+        assert_eq!(
+            normalize_chat_interaction_mode(cfg.ai.chat.mode.as_str()),
+            "task"
+        );
     }
 
     #[test]

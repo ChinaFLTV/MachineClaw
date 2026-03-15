@@ -27,10 +27,11 @@ use crate::{
         ModelPriceCheckResult, ModelPriceSource, ToolCallRequest, ToolUsePolicy,
         is_chat_cancelled_error, is_transient_ai_error,
     },
+    builtin_tools,
     cli::InspectTarget,
     config::{
-        AppConfig, expand_tilde, normalize_chat_model_price_check_mode,
-        normalize_mcp_availability_check_mode,
+        AppConfig, expand_tilde, normalize_chat_interaction_mode,
+        normalize_chat_model_price_check_mode, normalize_mcp_availability_check_mode,
     },
     context::{SessionMessage, SessionStore},
     error::{AppError, ExitCode},
@@ -40,6 +41,7 @@ use crate::{
     platform::OsType,
     render::{self, ActionRenderData},
     shell::{CommandMode, CommandResult, CommandSpec, ShellExecutor, note_interactive_input_wait},
+    task_store,
 };
 
 pub struct ActionServices<'a> {
@@ -308,7 +310,11 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
     reset_queued_async_chat_notices();
 
     let base_system_prompt = render::load_prompt_template(services.assets_dir, "chat_system.md")?;
-    let system_prompt = build_chat_system_prompt(services, &base_system_prompt);
+    let system_prompt = build_chat_system_prompt(
+        services,
+        &base_system_prompt,
+        services.cfg.ai.chat.mode.as_str(),
+    );
     maybe_ensure_chat_environment_profile(services, &system_prompt)?;
     let chat_input_waiting = Arc::new(AtomicBool::new(false));
     maybe_prepare_chat_model_price(services, chat_input_waiting.clone());
@@ -638,13 +644,12 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
         );
         logging::info("AI chat start");
         let history = services.session.build_chat_history();
-        let external_mcp_tools: Vec<ExternalToolDefinition> =
-            services.mcp.external_tool_definitions();
-        let policy = if should_require_tool_call(&message) {
-            ToolUsePolicy::RequireAtLeastOne
-        } else {
-            ToolUsePolicy::Auto
-        };
+        let mut external_tools: Vec<ExternalToolDefinition> =
+            builtin_tools::external_tool_definitions(&services.cfg.ai.tools.builtin);
+        if services.cfg.ai.tools.mcp.enabled {
+            external_tools.extend(services.mcp.external_tool_definitions());
+        }
+        let policy = chat_tool_use_policy_for_message(&message, services.cfg.ai.chat.mode.as_str());
         let colorful = services.cfg.console.colorful;
         let stream_output = services.cfg.ai.chat.stream_output;
         let show_tips = services.cfg.ai.chat.show_tips;
@@ -669,7 +674,7 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
             services.cfg.ai.chat.max_tool_rounds,
             services.cfg.ai.chat.max_total_tool_calls,
             stream_output,
-            &external_mcp_tools,
+            &external_tools,
             Some(chat_cancel_requested.as_ref()),
             Some(debug_session_id.as_str()),
             |tool_call| {
@@ -983,6 +988,45 @@ fn execute_tool_call(
     cache_ttl_ms: u128,
 ) -> String {
     if tool_call.name != "run_shell_command" {
+        if builtin_tools::is_builtin_tool(&tool_call.name) {
+            stats.tool_calls += 1;
+            let started = Instant::now();
+            let raw_payload = match builtin_tools::execute_tool(
+                &tool_call.name,
+                &tool_call.arguments,
+                &services.cfg.ai.tools.builtin,
+            ) {
+                Ok(text) => {
+                    stats.tool_duration_ms += started.elapsed().as_millis();
+                    text
+                }
+                Err(err) => {
+                    stats.command_failures += 1;
+                    stats.tool_duration_ms += started.elapsed().as_millis();
+                    json!({
+                        "ok": false,
+                        "error": err,
+                        "tool": tool_call.name,
+                        "raw_arguments": trim_tool_argument_preview(&tool_call.arguments)
+                    })
+                    .to_string()
+                }
+            };
+            let payload =
+                maybe_persist_task_payload(services, tool_call, raw_payload.as_str(), group_id);
+            services.session.add_tool_message(
+                format!(
+                    "tool_call_id={} function={} args={} result={}",
+                    tool_call.id,
+                    tool_call.name,
+                    trim_tool_argument_preview(&tool_call.arguments),
+                    trim_text(&payload, 2400)
+                ),
+                Some(group_id.to_string()),
+            );
+            let _ = services.session.persist();
+            return payload;
+        }
         if services.mcp.has_ai_tool(&tool_call.name) {
             return execute_mcp_tool_call(services, group_id, tool_call, stats);
         }
@@ -1296,6 +1340,52 @@ fn execute_tool_call(
             text
         }
     }
+}
+
+fn maybe_persist_task_payload(
+    services: &mut ActionServices<'_>,
+    tool_call: &ToolCallRequest,
+    payload: &str,
+    group_id: &str,
+) -> String {
+    if !tool_call.name.eq_ignore_ascii_case("task") {
+        return payload.to_string();
+    }
+    let Some(task_args) = task_store::extract_task_call_args(tool_call.arguments.as_str()) else {
+        return payload.to_string();
+    };
+    let status = task_store::infer_task_status_from_payload(payload);
+    let record = match task_store::persist_task_record(task_store::PersistTaskRequest {
+        session_file: services.session.file_path(),
+        session_id: services.session.session_id(),
+        session_name: services.session.session_name(),
+        task_id: task_args.task_id.as_deref(),
+        description: task_args.description.as_str(),
+        status,
+        source: "builtin_task",
+        tool_call_id: tool_call.id.as_str(),
+        raw_payload: payload,
+    }) {
+        Ok(value) => value,
+        Err(err) => {
+            logging::warn(&format!(
+                "persist task record failed: session={}, tool_call_id={}, err={}",
+                services.session.session_id(),
+                tool_call.id,
+                mask_sensitive(&err.to_string())
+            ));
+            services.session.add_system_message(
+                format!(
+                    "task persistence failed: {}",
+                    mask_sensitive(&err.to_string())
+                ),
+                Some(group_id.to_string()),
+            );
+            let _ = services.session.persist();
+            return payload.to_string();
+        }
+    };
+    task_store::augment_tool_payload_with_task(payload, &record)
 }
 
 fn execute_mcp_tool_call(
@@ -3220,7 +3310,11 @@ fn render_chat_window_header(services: &ActionServices<'_>, after_clear: bool) {
     }
 }
 
-pub(crate) fn build_chat_system_prompt(services: &ActionServices<'_>, base: &str) -> String {
+pub(crate) fn build_chat_system_prompt(
+    services: &ActionServices<'_>,
+    base: &str,
+    chat_mode_raw: &str,
+) -> String {
     let mut prompt = append_env_mode_prompt(base, services.cfg.app.env_mode.as_str());
     let skills_list = if services.skills.is_empty() {
         "none".to_string()
@@ -3238,19 +3332,51 @@ pub(crate) fn build_chat_system_prompt(services: &ActionServices<'_>, base: &str
     } else {
         mcp_tools.join(", ")
     };
+    let builtin_tool_names = builtin_tools::tool_names(&services.cfg.ai.tools.builtin);
+    let builtin_tools_list = if builtin_tool_names.is_empty() {
+        "none".to_string()
+    } else {
+        builtin_tool_names.join(", ")
+    };
     let skills_enabled = services.cfg.ai.tools.skills.enabled;
     let skills_dir_raw = services.cfg.ai.tools.skills.dir.trim();
     let skills_dir_path = expand_tilde(skills_dir_raw);
     let skills_catalog = format_prompt_skill_catalog(skills_dir_path.as_path(), services.skills);
     let mcp_tool_catalog = format_prompt_mcp_catalog(&services.mcp.external_tool_definitions());
-    prompt.push_str("\n\n[Capability Routing Protocol]\n- Bash Tool execution, Skills, and MCP are peer capabilities. Never default to Bash out of habit.\n- Before first tool call, decide capability in this order: (1) matching Skill workflow, (2) matching MCP tool, (3) Bash.\n- If a detected MCP tool clearly matches the task intent, call MCP first. Use Bash fallback only when MCP is unavailable or insufficient.\n- If a detected skill clearly matches, read its `SKILL.md` first (via read-only Bash command) and execute according to that workflow.\n- Prefer Bash for deterministic local inspection/edit/build/test/log/file/process operations.\n- For MCP HTTP troubleshooting, verify endpoint/auth/header config first; `/mcp` is preferred over legacy `/sse` paths.\n- After each tool result, reassess whether enough evidence exists to answer. Stop tool-chaining once evidence is sufficient.\n- If any round already produced user-visible assistant text, preserve and surface it. Do not drop earlier valid text.\n");
+    prompt.push_str("\n\n[Capability Routing Protocol]\n- Built-in tools, Bash Tool execution, Skills, and MCP are peer capabilities. Never default to Bash out of habit.\n- Before first tool call, decide capability in this order: (1) matching Skill workflow, (2) matching MCP tool, (3) matching built-in tool, (4) Bash.\n- If a detected MCP tool clearly matches the task intent, call MCP first. Use Bash fallback only when MCP is unavailable or insufficient.\n- For local file/grep/glob/list/read operations, prefer built-in tools (`View`/`LS`/`GlobTool`/`GrepTool`) instead of shell `cat/head/tail/ls/find/grep`.\n- If a detected skill clearly matches, read its `SKILL.md` first (via read-only Bash command) and execute according to that workflow.\n- Prefer Bash for deterministic local process/runtime/build/test operations.\n- For MCP HTTP troubleshooting, verify endpoint/auth/header config first; `/mcp` is preferred over legacy `/sse` paths.\n- After each tool result, reassess whether enough evidence exists to answer. Stop tool-chaining once evidence is sufficient.\n- If any round already produced user-visible assistant text, preserve and surface it. Do not drop earlier valid text.\n");
     prompt.push_str("\n[Tool Argument Rules]\n- Every tool call argument MUST be a strict JSON object. Do not emit pseudo-JSON, markdown, comments, or partially written strings.\n- Use double quotes for all JSON keys and string values.\n- For Bash Tool `run_shell_command`, always send at least `{\\\"command\\\":\\\"...\\\"}` and optionally `label` plus `mode=read|write`.\n- If a previous tool result says arguments are invalid, fix the JSON structure directly instead of retrying with another malformed variant.\n");
     prompt.push_str("\n[Skill Workflow]\n- Before complex tasks, scan available skills first.\n- If a matching skill exists, follow its SKILL.md workflow.\n- In responses, explicitly mention which skill is used.\n- If no skill matches, explicitly state that no matching skill is found and continue with the smallest sufficient capability.\n");
     prompt.push_str(&format!(
-        "\n[Runtime Capability Context]\n- bash_tool=run_shell_command\n- skills_enabled={skills_enabled}\n- skills_dir={}\n- detected_skills={skills_list}\n- detected_mcp_tools={mcp_tools_list}\n- skill_catalog={skills_catalog}\n- mcp_tool_catalog={mcp_tool_catalog}\n",
+        "\n[Runtime Capability Context]\n- bash_tool=run_shell_command\n- built_in_tools={builtin_tools_list}\n- skills_enabled={skills_enabled}\n- skills_dir={}\n- detected_skills={skills_list}\n- detected_mcp_tools={mcp_tools_list}\n- skill_catalog={skills_catalog}\n- mcp_tool_catalog={mcp_tool_catalog}\n",
         skills_dir_path.display()
     ));
+    let chat_mode = resolve_chat_mode(chat_mode_raw);
+    if chat_mode == "task" {
+        prompt.push_str("\n[Interaction Mode]\n- mode=task\n- This request must be executed in task orchestration mode.\n- Before major execution, produce a concise step plan with acceptance criteria.\n- For complex or ambiguous tasks, call `Architect` first to compare options and risks.\n- Use `Task` to track sub-task objective/status/evidence, then run tools to collect verifiable results.\n- `Task` supports `task_id`; reuse the same `task_id` when updating the same task and set `status` to running/done/failed/blocked.\n- Final response must include: overall status, completed steps, failed/blocked steps, and next actionable step.\n");
+    } else {
+        prompt.push_str("\n[Interaction Mode]\n- mode=chat\n- Keep direct conversational workflow. Use tools only when they improve correctness or are explicitly required.\n");
+    }
     prompt
+}
+
+pub(crate) fn resolve_chat_mode(raw: &str) -> &str {
+    let normalized = normalize_chat_interaction_mode(raw);
+    if normalized == "__invalid__" {
+        "chat"
+    } else {
+        normalized
+    }
+}
+
+pub(crate) fn chat_tool_use_policy_for_message(
+    message: &str,
+    chat_mode_raw: &str,
+) -> ToolUsePolicy {
+    if resolve_chat_mode(chat_mode_raw) == "task" || should_require_tool_call(message) {
+        ToolUsePolicy::RequireAtLeastOne
+    } else {
+        ToolUsePolicy::Auto
+    }
 }
 
 fn format_prompt_skill_catalog(skills_dir: &Path, skills: &[String]) -> String {
@@ -4338,8 +4464,10 @@ mod tests {
         format_fixed_table_with_options, is_cancel_shortcut_csi_sequence,
         is_cancel_shortcut_escape_sequence, is_chat_cancel_shortcut_bytes,
         normalize_builtin_command_alias, normalize_history_content, parse_builtin_command,
-        parse_chat_history_limit, render_async_chat_notice_output, strip_ansi_escape_sequences,
+        parse_chat_history_limit, render_async_chat_notice_output, resolve_chat_mode,
+        strip_ansi_escape_sequences,
     };
+    use crate::ai::ToolUsePolicy;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -4375,6 +4503,20 @@ mod tests {
             "/skills"
         );
         assert_eq!(normalize_builtin_command_alias("mcps".to_string()), "/mcps");
+    }
+
+    #[test]
+    fn resolve_chat_mode_defaults_to_chat_when_invalid() {
+        assert_eq!(resolve_chat_mode("chat"), "chat");
+        assert_eq!(resolve_chat_mode("task"), "task");
+        assert_eq!(resolve_chat_mode(""), "chat");
+        assert_eq!(resolve_chat_mode("unknown"), "chat");
+    }
+
+    #[test]
+    fn task_mode_requires_tool_policy_for_any_message() {
+        let policy = super::chat_tool_use_policy_for_message("just answer directly", "task");
+        assert!(matches!(policy, ToolUsePolicy::RequireAtLeastOne));
     }
 
     #[test]

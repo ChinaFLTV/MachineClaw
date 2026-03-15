@@ -1,8 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashSet, VecDeque},
-    env,
-    fs,
+    env, fs,
     io::{self, IsTerminal, Stdout, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -44,11 +43,15 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 
 use crate::{
-    actions::{ActionOutcome, ActionServices, build_chat_system_prompt},
+    actions::{
+        ActionOutcome, ActionServices, build_chat_system_prompt, chat_tool_use_policy_for_message,
+        resolve_chat_mode,
+    },
     ai::{
         ChatRoundEvent, ChatStreamEvent, ChatStreamEventKind, ChatToolResponse, ToolCallRequest,
         ToolUsePolicy,
     },
+    builtin_tools,
     cli::InspectTarget,
     config::{AppConfig, McpServerConfig, expand_tilde},
     context::{SessionMessage, SessionOverview, ToolExecutionMeta},
@@ -58,6 +61,7 @@ use crate::{
     platform::OsType,
     render,
     shell::{CommandMode, CommandResult, CommandSpec, looks_like_write_command_hint},
+    task_store,
 };
 
 const CHAT_RENDER_LIMIT: usize = 260;
@@ -77,6 +81,7 @@ const TOOL_RESULT_MODAL_MAX_RESULT_CHARS: usize = 120_000;
 const MCP_TOOL_RESULT_CONTENT_MAX_CHARS: usize = 120_000;
 const SESSION_AUTO_TITLE_MAX_UNITS: usize = 15;
 const SESSION_AUTO_TITLE_SOURCE_MAX_CHARS: usize = 1200;
+const TASK_BOARD_MAX_ITEMS: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiRole {
@@ -106,6 +111,20 @@ enum ConversationLineKind {
     BubbleBorder,
     Body,
     Spacer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskBoardStatus {
+    Running,
+    Done,
+    Failed,
+    Blocked,
+}
+
+#[derive(Debug, Clone)]
+struct TaskBoardItem {
+    name: String,
+    status: TaskBoardStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +184,26 @@ struct ConversationHoverButtons {
     copy_rect: Rect,
     result_rect: Option<Rect>,
     delete_rect: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatInputActionKind {
+    ModeToggle,
+    TrackingToggle,
+    JumpToLatest,
+}
+
+#[derive(Debug, Clone)]
+struct ChatInputActionButton {
+    kind: ChatInputActionKind,
+    label: String,
+    rect: Rect,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadRenameClearButton {
+    label: String,
+    rect: Rect,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -363,6 +402,36 @@ enum UiMode {
     Mcp,
     Inspect,
     Config,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatInteractionMode {
+    Chat,
+    Task,
+}
+
+impl ChatInteractionMode {
+    fn from_raw(raw: &str) -> Self {
+        if resolve_chat_mode(raw) == "task" {
+            Self::Task
+        } else {
+            Self::Chat
+        }
+    }
+
+    fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Task => "task",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            Self::Chat => Self::Task,
+            Self::Task => Self::Chat,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -606,6 +675,7 @@ struct ChatUiState {
     conversation_dirty: bool,
     conversation_scroll: u16,
     follow_tail: bool,
+    message_tracking_enabled: bool,
     hovered_message_idx: Option<usize>,
     pending_delete_confirm: Option<DeleteMessageConfirmState>,
     pending_thread_action_menu: Option<ThreadActionMenuState>,
@@ -620,6 +690,7 @@ struct ChatUiState {
     threads: Vec<SessionOverview>,
     thread_selected: usize,
     input: InputBuffer,
+    chat_mode: ChatInteractionMode,
     theme_idx: usize,
     prefs_path: PathBuf,
     write_session_approved: bool,
@@ -675,6 +746,7 @@ impl ChatUiState {
             conversation_dirty: true,
             conversation_scroll: 0,
             follow_tail: true,
+            message_tracking_enabled: true,
             hovered_message_idx: None,
             pending_delete_confirm: None,
             pending_thread_action_menu: None,
@@ -689,6 +761,7 @@ impl ChatUiState {
             threads,
             thread_selected: 0,
             input: InputBuffer::new(),
+            chat_mode: ChatInteractionMode::from_raw(cfg.ai.chat.mode.as_str()),
             theme_idx,
             prefs_path,
             write_session_approved: false,
@@ -731,7 +804,7 @@ impl ChatUiState {
             self.message_persisted.pop_front();
         }
         self.conversation_dirty = true;
-        self.follow_tail = true;
+        self.follow_tail = self.message_tracking_enabled;
         self.hovered_message_idx = None;
         self.pending_delete_confirm = None;
         self.pending_thread_delete_confirm = None;
@@ -773,7 +846,7 @@ impl ChatUiState {
             }
         }
         self.conversation_dirty = true;
-        self.follow_tail = true;
+        self.follow_tail = self.message_tracking_enabled;
         self.hovered_message_idx = None;
         self.pending_delete_confirm = None;
         self.pending_thread_delete_confirm = None;
@@ -821,11 +894,28 @@ impl ChatUiState {
         self.message_persisted.clear();
         self.conversation_dirty = true;
         self.conversation_scroll = 0;
-        self.follow_tail = true;
+        self.follow_tail = self.message_tracking_enabled;
         self.hovered_message_idx = None;
         self.pending_delete_confirm = None;
         self.pending_thread_delete_confirm = None;
         self.pending_tool_result_modal = None;
+    }
+
+    fn jump_to_latest(&mut self, viewport_height: u16, enable_tracking: bool) {
+        self.ensure_conversation_cache();
+        let visible = viewport_height.max(1) as usize;
+        let max = self
+            .conversation_line_count
+            .saturating_sub(visible)
+            .min(u16::MAX as usize) as u16;
+        let tail_max = self
+            .conversation_line_count
+            .saturating_add(CONVERSATION_TAIL_PADDING_LINES)
+            .saturating_sub(visible)
+            .min(u16::MAX as usize) as u16;
+        self.conversation_scroll = tail_max.max(max);
+        self.message_tracking_enabled = enable_tracking;
+        self.follow_tail = enable_tracking;
     }
 
     fn is_message_persisted(&self, index: usize) -> bool {
@@ -871,7 +961,7 @@ impl ChatUiState {
         let _ = self.messages.remove(index);
         let _ = self.message_persisted.remove(index);
         self.conversation_dirty = true;
-        self.follow_tail = true;
+        self.follow_tail = self.message_tracking_enabled;
         if let Some(modal) = self.pending_tool_result_modal.as_ref()
             && modal.message_index == index
         {
@@ -1118,6 +1208,13 @@ impl ChatUiState {
                 });
             }
         }
+        if self.chat_mode == ChatInteractionMode::Task {
+            prepend_task_board_lines(
+                &mut lines,
+                collect_task_board_items_for_state(self, TASK_BOARD_MAX_ITEMS),
+                conversation_width,
+            );
+        }
         if lines.is_empty() {
             lines.push(ConversationLine {
                 kind: ConversationLineKind::Body,
@@ -1256,7 +1353,6 @@ pub fn run_chat_tui(services: &mut ActionServices<'_>) -> Result<ActionOutcome, 
     }
     let (theme_idx, prefs_path) = load_theme_preferences()?;
     let base_system_prompt = render::load_prompt_template(services.assets_dir, "chat_system.md")?;
-    let system_prompt = build_chat_system_prompt(services, &base_system_prompt);
     let recent_messages = services
         .session
         .recent_messages_for_display(CHAT_RENDER_LIMIT);
@@ -1274,11 +1370,13 @@ pub fn run_chat_tui(services: &mut ActionServices<'_>) -> Result<ActionOutcome, 
     state.push(
         UiRole::System,
         format!(
-            "{}: {} | {}: {}",
+            "{}: {} | {}: {} | {}: {}",
             ui_text_tui_ready(),
             services.session.session_name(),
             ui_text_model_label(),
-            services.cfg.ai.model
+            services.cfg.ai.model,
+            ui_text_chat_mode_label(),
+            ui_text_chat_mode_value(state.chat_mode),
         ),
     );
 
@@ -1302,7 +1400,7 @@ pub fn run_chat_tui(services: &mut ActionServices<'_>) -> Result<ActionOutcome, 
     let loop_result = run_loop(
         &mut terminal,
         services,
-        &system_prompt,
+        &base_system_prompt,
         &mut state,
         &mut chat_turns,
         &mut last_assistant_reply,
@@ -1386,7 +1484,7 @@ fn run_startup_checks_in_tui(
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     services: &mut ActionServices<'_>,
-    system_prompt: &str,
+    base_system_prompt: &str,
     state: &mut ChatUiState,
     chat_turns: &mut usize,
     last_assistant_reply: &mut String,
@@ -1425,7 +1523,7 @@ fn run_loop(
                     key,
                     terminal,
                     services,
-                    system_prompt,
+                    base_system_prompt,
                     state,
                     chat_turns,
                     last_assistant_reply,
@@ -1763,7 +1861,9 @@ fn maybe_start_session_auto_title_worker(
     ) {
         return;
     }
-    state.session_auto_title_attempted.insert(session_id.clone());
+    state
+        .session_auto_title_attempted
+        .insert(session_id.clone());
     let language = i18n::resolve_language(services.cfg.app.language.as_deref());
     state
         .session_auto_title_workers
@@ -2006,7 +2106,7 @@ fn handle_key_event(
     key: KeyEvent,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     services: &mut ActionServices<'_>,
-    system_prompt: &str,
+    base_system_prompt: &str,
     state: &mut ChatUiState,
     chat_turns: &mut usize,
     last_assistant_reply: &mut String,
@@ -2065,7 +2165,7 @@ fn handle_key_event(
             key,
             terminal,
             services,
-            system_prompt,
+            base_system_prompt,
             state,
             chat_turns,
             last_assistant_reply,
@@ -2158,13 +2258,12 @@ fn handle_conversation_key(
         KeyCode::PageUp => state.scroll_by(-(viewport as i16), viewport),
         KeyCode::PageDown => state.scroll_by(viewport as i16, viewport),
         KeyCode::Home => {
+            state.message_tracking_enabled = false;
             state.follow_tail = false;
             state.conversation_scroll = 0;
         }
         KeyCode::End => {
-            state.follow_tail = true;
-            state.ensure_conversation_cache();
-            state.clamp_scroll(viewport);
+            state.jump_to_latest(viewport, true);
         }
         KeyCode::Char('/') => {
             state.focus = FocusPanel::Input;
@@ -2392,7 +2491,7 @@ fn handle_input_key(
     key: KeyEvent,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     services: &mut ActionServices<'_>,
-    system_prompt: &str,
+    base_system_prompt: &str,
     state: &mut ChatUiState,
     chat_turns: &mut usize,
     last_assistant_reply: &mut String,
@@ -2415,7 +2514,7 @@ fn handle_input_key(
             key,
             terminal,
             services,
-            system_prompt,
+            base_system_prompt,
             state,
             chat_turns,
             last_assistant_reply,
@@ -2445,7 +2544,7 @@ fn handle_input_key(
             if submit_chat_message(
                 terminal,
                 services,
-                system_prompt,
+                base_system_prompt,
                 state,
                 chat_turns,
                 last_assistant_reply,
@@ -2915,6 +3014,67 @@ fn handle_mouse_event(
                     } else if let Some(field) = mcp_selected_field_def(state) {
                         let _ = mcp_start_edit(state, field.id);
                     }
+                } else if layout.input_body.height >= 2 {
+                    let rows = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(1), Constraint::Length(1)])
+                        .split(layout.input_body);
+                    let mut clicked_action = false;
+                    for button in chat_input_action_buttons(state, layout, rows[1]) {
+                        if !rect_contains(button.rect, mouse.column, mouse.row) {
+                            continue;
+                        }
+                        clicked_action = true;
+                        match button.kind {
+                            ChatInputActionKind::ModeToggle => {
+                                state.chat_mode = state.chat_mode.toggle();
+                                state.status =
+                                    ui_text_chat_mode_switched_temporary(state.chat_mode);
+                            }
+                            ChatInputActionKind::TrackingToggle => {
+                                state.message_tracking_enabled = !state.message_tracking_enabled;
+                                if state.message_tracking_enabled {
+                                    state.jump_to_latest(
+                                        layout.conversation_body.height.max(1),
+                                        true,
+                                    );
+                                    state.status = ui_text_message_tracking_enabled().to_string();
+                                } else {
+                                    state.follow_tail = false;
+                                    state.status = ui_text_message_tracking_disabled().to_string();
+                                }
+                            }
+                            ChatInputActionKind::JumpToLatest => {
+                                state.jump_to_latest(layout.conversation_body.height.max(1), false);
+                                state.status = ui_text_jump_to_latest_done().to_string();
+                            }
+                        }
+                        break;
+                    }
+                    if clicked_action {
+                        return Ok(());
+                    }
+                    if let Some(choice) = state.pending_choice.as_ref() {
+                        if choice.options.is_empty() {
+                            state.input.move_end();
+                        } else {
+                            let row = mouse.row.saturating_sub(layout.input_body.y) as usize;
+                            if row == 0 {
+                                if let Some(item) = state.pending_choice.as_mut() {
+                                    item.selected = item.selected.min(item.options.len() - 1);
+                                }
+                            } else {
+                                let idx = row.saturating_sub(1);
+                                if idx < choice.options.len()
+                                    && let Some(item) = state.pending_choice.as_mut()
+                                {
+                                    item.selected = idx;
+                                }
+                            }
+                        }
+                    } else {
+                        state.input.move_end();
+                    }
                 } else if let Some(choice) = state.pending_choice.as_ref() {
                     if choice.options.is_empty() {
                         state.input.move_end();
@@ -3294,6 +3454,15 @@ fn handle_thread_rename_modal_mouse(
     if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
         return Ok(());
     }
+    if let Some(button) = thread_rename_clear_button_data(layout)
+        && rect_contains(button.rect, mouse.column, mouse.row)
+    {
+        if let Some(modal) = state.pending_thread_rename.as_mut() {
+            modal.input.clear();
+        }
+        state.status = ui_text_thread_rename_cleared().to_string();
+        return Ok(());
+    }
     if !rect_contains(thread_rename_modal_rect(layout), mouse.column, mouse.row) {
         state.pending_thread_rename = None;
         state.status = ui_text_thread_rename_cancelled().to_string();
@@ -3606,7 +3775,10 @@ fn handle_thread_rename_modal_key(
         KeyCode::Backspace => modal.input.backspace(),
         KeyCode::Delete => modal.input.delete(),
         KeyCode::Char(ch) => {
-            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+            if key.modifiers == KeyModifiers::CONTROL && matches!(ch, 'u' | 'U') {
+                modal.input.clear();
+                state.status = ui_text_thread_rename_cleared().to_string();
+            } else if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
                 modal.input.insert_char(ch);
             }
         }
@@ -3718,7 +3890,9 @@ fn delete_thread_session_by_index(
     let previous_active_id = services.session.session_id().to_string();
     let active_after = services.session.delete_session_by_id(&target.session_id)?;
     state.drop_session_cache(&target.session_id);
-    state.session_auto_title_attempted.remove(&target.session_id);
+    state
+        .session_auto_title_attempted
+        .remove(&target.session_id);
     state
         .session_auto_title_workers
         .retain(|item| item.session_id != target.session_id);
@@ -3883,7 +4057,7 @@ fn handle_choice_input_key(
     key: KeyEvent,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     services: &mut ActionServices<'_>,
-    system_prompt: &str,
+    base_system_prompt: &str,
     state: &mut ChatUiState,
     chat_turns: &mut usize,
     last_assistant_reply: &mut String,
@@ -3935,7 +4109,7 @@ fn handle_choice_input_key(
             return submit_chat_message(
                 terminal,
                 services,
-                system_prompt,
+                base_system_prompt,
                 state,
                 chat_turns,
                 last_assistant_reply,
@@ -3951,7 +4125,7 @@ fn handle_choice_input_key(
 fn submit_chat_message(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     services: &mut ActionServices<'_>,
-    system_prompt: &str,
+    base_system_prompt: &str,
     state: &mut ChatUiState,
     chat_turns: &mut usize,
     last_assistant_reply: &mut String,
@@ -4013,29 +4187,27 @@ fn submit_chat_message(
     });
     draw_once(terminal, services, state)?;
     let history = services.session.build_chat_history();
-    let external_mcp_tools = if services.cfg.ai.tools.mcp.enabled {
-        services.mcp.external_tool_definitions()
-    } else {
-        Vec::new()
-    };
-    let policy = if should_require_tool_call(&message) {
-        ToolUsePolicy::RequireAtLeastOne
-    } else {
-        ToolUsePolicy::Auto
-    };
+    let mut external_tools =
+        builtin_tools::external_tool_definitions(&services.cfg.ai.tools.builtin);
+    if services.cfg.ai.tools.mcp.enabled {
+        external_tools.extend(services.mcp.external_tool_definitions());
+    }
+    let chat_mode = state.chat_mode.as_config_value();
+    let policy = chat_tool_use_policy_for_message(&message, chat_mode);
+    let system_prompt = build_chat_system_prompt(services, base_system_prompt, chat_mode);
     let (event_tx, event_rx) = mpsc::channel::<PendingAiEvent>();
     let cancel_requested = Arc::new(AtomicBool::new(false));
     spawn_chat_worker(
         services.ai.clone(),
         history,
-        system_prompt.to_string(),
+        system_prompt,
         message.clone(),
         services.session.session_id().to_string(),
         policy,
         services.cfg.ai.chat.max_tool_rounds,
         services.cfg.ai.chat.max_total_tool_calls,
         services.cfg.ai.chat.stream_output,
-        external_mcp_tools,
+        external_tools,
         cancel_requested.clone(),
         event_tx,
     );
@@ -4217,9 +4389,10 @@ fn wait_chat_worker_result(
                     {
                         let thinking_text = thinking.trim();
                         state.push_persisted(UiRole::Thinking, thinking_text);
-                        services
-                            .session
-                            .add_thinking_message(thinking_text.to_string(), Some(group_id.to_string()));
+                        services.session.add_thinking_message(
+                            thinking_text.to_string(),
+                            Some(group_id.to_string()),
+                        );
                         services.session.persist()?;
                         thinking_rendered_in_ui = true;
                         state.add_live_token_estimate(estimate_tokens_from_text_delta(
@@ -4305,7 +4478,9 @@ fn wait_chat_worker_result(
             streamed_thinking_dirty = false;
             streamed_thinking_last_flush = Instant::now();
         }
-        if (!stream_draw_happened && ui_dirty) || last_idle_draw.elapsed() >= Duration::from_millis(120) {
+        if (!stream_draw_happened && ui_dirty)
+            || last_idle_draw.elapsed() >= Duration::from_millis(120)
+        {
             draw_once(terminal, services, state)?;
             last_idle_draw = Instant::now();
         }
@@ -4592,10 +4767,7 @@ fn handle_pending_ai_nav_key(
     Ok(false)
 }
 
-fn handle_pending_ai_threads_key(
-    key: KeyEvent,
-    state: &mut ChatUiState,
-) -> Result<bool, AppError> {
+fn handle_pending_ai_threads_key(key: KeyEvent, state: &mut ChatUiState) -> Result<bool, AppError> {
     match key.code {
         KeyCode::Up => {
             state.thread_selected = state.thread_selected.saturating_sub(1);
@@ -4903,6 +5075,88 @@ fn execute_tool_call_tui(
     state: &mut ChatUiState,
 ) -> String {
     if tool_call.name != "run_shell_command" {
+        if builtin_tools::is_builtin_tool(&tool_call.name) {
+            let command_preview =
+                extract_tool_command_preview(tool_call.name.as_str(), tool_call.arguments.as_str());
+            state.push(
+                UiRole::Tool,
+                format!(
+                    "{}: {} [{}]\n{}",
+                    ui_text_tool_running(),
+                    tool_call.name,
+                    "builtin",
+                    if command_preview.is_empty() {
+                        trim_tool_text(tool_call.arguments.as_str(), 280)
+                    } else {
+                        command_preview.clone()
+                    }
+                ),
+            );
+            let started = Instant::now();
+            let raw_payload = match builtin_tools::execute_tool(
+                &tool_call.name,
+                &tool_call.arguments,
+                &services.cfg.ai.tools.builtin,
+            ) {
+                Ok(text) => {
+                    state.push(
+                        UiRole::Tool,
+                        format!(
+                            "{}: {} [{}]",
+                            ui_text_tool_finished(),
+                            tool_call.name,
+                            "builtin"
+                        ),
+                    );
+                    text
+                }
+                Err(err) => json!({
+                    "ok": false,
+                    "error": err,
+                    "tool": tool_call.name,
+                    "raw_arguments": trim_tool_text(&tool_call.arguments, 300),
+                })
+                .to_string(),
+            };
+            let payload =
+                maybe_persist_task_payload_in_tui(services, state, tool_call, raw_payload.as_str());
+            if payload.contains("\"ok\":false") {
+                state.push(
+                    UiRole::Tool,
+                    format!("{}: {}", ui_text_tool_error(), tool_call.name),
+                );
+            }
+            let duration_ms = started.elapsed().as_millis();
+            let tool_meta = build_tool_execution_meta(
+                services,
+                ToolExecutionMetaInput {
+                    tool_call_id: tool_call.id.as_str(),
+                    function_name: tool_call.name.as_str(),
+                    command: command_preview.as_str(),
+                    arguments: tool_call.arguments.as_str(),
+                    result_payload: payload.as_str(),
+                    mode: "builtin",
+                    label: tool_call.name.as_str(),
+                    exit_code: None,
+                    duration_ms,
+                    timed_out: false,
+                    interrupted: false,
+                    blocked: false,
+                },
+            );
+            persist_tool_call_record(
+                services,
+                state,
+                group_id,
+                tool_call,
+                &tool_call.arguments,
+                payload.as_str(),
+                tool_meta.clone(),
+            );
+            attach_tool_meta_to_last_tool_message(state, &tool_meta);
+            attach_tool_meta_to_recent_running_tool_message(state, &tool_meta);
+            return payload;
+        }
         if services.mcp.has_ai_tool(&tool_call.name) {
             return execute_mcp_tool_call_tui(services, group_id, tool_call, state);
         }
@@ -4918,20 +5172,23 @@ fn execute_tool_call_tui(
             tool_call,
             &tool_call.arguments,
             payload.as_str(),
-            build_tool_execution_meta(services, ToolExecutionMetaInput {
-                tool_call_id: tool_call.id.as_str(),
-                function_name: tool_call.name.as_str(),
-                command: "",
-                arguments: tool_call.arguments.as_str(),
-                result_payload: payload.as_str(),
-                mode: "",
-                label: "",
-                exit_code: None,
-                duration_ms: 0,
-                timed_out: false,
-                interrupted: false,
-                blocked: false,
-            }),
+            build_tool_execution_meta(
+                services,
+                ToolExecutionMetaInput {
+                    tool_call_id: tool_call.id.as_str(),
+                    function_name: tool_call.name.as_str(),
+                    command: "",
+                    arguments: tool_call.arguments.as_str(),
+                    result_payload: payload.as_str(),
+                    mode: "",
+                    label: "",
+                    exit_code: None,
+                    duration_ms: 0,
+                    timed_out: false,
+                    interrupted: false,
+                    blocked: false,
+                },
+            ),
         );
         return payload;
     }
@@ -4954,20 +5211,23 @@ fn execute_tool_call_tui(
                 tool_call,
                 &tool_call.arguments,
                 payload.as_str(),
-                build_tool_execution_meta(services, ToolExecutionMetaInput {
-                    tool_call_id: tool_call.id.as_str(),
-                    function_name: tool_call.name.as_str(),
-                    command: "",
-                    arguments: tool_call.arguments.as_str(),
-                    result_payload: payload.as_str(),
-                    mode: "",
-                    label: "",
-                    exit_code: None,
-                    duration_ms: 0,
-                    timed_out: false,
-                    interrupted: false,
-                    blocked: false,
-                }),
+                build_tool_execution_meta(
+                    services,
+                    ToolExecutionMetaInput {
+                        tool_call_id: tool_call.id.as_str(),
+                        function_name: tool_call.name.as_str(),
+                        command: "",
+                        arguments: tool_call.arguments.as_str(),
+                        result_payload: payload.as_str(),
+                        mode: "",
+                        label: "",
+                        exit_code: None,
+                        duration_ms: 0,
+                        timed_out: false,
+                        interrupted: false,
+                        blocked: false,
+                    },
+                ),
             );
             return payload;
         }
@@ -4986,20 +5246,23 @@ fn execute_tool_call_tui(
             tool_call,
             tool_call.arguments.as_str(),
             payload.as_str(),
-            build_tool_execution_meta(services, ToolExecutionMetaInput {
-                tool_call_id: tool_call.id.as_str(),
-                function_name: tool_call.name.as_str(),
-                command: "",
-                arguments: tool_call.arguments.as_str(),
-                result_payload: payload.as_str(),
-                mode: "",
-                label: "",
-                exit_code: None,
-                duration_ms: 0,
-                timed_out: false,
-                interrupted: false,
-                blocked: false,
-            }),
+            build_tool_execution_meta(
+                services,
+                ToolExecutionMetaInput {
+                    tool_call_id: tool_call.id.as_str(),
+                    function_name: tool_call.name.as_str(),
+                    command: "",
+                    arguments: tool_call.arguments.as_str(),
+                    result_payload: payload.as_str(),
+                    mode: "",
+                    label: "",
+                    exit_code: None,
+                    duration_ms: 0,
+                    timed_out: false,
+                    interrupted: false,
+                    blocked: false,
+                },
+            ),
         );
         return payload;
     }
@@ -5047,24 +5310,27 @@ fn execute_tool_call_tui(
                     tool_call,
                     tool_call.arguments.as_str(),
                     payload.as_str(),
-                    build_tool_execution_meta(services, ToolExecutionMetaInput {
-                        tool_call_id: tool_call.id.as_str(),
-                        function_name: tool_call.name.as_str(),
-                        command: effective_command.as_str(),
-                        arguments: tool_call.arguments.as_str(),
-                        result_payload: payload.as_str(),
-                        mode: if matches!(mode, CommandMode::Write) {
-                            ui_text_mode_write()
-                        } else {
-                            ui_text_mode_read()
+                    build_tool_execution_meta(
+                        services,
+                        ToolExecutionMetaInput {
+                            tool_call_id: tool_call.id.as_str(),
+                            function_name: tool_call.name.as_str(),
+                            command: effective_command.as_str(),
+                            arguments: tool_call.arguments.as_str(),
+                            result_payload: payload.as_str(),
+                            mode: if matches!(mode, CommandMode::Write) {
+                                ui_text_mode_write()
+                            } else {
+                                ui_text_mode_read()
+                            },
+                            label: "",
+                            exit_code: None,
+                            duration_ms: 0,
+                            timed_out: false,
+                            interrupted: false,
+                            blocked: true,
                         },
-                        label: "",
-                        exit_code: None,
-                        duration_ms: 0,
-                        timed_out: false,
-                        interrupted: false,
-                        blocked: true,
-                    }),
+                    ),
                 );
                 return payload;
             }
@@ -5088,24 +5354,27 @@ fn execute_tool_call_tui(
                             tool_call,
                             tool_call.arguments.as_str(),
                             payload.as_str(),
-                            build_tool_execution_meta(services, ToolExecutionMetaInput {
-                                tool_call_id: tool_call.id.as_str(),
-                                function_name: tool_call.name.as_str(),
-                                command: effective_command.as_str(),
-                                arguments: tool_call.arguments.as_str(),
-                                result_payload: payload.as_str(),
-                                mode: if matches!(mode, CommandMode::Write) {
-                                    ui_text_mode_write()
-                                } else {
-                                    ui_text_mode_read()
+                            build_tool_execution_meta(
+                                services,
+                                ToolExecutionMetaInput {
+                                    tool_call_id: tool_call.id.as_str(),
+                                    function_name: tool_call.name.as_str(),
+                                    command: effective_command.as_str(),
+                                    arguments: tool_call.arguments.as_str(),
+                                    result_payload: payload.as_str(),
+                                    mode: if matches!(mode, CommandMode::Write) {
+                                        ui_text_mode_write()
+                                    } else {
+                                        ui_text_mode_read()
+                                    },
+                                    label: "",
+                                    exit_code: None,
+                                    duration_ms: 0,
+                                    timed_out: false,
+                                    interrupted: false,
+                                    blocked: true,
                                 },
-                                label: "",
-                                exit_code: None,
-                                duration_ms: 0,
-                                timed_out: false,
-                                interrupted: false,
-                                blocked: true,
-                            }),
+                            ),
                         );
                         return payload;
                     }
@@ -5122,24 +5391,27 @@ fn execute_tool_call_tui(
                             tool_call,
                             tool_call.arguments.as_str(),
                             payload.as_str(),
-                            build_tool_execution_meta(services, ToolExecutionMetaInput {
-                                tool_call_id: tool_call.id.as_str(),
-                                function_name: tool_call.name.as_str(),
-                                command: effective_command.as_str(),
-                                arguments: tool_call.arguments.as_str(),
-                                result_payload: payload.as_str(),
-                                mode: if matches!(mode, CommandMode::Write) {
-                                    ui_text_mode_write()
-                                } else {
-                                    ui_text_mode_read()
+                            build_tool_execution_meta(
+                                services,
+                                ToolExecutionMetaInput {
+                                    tool_call_id: tool_call.id.as_str(),
+                                    function_name: tool_call.name.as_str(),
+                                    command: effective_command.as_str(),
+                                    arguments: tool_call.arguments.as_str(),
+                                    result_payload: payload.as_str(),
+                                    mode: if matches!(mode, CommandMode::Write) {
+                                        ui_text_mode_write()
+                                    } else {
+                                        ui_text_mode_read()
+                                    },
+                                    label: "",
+                                    exit_code: None,
+                                    duration_ms: 0,
+                                    timed_out: false,
+                                    interrupted: false,
+                                    blocked: false,
                                 },
-                                label: "",
-                                exit_code: None,
-                                duration_ms: 0,
-                                timed_out: false,
-                                interrupted: false,
-                                blocked: false,
-                            }),
+                            ),
                         );
                         return payload;
                     }
@@ -5159,24 +5431,27 @@ fn execute_tool_call_tui(
                     tool_call,
                     tool_call.arguments.as_str(),
                     payload.as_str(),
-                    build_tool_execution_meta(services, ToolExecutionMetaInput {
-                        tool_call_id: tool_call.id.as_str(),
-                        function_name: tool_call.name.as_str(),
-                        command: effective_command.as_str(),
-                        arguments: tool_call.arguments.as_str(),
-                        result_payload: payload.as_str(),
-                        mode: if matches!(mode, CommandMode::Write) {
-                            ui_text_mode_write()
-                        } else {
-                            ui_text_mode_read()
+                    build_tool_execution_meta(
+                        services,
+                        ToolExecutionMetaInput {
+                            tool_call_id: tool_call.id.as_str(),
+                            function_name: tool_call.name.as_str(),
+                            command: effective_command.as_str(),
+                            arguments: tool_call.arguments.as_str(),
+                            result_payload: payload.as_str(),
+                            mode: if matches!(mode, CommandMode::Write) {
+                                ui_text_mode_write()
+                            } else {
+                                ui_text_mode_read()
+                            },
+                            label: "",
+                            exit_code: None,
+                            duration_ms: 0,
+                            timed_out: false,
+                            interrupted: false,
+                            blocked: false,
                         },
-                        label: "",
-                        exit_code: None,
-                        duration_ms: 0,
-                        timed_out: false,
-                        interrupted: false,
-                        blocked: false,
-                    }),
+                    ),
                 );
                 return payload;
             }
@@ -5227,20 +5502,23 @@ fn execute_tool_call_tui(
                     result.blocked
                 ),
             );
-            let tool_meta = build_tool_execution_meta(services, ToolExecutionMetaInput {
-                tool_call_id: tool_call.id.as_str(),
-                function_name: tool_call.name.as_str(),
-                command: effective_command.as_str(),
-                arguments: tool_call.arguments.as_str(),
-                result_payload: payload.as_str(),
-                mode: result.mode.as_str(),
-                label: result.label.as_str(),
-                exit_code: result.exit_code,
-                duration_ms: result.duration_ms,
-                timed_out: result.timed_out,
-                interrupted: result.interrupted,
-                blocked: result.blocked,
-            });
+            let tool_meta = build_tool_execution_meta(
+                services,
+                ToolExecutionMetaInput {
+                    tool_call_id: tool_call.id.as_str(),
+                    function_name: tool_call.name.as_str(),
+                    command: effective_command.as_str(),
+                    arguments: tool_call.arguments.as_str(),
+                    result_payload: payload.as_str(),
+                    mode: result.mode.as_str(),
+                    label: result.label.as_str(),
+                    exit_code: result.exit_code,
+                    duration_ms: result.duration_ms,
+                    timed_out: result.timed_out,
+                    interrupted: result.interrupted,
+                    blocked: result.blocked,
+                },
+            );
             persist_tool_call_record(
                 services,
                 state,
@@ -5261,24 +5539,27 @@ fn execute_tool_call_tui(
             })
             .to_string();
             state.push(UiRole::Tool, format!("{}: {}", ui_text_tool_error(), err));
-            let tool_meta = build_tool_execution_meta(services, ToolExecutionMetaInput {
-                tool_call_id: tool_call.id.as_str(),
-                function_name: tool_call.name.as_str(),
-                command: effective_command.as_str(),
-                arguments: tool_call.arguments.as_str(),
-                result_payload: payload.as_str(),
-                mode: if matches!(mode, CommandMode::Write) {
-                    ui_text_mode_write()
-                } else {
-                    ui_text_mode_read()
+            let tool_meta = build_tool_execution_meta(
+                services,
+                ToolExecutionMetaInput {
+                    tool_call_id: tool_call.id.as_str(),
+                    function_name: tool_call.name.as_str(),
+                    command: effective_command.as_str(),
+                    arguments: tool_call.arguments.as_str(),
+                    result_payload: payload.as_str(),
+                    mode: if matches!(mode, CommandMode::Write) {
+                        ui_text_mode_write()
+                    } else {
+                        ui_text_mode_read()
+                    },
+                    label: spec.label.as_str(),
+                    exit_code: None,
+                    duration_ms: 0,
+                    timed_out: false,
+                    interrupted: false,
+                    blocked: false,
                 },
-                label: spec.label.as_str(),
-                exit_code: None,
-                duration_ms: 0,
-                timed_out: false,
-                interrupted: false,
-                blocked: false,
-            });
+            );
             persist_tool_call_record(
                 services,
                 state,
@@ -5968,11 +6249,31 @@ fn draw_thread_rename_modal(
     if input_inner.width > 0 && input_inner.height > 0 {
         frame.set_cursor_position((input_inner.x + cursor_col as u16, input_inner.y));
     }
+    let clear_button = thread_rename_clear_button_data(layout);
+    let hint_width = clear_button
+        .as_ref()
+        .map(|button| {
+            body[2]
+                .width
+                .saturating_sub(button.rect.width.saturating_add(1))
+        })
+        .unwrap_or(body[2].width) as usize;
     frame.render_widget(
-        Paragraph::new(ui_text_thread_rename_modal_hint())
+        Paragraph::new(trim_ui_text(ui_text_thread_rename_modal_hint(), hint_width))
             .style(Style::default().fg(palette.muted)),
         body[2],
     );
+    if let Some(button) = clear_button {
+        frame.render_widget(
+            Paragraph::new(button.label).style(
+                Style::default()
+                    .fg(palette.panel_bg)
+                    .bg(Color::Rgb(255, 176, 122))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            button.rect,
+        );
+    }
 }
 
 fn execute_mcp_tool_call_tui(
@@ -6029,20 +6330,23 @@ fn execute_mcp_tool_call_tui(
     } else {
         extracted_command
     };
-    let tool_meta = build_tool_execution_meta(services, ToolExecutionMetaInput {
-        tool_call_id: tool_call.id.as_str(),
-        function_name: tool_call.name.as_str(),
-        command: effective_command.as_str(),
-        arguments: tool_call.arguments.as_str(),
-        result_payload: payload.as_str(),
-        mode: "mcp",
-        label: tool_call.name.as_str(),
-        exit_code: Some(exit_code),
-        duration_ms,
-        timed_out: false,
-        interrupted: false,
-        blocked: false,
-    });
+    let tool_meta = build_tool_execution_meta(
+        services,
+        ToolExecutionMetaInput {
+            tool_call_id: tool_call.id.as_str(),
+            function_name: tool_call.name.as_str(),
+            command: effective_command.as_str(),
+            arguments: tool_call.arguments.as_str(),
+            result_payload: payload.as_str(),
+            mode: "mcp",
+            label: tool_call.name.as_str(),
+            exit_code: Some(exit_code),
+            duration_ms,
+            timed_out: false,
+            interrupted: false,
+            blocked: false,
+        },
+    );
     persist_tool_call_record(
         services,
         state,
@@ -6084,6 +6388,9 @@ fn extract_http_status_code(raw: &str) -> Option<i32> {
 fn format_live_tool_label(name: &str) -> String {
     if name == "run_shell_command" {
         return "bash.run_shell_command".to_string();
+    }
+    if builtin_tools::is_builtin_tool(name) {
+        return format!("builtin.{name}");
     }
     if name.starts_with("mcp__") {
         return format!("mcp.{name}");
@@ -6166,6 +6473,47 @@ fn format_tool_result_payload(result: &CommandResult) -> String {
     .to_string()
 }
 
+fn maybe_persist_task_payload_in_tui(
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+    tool_call: &ToolCallRequest,
+    payload: &str,
+) -> String {
+    if !tool_call.name.eq_ignore_ascii_case("task") {
+        return payload.to_string();
+    }
+    let Some(task_args) = task_store::extract_task_call_args(tool_call.arguments.as_str()) else {
+        return payload.to_string();
+    };
+    let status = task_store::infer_task_status_from_payload(payload);
+    let record = match task_store::persist_task_record(task_store::PersistTaskRequest {
+        session_file: services.session.file_path(),
+        session_id: services.session.session_id(),
+        session_name: services.session.session_name(),
+        task_id: task_args.task_id.as_deref(),
+        description: task_args.description.as_str(),
+        status,
+        source: "builtin_task",
+        tool_call_id: tool_call.id.as_str(),
+        raw_payload: payload,
+    }) {
+        Ok(value) => value,
+        Err(err) => {
+            state.push(
+                UiRole::System,
+                format!(
+                    "{}: task persistence failed ({})",
+                    ui_text_tool_error(),
+                    i18n::localize_error(&err)
+                ),
+            );
+            return payload.to_string();
+        }
+    };
+    state.conversation_dirty = true;
+    task_store::augment_tool_payload_with_task(payload, &record)
+}
+
 fn persist_tool_call_record(
     services: &mut ActionServices<'_>,
     state: &mut ChatUiState,
@@ -6191,11 +6539,7 @@ fn persist_tool_call_record(
     }
 }
 
-fn report_tool_session_persist_failure(
-    state: &mut ChatUiState,
-    err: &AppError,
-    stage: &str,
-) {
+fn report_tool_session_persist_failure(state: &mut ChatUiState, err: &AppError, stage: &str) {
     state.push(
         UiRole::System,
         format!(
@@ -6284,17 +6628,6 @@ fn resolve_runtime_cwd() -> String {
         .ok()
         .map(|item| item.display().to_string())
         .unwrap_or_default()
-}
-
-fn should_require_tool_call(message: &str) -> bool {
-    const FORCE_TOOL_KEYWORDS: [&str; 12] = [
-        "执行", "检查", "排查", "inspect", "check", "run", "execute", "memory", "cpu", "disk",
-        "network", "process",
-    ];
-    let lowered = message.to_ascii_lowercase();
-    FORCE_TOOL_KEYWORDS
-        .iter()
-        .any(|keyword| lowered.contains(&keyword.to_ascii_lowercase()))
 }
 
 fn collect_cpu_metrics_local(
@@ -7013,13 +7346,28 @@ fn draw_main_header(
         .as_ref()
         .map(|live| format!("{} ", spinner_frame(live.started_at)))
         .unwrap_or_default();
-    let token_line = format!(
+    let task_items = if state.chat_mode == ChatInteractionMode::Task {
+        collect_task_board_items_for_state(state, TASK_BOARD_MAX_ITEMS)
+    } else {
+        Vec::new()
+    };
+    let mut token_line = format!(
         "{}{}: {}{}",
         token_prefix,
         ui_text_session_card_tokens(),
         format_u64_compact(state.token_display_value),
         token_live_hint
     );
+    if state.chat_mode == ChatInteractionMode::Task {
+        token_line.push_str(
+            format!(
+                " · {}:{}",
+                ui_text_task_list_title(),
+                format_u64_compact(task_items.len() as u64)
+            )
+            .as_str(),
+        );
+    }
     let right_width = cols[1].width.saturating_sub(2) as usize;
     frame.render_widget(
         Paragraph::new(vec![
@@ -7059,6 +7407,210 @@ fn draw_main_header(
         ),
         cols[1],
     );
+}
+
+fn prepend_task_board_lines(
+    lines: &mut Vec<ConversationLine>,
+    tasks: Vec<TaskBoardItem>,
+    width: usize,
+) {
+    if tasks.is_empty() {
+        return;
+    }
+    let content_width = width.max(1);
+    let mut prefixed = Vec::<ConversationLine>::new();
+    let pulse = if status_pulse_on() { "✦" } else { "✧" };
+    let (running, done, failed, blocked) = task_board_counts(tasks.as_slice());
+    let progress = task_board_progress_bar(done, tasks.len(), 14);
+    prefixed.push(ConversationLine {
+        kind: ConversationLineKind::Body,
+        role: UiRole::System,
+        text: trim_ui_text(
+            format!("{pulse} {} ({})", ui_text_task_list_title(), tasks.len()).as_str(),
+            content_width,
+        ),
+        message_index: None,
+    });
+    prefixed.push(ConversationLine {
+        kind: ConversationLineKind::Body,
+        role: UiRole::System,
+        text: trim_ui_text(
+            format!(
+                "  ◌{}:{}  ●{}:{}  ◆{}:{}  ■{}:{}",
+                ui_text_task_status_label(TaskBoardStatus::Running),
+                running,
+                ui_text_task_status_label(TaskBoardStatus::Done),
+                done,
+                ui_text_task_status_label(TaskBoardStatus::Failed),
+                failed,
+                ui_text_task_status_label(TaskBoardStatus::Blocked),
+                blocked
+            )
+            .as_str(),
+            content_width,
+        ),
+        message_index: None,
+    });
+    prefixed.push(ConversationLine {
+        kind: ConversationLineKind::Body,
+        role: UiRole::Assistant,
+        text: trim_ui_text(
+            format!("  {} {}", ui_text_task_progress(), progress).as_str(),
+            content_width,
+        ),
+        message_index: None,
+    });
+    for item in tasks {
+        let (icon, role) = match item.status {
+            TaskBoardStatus::Running => ("◌", UiRole::Thinking),
+            TaskBoardStatus::Done => ("●", UiRole::Assistant),
+            TaskBoardStatus::Failed => ("◆", UiRole::System),
+            TaskBoardStatus::Blocked => ("■", UiRole::Tool),
+        };
+        let line = format!(
+            "  {} [{}] {}",
+            icon,
+            ui_text_task_status_label(item.status),
+            item.name
+        );
+        prefixed.push(ConversationLine {
+            kind: ConversationLineKind::Body,
+            role,
+            text: trim_ui_text(line.as_str(), content_width),
+            message_index: None,
+        });
+    }
+    prefixed.push(ConversationLine {
+        kind: ConversationLineKind::Spacer,
+        role: UiRole::System,
+        text: String::new(),
+        message_index: None,
+    });
+    prefixed.extend(lines.iter().cloned());
+    *lines = prefixed;
+}
+
+fn task_board_counts(tasks: &[TaskBoardItem]) -> (usize, usize, usize, usize) {
+    let mut running = 0usize;
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    let mut blocked = 0usize;
+    for item in tasks {
+        match item.status {
+            TaskBoardStatus::Running => running += 1,
+            TaskBoardStatus::Done => done += 1,
+            TaskBoardStatus::Failed => failed += 1,
+            TaskBoardStatus::Blocked => blocked += 1,
+        }
+    }
+    (running, done, failed, blocked)
+}
+
+fn task_board_progress_bar(done: usize, total: usize, width: usize) -> String {
+    let safe_total = total.max(1);
+    let ratio = done as f64 / safe_total as f64;
+    let fill = (ratio * width as f64).round() as usize;
+    let capped_fill = fill.min(width);
+    let empty = width.saturating_sub(capped_fill);
+    let percent = ((ratio * 100.0).round() as usize).min(100);
+    format!(
+        "[{}{}] {}%",
+        "█".repeat(capped_fill),
+        "░".repeat(empty),
+        percent
+    )
+}
+
+fn collect_task_board_items_for_state(state: &ChatUiState, limit: usize) -> Vec<TaskBoardItem> {
+    let mut items = collect_task_board_items_from_persisted(state, limit);
+    if items.is_empty() {
+        items = collect_task_board_items(&state.messages, limit);
+    }
+    items
+}
+
+fn collect_task_board_items_from_persisted(
+    state: &ChatUiState,
+    limit: usize,
+) -> Vec<TaskBoardItem> {
+    let Some(active) = state
+        .threads
+        .iter()
+        .find(|item| item.session_id == state.current_session_id)
+    else {
+        return Vec::new();
+    };
+    let Ok(summary) = task_store::summarize_tasks_for_session(
+        active.file_path.as_path(),
+        active.session_id.as_str(),
+        limit,
+    ) else {
+        return Vec::new();
+    };
+    summary
+        .latest
+        .into_iter()
+        .map(|item| TaskBoardItem {
+            name: item.description,
+            status: match item.status {
+                task_store::TaskStatus::Running => TaskBoardStatus::Running,
+                task_store::TaskStatus::Done => TaskBoardStatus::Done,
+                task_store::TaskStatus::Failed => TaskBoardStatus::Failed,
+                task_store::TaskStatus::Blocked => TaskBoardStatus::Blocked,
+            },
+        })
+        .collect::<Vec<_>>()
+}
+
+fn collect_task_board_items(messages: &VecDeque<UiMessage>, limit: usize) -> Vec<TaskBoardItem> {
+    let mut items = Vec::<TaskBoardItem>::new();
+    for message in messages {
+        let Some(meta) = message.tool_meta.as_ref() else {
+            continue;
+        };
+        if !meta.function_name.eq_ignore_ascii_case("task") {
+            continue;
+        }
+        let name = task_name_from_tool_meta(meta);
+        if name.is_empty() {
+            continue;
+        }
+        let status = match task_store::infer_task_status_from_payload(meta.result_payload.as_str())
+        {
+            task_store::TaskStatus::Running => TaskBoardStatus::Running,
+            task_store::TaskStatus::Done => TaskBoardStatus::Done,
+            task_store::TaskStatus::Failed => TaskBoardStatus::Failed,
+            task_store::TaskStatus::Blocked => TaskBoardStatus::Blocked,
+        };
+        if let Some(existing) = items.iter_mut().find(|item| item.name == name) {
+            existing.status = status;
+        } else {
+            items.push(TaskBoardItem { name, status });
+        }
+    }
+    if items.len() <= limit {
+        return items;
+    }
+    items.split_off(items.len().saturating_sub(limit))
+}
+
+fn task_name_from_tool_meta(meta: &ToolExecutionMeta) -> String {
+    let command = meta.command.trim();
+    if let Some(text) = command.strip_prefix("description=") {
+        let name = text.trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+    if let Ok(args) = serde_json::from_str::<serde_json::Value>(meta.arguments.as_str())
+        && let Some(name) = args.get("description").and_then(|value| value.as_str())
+    {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    command.to_string()
 }
 
 fn conversation_text(state: &ChatUiState, palette: ThemePalette) -> Text<'static> {
@@ -7215,6 +7767,101 @@ fn conversation_tool_result_button_data(
         message_index: buttons.message_index,
         rect: result_rect,
     })
+}
+
+fn chat_input_action_buttons(
+    state: &ChatUiState,
+    layout: UiLayout,
+    button_area: Rect,
+) -> Vec<ChatInputActionButton> {
+    if state.mode != UiMode::Chat || state.pending_choice.is_some() || layout.input_body.height < 2
+    {
+        return Vec::new();
+    }
+    if button_area.width < 4 {
+        return Vec::new();
+    }
+    let mut buttons = Vec::<ChatInputActionButton>::new();
+    let mut cursor_x = button_area.x;
+    let max_x = button_area.x.saturating_add(button_area.width);
+    append_chat_input_action_button(
+        &mut buttons,
+        ChatInputActionKind::ModeToggle,
+        format!(
+            "[ {}: {} · {} ]",
+            ui_text_chat_mode_label(),
+            ui_text_chat_mode_value(state.chat_mode),
+            ui_text_chat_mode_temporary(),
+        ),
+        &mut cursor_x,
+        button_area.y,
+        max_x,
+    );
+    append_chat_input_action_button(
+        &mut buttons,
+        ChatInputActionKind::TrackingToggle,
+        format!(
+            "[ {}: {} ]",
+            ui_text_message_tracking_label(),
+            if state.message_tracking_enabled {
+                ui_text_message_tracking_on()
+            } else {
+                ui_text_message_tracking_off()
+            }
+        ),
+        &mut cursor_x,
+        button_area.y,
+        max_x,
+    );
+    if !conversation_is_at_bottom(state, layout.conversation_body.height.max(1)) {
+        append_chat_input_action_button(
+            &mut buttons,
+            ChatInputActionKind::JumpToLatest,
+            format!("[ {} ]", ui_text_jump_to_latest()),
+            &mut cursor_x,
+            button_area.y,
+            max_x,
+        );
+    }
+    buttons
+}
+
+fn append_chat_input_action_button(
+    buttons: &mut Vec<ChatInputActionButton>,
+    kind: ChatInputActionKind,
+    label: String,
+    cursor_x: &mut u16,
+    y: u16,
+    max_x: u16,
+) {
+    if *cursor_x >= max_x {
+        return;
+    }
+    let remaining = max_x.saturating_sub(*cursor_x);
+    if remaining < 4 {
+        return;
+    }
+    let width = text_display_width(&label).max(1).min(remaining as usize) as u16;
+    buttons.push(ChatInputActionButton {
+        kind,
+        label: trim_ui_text(&label, remaining as usize),
+        rect: Rect {
+            x: *cursor_x,
+            y,
+            width,
+            height: 1,
+        },
+    });
+    *cursor_x = (*cursor_x).saturating_add(width.saturating_add(1));
+}
+
+fn conversation_is_at_bottom(state: &ChatUiState, viewport_height: u16) -> bool {
+    let visible = viewport_height.max(1) as usize;
+    let max = state
+        .conversation_line_count
+        .saturating_sub(visible)
+        .min(u16::MAX as usize) as u16;
+    state.conversation_scroll >= max
 }
 
 fn conversation_hover_buttons_data(
@@ -7723,6 +8370,15 @@ fn draw_input_panel(
             palette,
         )));
     frame.render_widget(input_block, layout.input);
+    let (content_area, button_area) = if layout.input_body.height >= 2 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(layout.input_body);
+        (rows[0], Some(rows[1]))
+    } else {
+        (layout.input_body, None)
+    };
     if let Some(choice) = state.pending_choice.as_ref() {
         let mut lines = vec![Line::from(ui_text_choice_prompt())];
         for (idx, item) in choice.options.iter().enumerate() {
@@ -7733,17 +8389,46 @@ fn draw_input_panel(
             Paragraph::new(lines)
                 .style(Style::default().fg(palette.text))
                 .wrap(Wrap { trim: false }),
-            layout.input_body,
+            content_area,
         );
         return;
     }
-    let (visible, cursor_col) = project_input_view(&state.input, layout.input_body.width as usize);
+    let (visible, cursor_col) = project_input_view(&state.input, content_area.width as usize);
     frame.render_widget(
         Paragraph::new(visible).style(Style::default().fg(palette.text)),
-        layout.input_body,
+        content_area,
     );
+    if let Some(button_area) = button_area {
+        let buttons = chat_input_action_buttons(state, layout, button_area);
+        for button in buttons {
+            let style = match button.kind {
+                ChatInputActionKind::ModeToggle => Style::default()
+                    .fg(palette.panel_bg)
+                    .bg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+                ChatInputActionKind::TrackingToggle => {
+                    if state.message_tracking_enabled {
+                        Style::default()
+                            .fg(palette.panel_bg)
+                            .bg(Color::Rgb(102, 214, 170))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                            .fg(palette.text)
+                            .bg(Color::Rgb(74, 92, 118))
+                            .add_modifier(Modifier::BOLD)
+                    }
+                }
+                ChatInputActionKind::JumpToLatest => Style::default()
+                    .fg(palette.panel_bg)
+                    .bg(Color::Rgb(255, 200, 120))
+                    .add_modifier(Modifier::BOLD),
+            };
+            frame.render_widget(Paragraph::new(button.label).style(style), button.rect);
+        }
+    }
     if state.focus == FocusPanel::Input {
-        frame.set_cursor_position((layout.input_body.x + cursor_col as u16, layout.input_body.y));
+        frame.set_cursor_position((content_area.x + cursor_col as u16, content_area.y));
     }
 }
 
@@ -8953,6 +9638,14 @@ fn config_seed_fields() -> Vec<ConfigFieldSeed> {
             options: &[],
         },
         ConfigFieldSeed {
+            key: "ai.chat.mode",
+            label: "mode",
+            category: "ai.chat",
+            kind: ConfigFieldKind::Enum,
+            required: false,
+            options: &["chat", "task"],
+        },
+        ConfigFieldSeed {
             key: "ai.chat.show-tool",
             label: "show-tool",
             category: "ai.chat",
@@ -9185,6 +9878,70 @@ fn config_seed_fields() -> Vec<ConfigFieldSeed> {
             options: &[],
         },
         ConfigFieldSeed {
+            key: "ai.tools.builtin.enabled",
+            label: "enabled",
+            category: "ai.tools.builtin",
+            kind: ConfigFieldKind::Bool,
+            required: false,
+            options: &["false", "true"],
+        },
+        ConfigFieldSeed {
+            key: "ai.tools.builtin.web-search-enabled",
+            label: "web-search-enabled",
+            category: "ai.tools.builtin",
+            kind: ConfigFieldKind::Bool,
+            required: false,
+            options: &["false", "true"],
+        },
+        ConfigFieldSeed {
+            key: "ai.tools.builtin.web-search-timeout-seconds",
+            label: "web-search-timeout-seconds",
+            category: "ai.tools.builtin",
+            kind: ConfigFieldKind::U64,
+            required: false,
+            options: &[],
+        },
+        ConfigFieldSeed {
+            key: "ai.tools.builtin.web-search-max-results",
+            label: "web-search-max-results",
+            category: "ai.tools.builtin",
+            kind: ConfigFieldKind::Usize,
+            required: false,
+            options: &[],
+        },
+        ConfigFieldSeed {
+            key: "ai.tools.builtin.max-read-bytes",
+            label: "max-read-bytes",
+            category: "ai.tools.builtin",
+            kind: ConfigFieldKind::Usize,
+            required: false,
+            options: &[],
+        },
+        ConfigFieldSeed {
+            key: "ai.tools.builtin.max-search-results",
+            label: "max-search-results",
+            category: "ai.tools.builtin",
+            kind: ConfigFieldKind::Usize,
+            required: false,
+            options: &[],
+        },
+        ConfigFieldSeed {
+            key: "ai.tools.builtin.write-tools-enabled",
+            label: "write-tools-enabled",
+            category: "ai.tools.builtin",
+            kind: ConfigFieldKind::Bool,
+            required: false,
+            options: &["false", "true"],
+        },
+        ConfigFieldSeed {
+            key: "ai.tools.builtin.workspace-only",
+            label: "workspace-only",
+            category: "ai.tools.builtin",
+            kind: ConfigFieldKind::Bool,
+            required: false,
+            options: &["false", "true"],
+        },
+        ConfigFieldSeed {
             key: "ai.tools.skills.enabled",
             label: "enabled",
             category: "ai.tools.skills",
@@ -9298,6 +10055,7 @@ fn config_value_from_cfg(cfg: &AppConfig, key: &str) -> Option<String> {
         "ai.retry.max-retries" => cfg.ai.retry.max_retries.to_string(),
         "ai.retry.backoff-millis" => cfg.ai.retry.backoff_millis.to_string(),
         "ai.chat.show-tool" => bool_to_text(cfg.ai.chat.show_tool),
+        "ai.chat.mode" => cfg.ai.chat.mode.clone(),
         "ai.chat.show-tool-ok" => bool_to_text(cfg.ai.chat.show_tool_ok),
         "ai.chat.show-tool-err" => bool_to_text(cfg.ai.chat.show_tool_err),
         "ai.chat.show-tool-timeout" => bool_to_text(cfg.ai.chat.show_tool_timeout),
@@ -9345,6 +10103,24 @@ fn config_value_from_cfg(cfg: &AppConfig, key: &str) -> Option<String> {
         "ai.tools.bash.command-output-max-bytes" => {
             cfg.ai.tools.bash.command_output_max_bytes.to_string()
         }
+        "ai.tools.builtin.enabled" => bool_to_text(cfg.ai.tools.builtin.enabled),
+        "ai.tools.builtin.web-search-enabled" => {
+            bool_to_text(cfg.ai.tools.builtin.web_search_enabled)
+        }
+        "ai.tools.builtin.web-search-timeout-seconds" => {
+            cfg.ai.tools.builtin.web_search_timeout_seconds.to_string()
+        }
+        "ai.tools.builtin.web-search-max-results" => {
+            cfg.ai.tools.builtin.web_search_max_results.to_string()
+        }
+        "ai.tools.builtin.max-read-bytes" => cfg.ai.tools.builtin.max_read_bytes.to_string(),
+        "ai.tools.builtin.max-search-results" => {
+            cfg.ai.tools.builtin.max_search_results.to_string()
+        }
+        "ai.tools.builtin.write-tools-enabled" => {
+            bool_to_text(cfg.ai.tools.builtin.write_tools_enabled)
+        }
+        "ai.tools.builtin.workspace-only" => bool_to_text(cfg.ai.tools.builtin.workspace_only),
         "ai.tools.skills.enabled" => bool_to_text(cfg.ai.tools.skills.enabled),
         "ai.tools.skills.dir" => cfg.ai.tools.skills.dir.clone(),
         "ai.tools.mcp.enabled" => bool_to_text(cfg.ai.tools.mcp.enabled),
@@ -9405,6 +10181,7 @@ fn config_category_label(category: &str) -> String {
         "ai.chat" => ui_text_config_category_ai_chat().to_string(),
         "ai.chat.compression" => ui_text_config_category_ai_compression().to_string(),
         "ai.tools.bash" => ui_text_config_category_ai_tools_bash().to_string(),
+        "ai.tools.builtin" => ui_text_config_category_ai_tools_builtin().to_string(),
         "ai.tools.skills" => ui_text_config_category_skills().to_string(),
         "ai.tools.mcp" => ui_text_config_category_mcp().to_string(),
         "console" => ui_text_config_category_console().to_string(),
@@ -10589,6 +11366,39 @@ fn thread_rename_modal_rect(layout: UiLayout) -> Rect {
     centered_rect(layout.conversation, 62, 9)
 }
 
+fn thread_rename_clear_button_data(layout: UiLayout) -> Option<ThreadRenameClearButton> {
+    let modal = thread_rename_modal_rect(layout);
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .margin(1)
+        .split(modal);
+    let hint_row = body[2];
+    if hint_row.width < 8 {
+        return None;
+    }
+    let label = format!("[ {} ]", ui_text_clear_button());
+    let width = text_display_width(label.as_str())
+        .max(1)
+        .min(hint_row.width as usize) as u16;
+    let x = hint_row
+        .x
+        .saturating_add(hint_row.width.saturating_sub(width));
+    Some(ThreadRenameClearButton {
+        label: trim_ui_text(label.as_str(), hint_row.width as usize),
+        rect: Rect {
+            x,
+            y: hint_row.y,
+            width,
+            height: 1,
+        },
+    })
+}
+
 fn tool_result_modal_rect(layout: UiLayout) -> Rect {
     centered_rect(layout.conversation, 88, 24)
 }
@@ -10801,9 +11611,16 @@ fn build_session_metadata_report(services: &ActionServices<'_>, state: &ChatUiSt
         .saturating_div(context_max)
         .min(100);
     let total_chars = services.session.total_message_chars();
+    let task_summary = task_store::summarize_tasks_for_session(
+        services.session.file_path(),
+        services.session.session_id(),
+        3,
+    )
+    .unwrap_or_default();
+    let task_latest = format_task_summary_latest(task_summary.latest.as_slice());
     if lang_is_zh() {
         format!(
-            "会话元数据\nID: {}\n名称: {}\n文件: {}\n创建时间: {}\n最近更新: {}\n消息总数: {} (用户 {} / 助手 {} / 工具 {} / 系统 {})\n有效上下文: {} (用户 {} / 助手 {} / 工具 {} / 系统 {})\n摘要长度: {} 字符\n消息总字符数: {}\n上下文占用: {}% (recent={}, max={})\n压缩统计: rounds={}, truncated={}, dropped_groups={}\n运行期 Token: committed={}, live_estimate={}, display={}",
+            "会话元数据\nID: {}\n名称: {}\n文件: {}\n创建时间: {}\n最近更新: {}\n消息总数: {} (用户 {} / 助手 {} / 工具 {} / 系统 {})\n有效上下文: {} (用户 {} / 助手 {} / 工具 {} / 系统 {})\n摘要长度: {} 字符\n消息总字符数: {}\n上下文占用: {}% (recent={}, max={})\n压缩统计: rounds={}, truncated={}, dropped_groups={}\n任务目录: {}\n任务统计: total={} (running={} / done={} / failed={} / blocked={})\n最近任务: {}\n运行期 Token: committed={}, live_estimate={}, display={}",
             services.session.session_id(),
             services.session.session_name(),
             services.session.file_path().display(),
@@ -10827,13 +11644,20 @@ fn build_session_metadata_report(services: &ActionServices<'_>, state: &ChatUiSt
             compass.compression_rounds,
             compass.truncated_messages,
             compass.dropped_groups,
+            task_store::resolve_tasks_dir(services.session.file_path()).display(),
+            task_summary.total,
+            task_summary.running,
+            task_summary.done,
+            task_summary.failed,
+            task_summary.blocked,
+            task_latest,
             format_u64_compact(state.token_usage_committed),
             format_u64_compact(state.token_live_estimate),
             format_u64_compact(state.token_display_value),
         )
     } else {
         format!(
-            "Session metadata\nID: {}\nName: {}\nFile: {}\nCreated: {}\nUpdated: {}\nMessages: {} (user {} / assistant {} / tool {} / system {})\nEffective context: {} (user {} / assistant {} / tool {} / system {})\nSummary chars: {}\nMessage chars total: {}\nContext usage: {}% (recent={}, max={})\nCompression: rounds={}, truncated={}, dropped_groups={}\nRuntime token: committed={}, live_estimate={}, display={}",
+            "Session metadata\nID: {}\nName: {}\nFile: {}\nCreated: {}\nUpdated: {}\nMessages: {} (user {} / assistant {} / tool {} / system {})\nEffective context: {} (user {} / assistant {} / tool {} / system {})\nSummary chars: {}\nMessage chars total: {}\nContext usage: {}% (recent={}, max={})\nCompression: rounds={}, truncated={}, dropped_groups={}\nTask directory: {}\nTask stats: total={} (running={} / done={} / failed={} / blocked={})\nLatest tasks: {}\nRuntime token: committed={}, live_estimate={}, display={}",
             services.session.session_id(),
             services.session.session_name(),
             services.session.file_path().display(),
@@ -10857,6 +11681,13 @@ fn build_session_metadata_report(services: &ActionServices<'_>, state: &ChatUiSt
             compass.compression_rounds,
             compass.truncated_messages,
             compass.dropped_groups,
+            task_store::resolve_tasks_dir(services.session.file_path()).display(),
+            task_summary.total,
+            task_summary.running,
+            task_summary.done,
+            task_summary.failed,
+            task_summary.blocked,
+            task_latest,
             format_u64_compact(state.token_usage_committed),
             format_u64_compact(state.token_live_estimate),
             format_u64_compact(state.token_display_value),
@@ -10874,9 +11705,16 @@ fn build_thread_metadata_report(
         .saturating_mul(100)
         .saturating_div(context_max)
         .min(100);
+    let task_summary = task_store::summarize_tasks_for_session(
+        session.file_path.as_path(),
+        session.session_id.as_str(),
+        3,
+    )
+    .unwrap_or_default();
+    let task_latest = format_task_summary_latest(task_summary.latest.as_slice());
     if lang_is_zh() {
         format!(
-            "会话元数据\nID: {}\n名称: {}\n文件: {}\n创建时间: {}\n最近更新: {}\n消息总数: {} (用户 {} / 助手 {} / 工具 {} / 系统 {})\n摘要长度: {} 字符\n上下文占用: {}% (recent={}, max={})\n活跃会话: 否\n说明: 该会话未激活，运行期 Token 与压缩运行态指标需切换后查看",
+            "会话元数据\nID: {}\n名称: {}\n文件: {}\n创建时间: {}\n最近更新: {}\n消息总数: {} (用户 {} / 助手 {} / 工具 {} / 系统 {})\n摘要长度: {} 字符\n上下文占用: {}% (recent={}, max={})\n任务目录: {}\n任务统计: total={} (running={} / done={} / failed={} / blocked={})\n最近任务: {}\n活跃会话: 否\n说明: 该会话未激活，运行期 Token 与压缩运行态指标需切换后查看",
             session.session_id,
             session.session_name,
             session.file_path.display(),
@@ -10891,10 +11729,17 @@ fn build_thread_metadata_report(
             context_usage,
             services.cfg.session.recent_messages,
             services.cfg.session.max_messages,
+            task_store::resolve_tasks_dir(session.file_path.as_path()).display(),
+            task_summary.total,
+            task_summary.running,
+            task_summary.done,
+            task_summary.failed,
+            task_summary.blocked,
+            task_latest,
         )
     } else {
         format!(
-            "Session metadata\nID: {}\nName: {}\nFile: {}\nCreated: {}\nUpdated: {}\nMessages: {} (user {} / assistant {} / tool {} / system {})\nSummary chars: {}\nContext usage: {}% (recent={}, max={})\nActive session: no\nNote: this session is inactive; runtime token and compression-live metrics are available after switching to it",
+            "Session metadata\nID: {}\nName: {}\nFile: {}\nCreated: {}\nUpdated: {}\nMessages: {} (user {} / assistant {} / tool {} / system {})\nSummary chars: {}\nContext usage: {}% (recent={}, max={})\nTask directory: {}\nTask stats: total={} (running={} / done={} / failed={} / blocked={})\nLatest tasks: {}\nActive session: no\nNote: this session is inactive; runtime token and compression-live metrics are available after switching to it",
             session.session_id,
             session.session_name,
             session.file_path.display(),
@@ -10909,8 +11754,41 @@ fn build_thread_metadata_report(
             context_usage,
             services.cfg.session.recent_messages,
             services.cfg.session.max_messages,
+            task_store::resolve_tasks_dir(session.file_path.as_path()).display(),
+            task_summary.total,
+            task_summary.running,
+            task_summary.done,
+            task_summary.failed,
+            task_summary.blocked,
+            task_latest,
         )
     }
+}
+
+fn format_task_summary_latest(items: &[task_store::PersistedTask]) -> String {
+    if items.is_empty() {
+        return ui_text_na().to_string();
+    }
+    items
+        .iter()
+        .map(|item| {
+            format!(
+                "{}:{}({})",
+                short_id(item.task_id.as_str(), 8),
+                trim_ui_text(item.description.as_str(), 24),
+                task_store::status_to_label(item.status)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn short_id(raw: &str, take: usize) -> String {
+    if raw.chars().count() <= take {
+        return raw.to_string();
+    }
+    let prefix = raw.chars().take(take).collect::<String>();
+    format!("{prefix}…")
 }
 
 fn current_thread_overview<'a>(
@@ -11369,6 +12247,34 @@ fn extract_shell_command_from_tool_args(raw_args: &str) -> String {
         .to_string()
 }
 
+fn extract_tool_command_preview(function_name: &str, raw_args: &str) -> String {
+    if function_name == "run_shell_command" {
+        return extract_shell_command_from_tool_args(raw_args);
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_args) else {
+        return String::new();
+    };
+    let Some(obj) = value.as_object() else {
+        return String::new();
+    };
+    for key in [
+        "command",
+        "file_path",
+        "path",
+        "pattern",
+        "query",
+        "description",
+        "problem",
+    ] {
+        if let Some(text) = obj.get(key).and_then(|item| item.as_str())
+            && !text.trim().is_empty()
+        {
+            return trim_tool_text(format!("{key}={text}").as_str(), 280);
+        }
+    }
+    String::new()
+}
+
 fn tool_result_output_for_modal(raw_payload: &str) -> String {
     let trimmed = raw_payload.trim();
     if trimmed.is_empty() {
@@ -11409,22 +12315,36 @@ fn format_tool_status_summary_from_meta(meta: &ToolExecutionMeta) -> String {
     let ok = tool_result_ok_from_payload(meta.result_payload.as_str()).unwrap_or_else(|| {
         meta.exit_code == Some(0) && !meta.timed_out && !meta.interrupted && !meta.blocked
     });
+    let channel = infer_tool_channel(meta.function_name.as_str(), meta.mode.as_str());
     let exit_text = meta
         .exit_code
         .map(|code| format!("Some({code})"))
         .unwrap_or_else(|| "None".to_string());
     format!(
-        "{}: ok={} exit={} timeout={} blocked={}",
+        "{} [{}:{}]: ok={} exit={} timeout={} blocked={} duration={}ms",
         if ok {
             ui_text_tool_finished()
         } else {
             ui_text_tool_error()
         },
+        channel,
+        meta.function_name,
         ok,
         exit_text,
         meta.timed_out,
-        meta.blocked
+        meta.blocked,
+        meta.duration_ms
     )
+}
+
+fn infer_tool_channel(function_name: &str, mode: &str) -> &'static str {
+    if mode.eq_ignore_ascii_case("mcp") || function_name.starts_with("mcp__") {
+        return "mcp";
+    }
+    if mode.eq_ignore_ascii_case("builtin") || builtin_tools::is_builtin_tool(function_name) {
+        return "builtin";
+    }
+    "bash"
 }
 
 fn tool_result_ok_from_payload(raw_payload: &str) -> Option<bool> {
@@ -11998,6 +12918,9 @@ fn ui_text_config_category_ai_compression() -> &'static str {
 fn ui_text_config_category_ai_tools_bash() -> &'static str {
     zh_or_en("AI工具(Bash)", "AI Tools (Bash)")
 }
+fn ui_text_config_category_ai_tools_builtin() -> &'static str {
+    zh_or_en("AI工具(Builtin)", "AI Tools (Builtin)")
+}
 fn ui_text_config_category_skills() -> &'static str {
     zh_or_en("技能", "Skills")
 }
@@ -12111,9 +13034,12 @@ fn ui_text_thread_rename_modal_title() -> &'static str {
 }
 fn ui_text_thread_rename_modal_hint() -> &'static str {
     zh_or_en(
-        "输入新名称，Enter保存，Esc取消",
-        "Type new name, Enter to save, Esc to cancel",
+        "输入新名称，Enter保存，Esc取消，Ctrl+U清空",
+        "Type new name, Enter save, Esc cancel, Ctrl+U clear",
     )
+}
+fn ui_text_thread_rename_cleared() -> &'static str {
+    zh_or_en("线程名称输入已清空", "Rename input cleared")
 }
 fn ui_text_thread_delete_confirm_prompt() -> &'static str {
     zh_or_en("请确认是否删除该线程", "Confirm thread deletion")
@@ -12169,6 +13095,74 @@ fn ui_text_input_hint() -> &'static str {
         "Enter send, Tab switch panel, Ctrl+C/Ctrl+Z exit",
     )
 }
+fn ui_text_chat_mode_label() -> &'static str {
+    zh_or_en("交互模式", "Mode")
+}
+fn ui_text_chat_mode_temporary() -> &'static str {
+    zh_or_en("临时", "Temp")
+}
+fn ui_text_chat_mode_value(mode: ChatInteractionMode) -> &'static str {
+    match mode {
+        ChatInteractionMode::Chat => "Chat",
+        ChatInteractionMode::Task => "Task",
+    }
+}
+fn ui_text_chat_mode_switched_temporary(mode: ChatInteractionMode) -> String {
+    if lang_is_zh() {
+        return format!(
+            "已临时切换交互模式为 {}；若需持久化，请修改 ai.chat.mode 或在【配置】页面保存。",
+            ui_text_chat_mode_value(mode)
+        );
+    }
+    format!(
+        "Temporarily switched interaction mode to {}; edit ai.chat.mode or use Config to persist.",
+        ui_text_chat_mode_value(mode)
+    )
+}
+fn ui_text_message_tracking_label() -> &'static str {
+    zh_or_en("消息跟踪", "Tracking")
+}
+fn ui_text_message_tracking_on() -> &'static str {
+    zh_or_en("开启", "On")
+}
+fn ui_text_message_tracking_off() -> &'static str {
+    zh_or_en("关闭", "Off")
+}
+fn ui_text_message_tracking_enabled() -> &'static str {
+    zh_or_en(
+        "已开启消息跟踪，将自动定位到最新消息",
+        "Message tracking enabled",
+    )
+}
+fn ui_text_message_tracking_disabled() -> &'static str {
+    zh_or_en(
+        "已关闭消息跟踪，可手动浏览历史消息",
+        "Message tracking disabled",
+    )
+}
+fn ui_text_jump_to_latest() -> &'static str {
+    zh_or_en("下滑至底部", "Jump to latest")
+}
+fn ui_text_jump_to_latest_done() -> &'static str {
+    zh_or_en("已定位到最新消息", "Moved to latest messages")
+}
+fn ui_text_clear_button() -> &'static str {
+    zh_or_en("清空", "Clear")
+}
+fn ui_text_task_list_title() -> &'static str {
+    zh_or_en("任务", "Tasks")
+}
+fn ui_text_task_status_label(status: TaskBoardStatus) -> &'static str {
+    match status {
+        TaskBoardStatus::Running => zh_or_en("进行中", "Running"),
+        TaskBoardStatus::Done => zh_or_en("已完成", "Done"),
+        TaskBoardStatus::Failed => zh_or_en("失败", "Failed"),
+        TaskBoardStatus::Blocked => zh_or_en("拦截", "Blocked"),
+    }
+}
+fn ui_text_task_progress() -> &'static str {
+    zh_or_en("进度", "Progress")
+}
 fn ui_text_theme_hint() -> &'static str {
     zh_or_en("F2切换主题", "F2 switch theme")
 }
@@ -12194,7 +13188,10 @@ fn ui_text_status_ai_thinking() -> &'static str {
     zh_or_en("[AI] 深度思考中", "[AI] reasoning")
 }
 fn ui_text_status_ai_tooling() -> &'static str {
-    zh_or_en("[AI] 工具执行中(Bash/MCP)", "[AI] running tools (Bash/MCP)")
+    zh_or_en(
+        "[AI] 工具执行中(Builtin/Bash/MCP)",
+        "[AI] running tools (Builtin/Bash/MCP)",
+    )
 }
 fn ui_text_status_ai_cancelling() -> &'static str {
     zh_or_en("[AI] 正在取消请求", "[AI] cancelling request")
@@ -12436,7 +13433,10 @@ fn ui_text_message_tool_result_modal_closed() -> &'static str {
     zh_or_en("已关闭执行结果弹窗", "Execution result modal closed")
 }
 fn ui_text_message_tool_result_unavailable() -> &'static str {
-    zh_or_en("当前消息没有可展示的执行结果", "No execution result for this message")
+    zh_or_en(
+        "当前消息没有可展示的执行结果",
+        "No execution result for this message",
+    )
 }
 fn ui_text_message_tool_result_meta_call_id() -> &'static str {
     zh_or_en("调用ID:", "Call ID:")
@@ -12550,16 +13550,19 @@ fn ui_text_thread_metadata_closed() -> &'static str {
     zh_or_en("已关闭线程元数据弹窗", "Thread metadata modal closed")
 }
 fn ui_text_tool_running() -> &'static str {
-    zh_or_en("Bash执行中", "Bash running")
+    zh_or_en("工具执行中", "Tool running")
 }
 fn ui_text_tool_finished() -> &'static str {
-    zh_or_en("Bash执行完成", "Bash finished")
+    zh_or_en("工具执行完成", "Tool finished")
 }
 fn ui_text_tool_error() -> &'static str {
-    zh_or_en("Bash执行错误", "Bash tool error")
+    zh_or_en("工具执行错误", "Tool error")
 }
 fn ui_text_tool_persist_failed() -> &'static str {
-    zh_or_en("工具消息写入会话失败", "Failed to persist tool message to session")
+    zh_or_en(
+        "工具消息写入会话失败",
+        "Failed to persist tool message to session",
+    )
 }
 fn ui_text_tool_persist_failed_hint() -> &'static str {
     zh_or_en(
@@ -12670,6 +13673,18 @@ model = "test-model"
         )
     }
 
+    fn mode_button_area(layout: UiLayout) -> Rect {
+        Rect {
+            x: layout.input_body.x,
+            y: layout
+                .input_body
+                .y
+                .saturating_add(layout.input_body.height.saturating_sub(1)),
+            width: layout.input_body.width,
+            height: 1,
+        }
+    }
+
     fn mock_overview(id: &str, name: &str, active: bool) -> SessionOverview {
         SessionOverview {
             session_id: id.to_string(),
@@ -12685,6 +13700,171 @@ model = "test-model"
             last_updated_epoch_ms: 0,
             active,
         }
+    }
+
+    #[test]
+    fn chat_mode_defaults_to_chat() {
+        let state = new_state();
+        assert_eq!(state.chat_mode, ChatInteractionMode::Chat);
+    }
+
+    #[test]
+    fn chat_mode_toggle_button_is_renderable_in_chat_input() {
+        let state = new_state();
+        let layout = compute_layout(Rect::new(0, 0, 160, 42));
+        let button = chat_input_action_buttons(&state, layout, mode_button_area(layout))
+            .into_iter()
+            .find(|item| item.kind == ChatInputActionKind::ModeToggle)
+            .expect("mode button should exist");
+        assert!(button.label.contains("Chat"));
+        assert!(button.rect.width > 0);
+    }
+
+    #[test]
+    fn chat_mode_toggle_button_is_hidden_when_choice_pending() {
+        let mut state = new_state();
+        state.pending_choice = Some(PendingChoice {
+            options: vec!["A".to_string(), "B".to_string()],
+            selected: 0,
+        });
+        let layout = compute_layout(Rect::new(0, 0, 160, 42));
+        let has_mode = chat_input_action_buttons(&state, layout, mode_button_area(layout))
+            .into_iter()
+            .any(|item| item.kind == ChatInputActionKind::ModeToggle);
+        assert!(!has_mode);
+    }
+
+    #[test]
+    fn chat_input_buttons_include_tracking_toggle() {
+        let state = new_state();
+        let layout = compute_layout(Rect::new(0, 0, 160, 42));
+        let buttons = chat_input_action_buttons(&state, layout, mode_button_area(layout));
+        assert!(
+            buttons
+                .iter()
+                .any(|item| item.kind == ChatInputActionKind::TrackingToggle)
+        );
+    }
+
+    #[test]
+    fn jump_to_latest_button_appears_when_not_at_bottom() {
+        let mut state = new_state();
+        state.set_conversation_wrap_width(60);
+        for idx in 0..20 {
+            state.push(UiRole::Assistant, format!("history {idx}"));
+        }
+        state.ensure_conversation_cache();
+        state.message_tracking_enabled = false;
+        state.follow_tail = false;
+        state.conversation_scroll = 0;
+        let layout = compute_layout(Rect::new(0, 0, 160, 42));
+        state.clamp_scroll(layout.conversation_body.height.max(1));
+        let buttons = chat_input_action_buttons(&state, layout, mode_button_area(layout));
+        assert!(
+            buttons
+                .iter()
+                .any(|item| item.kind == ChatInputActionKind::JumpToLatest)
+        );
+    }
+
+    #[test]
+    fn tracking_disabled_prevents_auto_follow_on_new_message() {
+        let mut state = new_state();
+        state.set_conversation_wrap_width(60);
+        for idx in 0..18 {
+            state.push(UiRole::Assistant, format!("history {idx}"));
+        }
+        state.ensure_conversation_cache();
+        state.follow_tail = true;
+        state.clamp_scroll(8);
+        state.message_tracking_enabled = false;
+        state.follow_tail = false;
+        state.clamp_scroll(8);
+        let before = state.conversation_scroll;
+        state.push(UiRole::Assistant, "new message");
+        state.ensure_conversation_cache();
+        state.clamp_scroll(8);
+        assert!(!state.follow_tail);
+        assert_eq!(state.conversation_scroll, before);
+    }
+
+    #[test]
+    fn thread_rename_modal_has_clear_button() {
+        let layout = compute_layout(Rect::new(0, 0, 160, 42));
+        let button = thread_rename_clear_button_data(layout).expect("clear button should exist");
+        assert!(button.rect.width > 0);
+    }
+
+    #[test]
+    fn task_board_collects_task_items_from_task_tool_meta() {
+        let mut state = new_state();
+        state.messages.push_back(UiMessage {
+            role: UiRole::Tool,
+            text: "task done".to_string(),
+            tool_meta: Some(ToolExecutionMeta {
+                tool_call_id: "call-task-1".to_string(),
+                function_name: "Task".to_string(),
+                command: "description=生成报告".to_string(),
+                arguments: "{\"description\":\"生成报告\"}".to_string(),
+                result_payload: "{\"ok\":true}".to_string(),
+                executed_at_epoch_ms: 1,
+                account: "tester".to_string(),
+                environment: "dev".to_string(),
+                os_name: "macos".to_string(),
+                cwd: "/tmp".to_string(),
+                mode: "builtin".to_string(),
+                label: "task".to_string(),
+                exit_code: None,
+                duration_ms: 10,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            }),
+        });
+        let items = collect_task_board_items(&state.messages, TASK_BOARD_MAX_ITEMS);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "生成报告");
+        assert_eq!(items[0].status, TaskBoardStatus::Done);
+    }
+
+    #[test]
+    fn task_mode_conversation_prepends_task_list_lines() {
+        let mut state = new_state();
+        state.chat_mode = ChatInteractionMode::Task;
+        state.set_conversation_wrap_width(100);
+        state.messages.push_back(UiMessage {
+            role: UiRole::Tool,
+            text: "task done".to_string(),
+            tool_meta: Some(ToolExecutionMeta {
+                tool_call_id: "call-task-2".to_string(),
+                function_name: "Task".to_string(),
+                command: "description=同步文档".to_string(),
+                arguments: "{\"description\":\"同步文档\"}".to_string(),
+                result_payload: "{\"ok\":true}".to_string(),
+                executed_at_epoch_ms: 1,
+                account: "tester".to_string(),
+                environment: "dev".to_string(),
+                os_name: "macos".to_string(),
+                cwd: "/tmp".to_string(),
+                mode: "builtin".to_string(),
+                label: "task".to_string(),
+                exit_code: None,
+                duration_ms: 10,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            }),
+        });
+        state.message_persisted.push_back(false);
+        state.ensure_conversation_cache();
+        let rendered = state
+            .conversation_lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains(ui_text_task_list_title()));
+        assert!(rendered.contains("同步文档"));
     }
 
     #[test]
@@ -12804,7 +13984,10 @@ model = "test-model"
     fn set_threads_prunes_orphaned_session_cache_entries() {
         let mut state = new_state();
         state.set_active_session("a".to_string());
-        state.threads = vec![mock_overview("a", "A", true), mock_overview("b", "B", false)];
+        state.threads = vec![
+            mock_overview("a", "A", true),
+            mock_overview("b", "B", false),
+        ];
         state.session_conversation_cache.insert(
             "a".to_string(),
             SessionConversationCache {
@@ -12839,7 +14022,10 @@ model = "test-model"
             },
         );
 
-        state.set_threads(vec![mock_overview("a", "A", true), mock_overview("b", "B", false)]);
+        state.set_threads(vec![
+            mock_overview("a", "A", true),
+            mock_overview("b", "B", false),
+        ]);
 
         assert!(state.session_conversation_cache.contains_key("a"));
         assert!(state.session_conversation_cache.contains_key("b"));
@@ -12850,24 +14036,34 @@ model = "test-model"
     fn set_threads_prunes_orphaned_auto_title_tracking() {
         let mut state = new_state();
         state.set_active_session("a".to_string());
-        state.threads = vec![mock_overview("a", "A", true), mock_overview("b", "B", false)];
+        state.threads = vec![
+            mock_overview("a", "A", true),
+            mock_overview("b", "B", false),
+        ];
         state.session_auto_title_attempted.insert("a".to_string());
         state.session_auto_title_attempted.insert("b".to_string());
         state
             .session_auto_title_attempted
             .insert("orphan".to_string());
         let (_tx_keep, rx_keep) = mpsc::channel::<Result<String, AppError>>();
-        state.session_auto_title_workers.push(SessionAutoTitleHandle {
-            session_id: "a".to_string(),
-            rx: rx_keep,
-        });
+        state
+            .session_auto_title_workers
+            .push(SessionAutoTitleHandle {
+                session_id: "a".to_string(),
+                rx: rx_keep,
+            });
         let (_tx_drop, rx_drop) = mpsc::channel::<Result<String, AppError>>();
-        state.session_auto_title_workers.push(SessionAutoTitleHandle {
-            session_id: "orphan".to_string(),
-            rx: rx_drop,
-        });
+        state
+            .session_auto_title_workers
+            .push(SessionAutoTitleHandle {
+                session_id: "orphan".to_string(),
+                rx: rx_drop,
+            });
 
-        state.set_threads(vec![mock_overview("a", "A", true), mock_overview("b", "B", false)]);
+        state.set_threads(vec![
+            mock_overview("a", "A", true),
+            mock_overview("b", "B", false),
+        ]);
 
         assert!(state.session_auto_title_attempted.contains("a"));
         assert!(state.session_auto_title_attempted.contains("b"));
@@ -13238,7 +14434,10 @@ model = "test-model"
         let mut state = new_state();
         state.messages.push_back(UiMessage {
             role: UiRole::Tool,
-            text: "Bash执行完成: ok=true exit=Some(0) timeout=false blocked=false".to_string(),
+            text: format!(
+                "{} [bash:run_shell_command]: ok=true exit=Some(0) timeout=false blocked=false duration=12ms",
+                ui_text_tool_finished()
+            ),
             tool_meta: Some(ToolExecutionMeta {
                 tool_call_id: "call_1".to_string(),
                 function_name: "run_shell_command".to_string(),
@@ -13363,16 +14562,13 @@ model = "test-model"
 
     #[test]
     fn session_auto_title_prompts_follow_app_language() {
-        let (_, zh_cn_prompt) =
-            build_session_auto_title_prompts(i18n::Language::ZhCn, "测试消息");
+        let (_, zh_cn_prompt) = build_session_auto_title_prompts(i18n::Language::ZhCn, "测试消息");
         assert!(zh_cn_prompt.contains("简体中文"));
 
-        let (_, zh_tw_prompt) =
-            build_session_auto_title_prompts(i18n::Language::ZhTw, "測試訊息");
+        let (_, zh_tw_prompt) = build_session_auto_title_prompts(i18n::Language::ZhTw, "測試訊息");
         assert!(zh_tw_prompt.contains("繁體中文"));
 
-        let (_, en_prompt) =
-            build_session_auto_title_prompts(i18n::Language::En, "test message");
+        let (_, en_prompt) = build_session_auto_title_prompts(i18n::Language::En, "test message");
         assert!(en_prompt.contains("Output language must be English"));
     }
 
@@ -13816,7 +15012,10 @@ model = "test-model"
         let mut state = new_state();
         state.messages.push_back(UiMessage {
             role: UiRole::Tool,
-            text: "Bash执行完成: ok=true exit=Some(0) timeout=false blocked=false".to_string(),
+            text: format!(
+                "{} [bash:run_shell_command]: ok=true exit=Some(0) timeout=false blocked=false duration=19ms",
+                ui_text_tool_finished()
+            ),
             tool_meta: Some(ToolExecutionMeta {
                 tool_call_id: "call-output".to_string(),
                 function_name: "run_shell_command".to_string(),
@@ -13897,7 +15096,10 @@ model = "test-model"
         let finished_detail = tool_result_detail_from_message(&state.messages[1])
             .expect("finished message should have tool detail");
         assert_eq!(running_detail.tool_call_id, finished_detail.tool_call_id);
-        assert_eq!(running_detail.result_payload, finished_detail.result_payload);
+        assert_eq!(
+            running_detail.result_payload,
+            finished_detail.result_payload
+        );
     }
 
     #[test]
@@ -13917,9 +15119,8 @@ model = "test-model"
 
     #[test]
     fn mcp_exit_code_from_error_falls_back_to_500() {
-        let with_status = AppError::Runtime(
-            "MCP http request failed: status=404 Not Found, body={}".to_string(),
-        );
+        let with_status =
+            AppError::Runtime("MCP http request failed: status=404 Not Found, body={}".to_string());
         assert_eq!(mcp_exit_code_from_error(&with_status), 404);
         let without_status = AppError::Runtime("MCP request timeout".to_string());
         assert_eq!(mcp_exit_code_from_error(&without_status), 500);

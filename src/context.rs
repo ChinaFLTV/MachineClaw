@@ -1312,7 +1312,9 @@ fn parse_session_message_lenient(value: &serde_json::Value) -> Option<SessionMes
     })
 }
 
-fn parse_tool_execution_meta_lenient(value: Option<&serde_json::Value>) -> Option<ToolExecutionMeta> {
+fn parse_tool_execution_meta_lenient(
+    value: Option<&serde_json::Value>,
+) -> Option<ToolExecutionMeta> {
     let object = value?.as_object()?;
     let meta = ToolExecutionMeta {
         tool_call_id: value_to_string(object.get("tool_call_id")).unwrap_or_default(),
@@ -1339,11 +1341,7 @@ fn parse_tool_execution_meta_lenient(value: Option<&serde_json::Value>) -> Optio
         || !meta.arguments.trim().is_empty()
         || !meta.result_payload.trim().is_empty()
         || meta.executed_at_epoch_ms > 0;
-    if has_payload {
-        Some(meta)
-    } else {
-        None
-    }
+    if has_payload { Some(meta) } else { None }
 }
 
 fn parse_session_compass_lenient(value: Option<&serde_json::Value>) -> SessionCompass {
@@ -1933,7 +1931,10 @@ mod tests {
     fn build_chat_history_skips_thinking_and_tool_progress_messages() {
         let mut store = build_store("");
         store.add_thinking_message("step-1".to_string(), Some("g1".to_string()));
-        store.add_tool_message("Bash执行中: demo [读]\ndate".to_string(), Some("g1".to_string()));
+        store.add_tool_message(
+            "Bash执行中: demo [读]\ndate".to_string(),
+            Some("g1".to_string()),
+        );
         store.add_tool_message_with_meta(
             r#"tool_call_id=call_1 function=run_shell_command args={"command":"date"} result={"ok":true,"stdout":"Sun"}"#.to_string(),
             Some("g1".to_string()),

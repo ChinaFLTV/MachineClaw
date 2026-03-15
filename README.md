@@ -170,7 +170,8 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 
 - `[app]`：语言、环境模式（`prod/test/dev`）
 - `[ai]`：协议类型（`type`）、API 地址、Token、模型、重试
-- `[ai.chat]`：chat 行为、工具显示、压缩、超时、轮次上限
+- `[ai.chat]`：chat 行为、交互模式（`chat/task`）、工具显示、压缩、超时、轮次上限
+- `[ai.tools.builtin]`：Claude 风格内置工具（View/LS/GlobTool/GrepTool/WebSearch/Think/Task/Architect）及写入型工具开关
 - `[ai.tools.bash]`：Bash 工具的命令超时、写命令确认、allow/deny 规则
 - `[ai.tools.skills]`：Skills 目录与开关
 - `[ai.tools.mcp]`：MCP 开关、可用性检查策略与 JSON 配置目录
@@ -180,6 +181,39 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 
 > 重要：`[cmd]`、`[skills]`、`[mcp]` 旧根段已彻底废弃，不再兼容。  
 > 请统一使用 `ai.tools.bash`、`ai.tools.skills`、`ai.tools.mcp`。
+
+### Builtin 工具配置建议
+
+```toml
+[ai.tools.builtin]
+enabled = true
+web-search-enabled = true
+web-search-timeout-seconds = 10
+web-search-max-results = 5
+max-read-bytes = 131072
+max-search-results = 100
+write-tools-enabled = false
+workspace-only = true
+```
+
+- 内置只读工具默认启用：`View`、`LS`、`GlobTool`、`GrepTool`、`WebSearch`、`Think`、`Task`、`Architect`。
+- 写入型工具（`Edit`/`Replace`/`NotebookEditCell`）默认关闭，开启需设置 `write-tools-enabled = true`。
+- `workspace-only = true` 时，内置工具会拒绝访问当前工作目录之外的路径。
+- `Task` 工具支持可选参数：`task_id`（稳定任务ID）、`status`（`running/done/failed/blocked`）、`acceptance_criteria`、`evidence`。
+- Task 模式下任务状态会持久化到 `./.machineclaw/tasks/tasks-{task_id}.json`，并按 `session_id` 关联。
+
+### Chat 模式配置建议
+
+```toml
+[ai.chat]
+mode = "chat" # chat | task，默认 chat
+```
+
+- `chat`：保持当前对话式交互流程（默认）。
+- `task`：启用任务编排导向交互（更强计划/验收/分步执行约束）。
+- TUI 输入区底部可临时切换 Chat/Task；该切换仅对当前运行有效，不会写回配置文件。
+- TUI 输入区底部提供“消息跟踪”与“下滑至底部”按钮：关闭跟踪后不会因新消息自动拉到底部，可随时一键回到底部；开启跟踪后会持续跟随最新消息。
+- TUI 会话区会显示 Task List（状态、进度）并在会话元数据弹窗展示任务目录/统计/最近任务。
 
 ### MCP 配置建议
 
@@ -226,6 +260,7 @@ MachineClaw [OPTIONS] <COMMAND>
 配置键示例（使用新路径）：
 
 - `MachineClaw config get ai.tools.bash.command-timeout-seconds`
+- `MachineClaw config get ai.tools.builtin.max-search-results`
 - `MachineClaw config get ai.tools.skills.dir`
 - `MachineClaw config set ai.tools.mcp.enabled true`
 

@@ -1,4 +1,6 @@
 use std::{
+    borrow::Cow,
+    collections::VecDeque,
     io::{self, IsTerminal, Read, Write},
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -62,6 +64,16 @@ static WRITE_HINT_PATTERNS: Lazy<Vec<&'static str>> = Lazy::new(|| {
 
 static DETACHED_AMPERSAND_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(^|\s)&(\s|$)").expect("valid detached ampersand regex"));
+static HEREDOC_START_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?P<op><<-?)\s*(?:'(?P<sq>[^']+)'|"(?P<dq>[^"]+)"|(?P<bare>[^\s<>&|;]+))"#)
+        .expect("valid heredoc start regex")
+});
+
+#[derive(Debug, Clone)]
+struct HeredocBoundary {
+    delimiter: String,
+    strip_tabs: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandMode {
@@ -678,8 +690,11 @@ fn command_matches_regex_rule(command: &str, pattern: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
+    let normalized = command_policy_match_text(command);
     match Regex::new(trimmed) {
-        Ok(regex) => regex.is_match(command),
+        Ok(regex) => regex.find_iter(normalized.as_ref()).any(|capture| {
+            has_word_boundaries(normalized.as_ref(), capture.start(), capture.end())
+        }),
         Err(err) => {
             logging::warn(&format!(
                 "invalid command regex pattern ignored: pattern={}, err={}",
@@ -689,6 +704,92 @@ fn command_matches_regex_rule(command: &str, pattern: &str) -> bool {
             false
         }
     }
+}
+
+fn command_policy_match_text(command: &str) -> Cow<'_, str> {
+    if !command.contains("<<") || !command.contains('\n') {
+        return Cow::Borrowed(command);
+    }
+    Cow::Owned(strip_heredoc_bodies(command))
+}
+
+fn strip_heredoc_bodies(command: &str) -> String {
+    let mut pending = VecDeque::<HeredocBoundary>::new();
+    let mut kept_lines = Vec::<String>::new();
+    for line in command.lines() {
+        if let Some(active) = pending.front() {
+            let normalized = line.trim_end_matches('\r');
+            let terminator = if active.strip_tabs {
+                normalized.trim_start_matches('\t')
+            } else {
+                normalized
+            };
+            if terminator == active.delimiter {
+                pending.pop_front();
+            }
+            continue;
+        }
+        kept_lines.push(line.to_string());
+        for capture in HEREDOC_START_RE.captures_iter(line) {
+            let delimiter = capture
+                .name("sq")
+                .or_else(|| capture.name("dq"))
+                .or_else(|| capture.name("bare"))
+                .map(|item| item.as_str().trim().to_string())
+                .filter(|item| !item.is_empty());
+            let Some(delimiter) = delimiter else {
+                continue;
+            };
+            let strip_tabs = capture
+                .name("op")
+                .is_some_and(|item| item.as_str() == "<<-");
+            pending.push_back(HeredocBoundary {
+                delimiter,
+                strip_tabs,
+            });
+        }
+    }
+    kept_lines.join("\n")
+}
+
+fn has_word_boundaries(text: &str, start: usize, end: usize) -> bool {
+    let mut normalized_start = start.min(text.len());
+    let mut normalized_end = end.min(text.len());
+    while normalized_start < normalized_end {
+        let Some(ch) = text[normalized_start..].chars().next() else {
+            break;
+        };
+        if is_word_char(ch) {
+            break;
+        }
+        normalized_start = normalized_start.saturating_add(ch.len_utf8());
+    }
+    while normalized_end > normalized_start {
+        let Some(ch) = text[..normalized_end].chars().next_back() else {
+            break;
+        };
+        if is_word_char(ch) {
+            break;
+        }
+        normalized_end = normalized_end.saturating_sub(ch.len_utf8());
+    }
+    let prev = if normalized_start == 0 {
+        None
+    } else {
+        text[..normalized_start].chars().next_back()
+    };
+    let next = if normalized_end >= text.len() {
+        None
+    } else {
+        text[normalized_end..].chars().next()
+    };
+    let left_ok = prev.is_none_or(|ch| !is_word_char(ch));
+    let right_ok = next.is_none_or(|ch| !is_word_char(ch));
+    left_ok && right_ok
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn parse_confirm_mode(raw: &str) -> WriteConfirmMode {
@@ -895,8 +996,8 @@ mod tests {
     use crate::config::CmdConfig;
 
     use super::{
-        CommandMode, CommandSpec, ShellExecutor, WriteDecision, looks_like_detached_command,
-        note_interactive_input_wait, parse_write_decision_input,
+        CommandMode, CommandSpec, ShellExecutor, WriteDecision, command_matches_regex_rule,
+        looks_like_detached_command, note_interactive_input_wait, parse_write_decision_input,
         take_interactive_input_refresh_hint,
     };
 
@@ -949,6 +1050,33 @@ mod tests {
             Some(WriteDecision::Reject)
         );
         assert_eq!(parse_write_decision_input("m\n", false), None);
+    }
+
+    #[test]
+    fn regex_rule_avoids_false_positive_inside_word_for_rm_star() {
+        assert!(!command_matches_regex_rule("echo JFrame", "rm *"));
+        assert!(!command_matches_regex_rule(
+            "printf \"format text\"",
+            "rm *"
+        ));
+    }
+
+    #[test]
+    fn regex_rule_matches_rm_command_with_token_boundary() {
+        assert!(command_matches_regex_rule("rm test.txt", "rm *"));
+        assert!(command_matches_regex_rule("sudo rm   /tmp/a.log", "rm *"));
+    }
+
+    #[test]
+    fn regex_rule_ignores_heredoc_body_content() {
+        let command = "cat > demo.txt <<'EOF'\nthis is sample text\nrm *\nEOF\ncat demo.txt";
+        assert!(!command_matches_regex_rule(command, "rm *"));
+    }
+
+    #[test]
+    fn regex_rule_matches_command_after_heredoc_body() {
+        let command = "cat > demo.txt <<'EOF'\nhello\nEOF\nrm *";
+        assert!(command_matches_regex_rule(command, "rm *"));
     }
 
     #[test]

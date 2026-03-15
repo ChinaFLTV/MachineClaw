@@ -1,5 +1,6 @@
 mod actions;
 mod ai;
+mod builtin_tools;
 mod cli;
 mod config;
 mod config_action;
@@ -14,6 +15,7 @@ mod render;
 mod shell;
 mod skills;
 mod snapshot;
+mod task_store;
 mod test_action;
 mod tls;
 mod tui;

@@ -683,7 +683,12 @@ impl AiClient {
 
         let mut messages = build_base_messages(history, system_prompt, user_prompt);
         let mut tools = vec![shell_tool_definition()];
-        tools.extend(extra_tools.iter().map(external_tool_definition));
+        let mut seen_tool_names = HashSet::<String>::from(["run_shell_command".to_string()]);
+        for tool in extra_tools {
+            if seen_tool_names.insert(tool.name.clone()) {
+                tools.push(external_tool_definition(tool));
+            }
+        }
         let mut forced_retry_used = false;
         let mut total_tool_calls: usize = 0;
         let mut tool_result_cache: HashMap<String, String> = HashMap::new();
@@ -962,7 +967,7 @@ impl AiClient {
                 forced_retry_used = true;
                 messages.push(ApiMessage {
                     role: "system".to_string(),
-                    content: Some("You are running locally with direct tool access. You MUST call at least one relevant tool before giving a final answer for this request. Do not default to run_shell_command when a matching MCP tool exists.".to_string()),
+                    content: Some("You are running locally with direct tool access. You MUST call at least one relevant tool before giving a final answer for this request. Prefer matching MCP tools first, then built-in tools (View/LS/GlobTool/GrepTool/WebSearch), and use run_shell_command only when needed.".to_string()),
                     reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -1018,7 +1023,7 @@ impl AiClient {
                 });
                 messages.push(ApiMessage {
                     role: "system".to_string(),
-                    content: Some("Policy requires at least one tool call in this round. Choose the most relevant available tool now (MCP when it clearly matches, otherwise run_shell_command) instead of giving a final text-only response.".to_string()),
+                    content: Some("Policy requires at least one tool call in this round. Choose the most relevant available tool now (MCP when it clearly matches, otherwise built-in tools, otherwise run_shell_command) instead of giving a final text-only response.".to_string()),
                     reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -3021,6 +3026,15 @@ fn build_guard_tool_result(reason: &str) -> String {
 }
 
 fn is_cacheable_tool_request(request: &ToolCallRequest) -> bool {
+    if is_builtin_read_tool_name(&request.name) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&request.arguments) {
+            return !value
+                .get("apply")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        }
+        return false;
+    }
     if request.name != "run_shell_command" {
         return false;
     }
@@ -3055,6 +3069,25 @@ fn normalize_tool_signature(name: &str, arguments: &str) -> String {
         return format!("{name}::{normalized_mode}::{command}");
     }
     format!("{name}::{}", arguments.trim())
+}
+
+fn is_builtin_read_tool_name(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase().replace(['_', '-'], "");
+    matches!(
+        normalized.as_str(),
+        "view"
+            | "readfile"
+            | "ls"
+            | "listfiles"
+            | "globtool"
+            | "globsearch"
+            | "greptool"
+            | "grepsearch"
+            | "websearch"
+            | "think"
+            | "task"
+            | "architect"
+    )
 }
 
 fn tool_result_timed_out(payload: &str) -> bool {
@@ -4636,18 +4669,18 @@ mod tests {
         RequestTraceEntry, SessionRequestTraceFile, StreamToolCallDelta, StreamToolFunctionDelta,
         assistant_reasoning_text, build_claude_request_body, build_provider_chat_url,
         builtin_model_prices, extract_text_delta_from_value, extract_text_from_value,
-        finalize_tool_calls, fresh_model_price_catalog, is_rate_limited_error, merge_text_delta,
-        merge_tool_call_delta, merge_visible_chunks, model_prefers_non_streaming_tool_rounds,
-        normalize_stepfun_chat_request, parse_claude_response_text, parse_gemini_response_text,
-        parse_model_price_catalog_response, parse_model_price_probe_response,
-        parse_rate_limit_retry_delay, price_probe_candidate_models,
-        provider_protocol_from_config_type, provider_requires_reasoning_content_omission,
-        request_contains_reasoning_content, resolve_effective_model_prices,
-        should_fallback_to_non_streaming, should_refresh_http_client_after_reqwest_error,
-        should_retry_without_reasoning_content, should_write_direct_stdout,
-        strip_reasoning_content_from_request, with_cost,
+        finalize_tool_calls, fresh_model_price_catalog, is_cacheable_tool_request,
+        is_rate_limited_error, merge_text_delta, merge_tool_call_delta, merge_visible_chunks,
+        model_prefers_non_streaming_tool_rounds, normalize_stepfun_chat_request,
+        parse_claude_response_text, parse_gemini_response_text, parse_model_price_catalog_response,
+        parse_model_price_probe_response, parse_rate_limit_retry_delay,
+        price_probe_candidate_models, provider_protocol_from_config_type,
+        provider_requires_reasoning_content_omission, request_contains_reasoning_content,
+        resolve_effective_model_prices, should_fallback_to_non_streaming,
+        should_refresh_http_client_after_reqwest_error, should_retry_without_reasoning_content,
+        should_write_direct_stdout, strip_reasoning_content_from_request, with_cost,
     };
-    use crate::{error::AppError, tls::ensure_rustls_crypto_provider};
+    use crate::{ai::ToolCallRequest, error::AppError, tls::ensure_rustls_crypto_provider};
 
     fn test_ai_client() -> AiClient {
         ensure_rustls_crypto_provider();
@@ -4885,6 +4918,32 @@ mod tests {
     fn cost_is_unavailable_for_unknown_model_without_config() {
         let metrics = with_cost(ChatMetrics::default(), "unknown-model", 0.0, 0.0, None);
         assert_eq!(metrics.estimated_cost_usd, None);
+    }
+
+    #[test]
+    fn builtin_tool_cacheability_rejects_invalid_json() {
+        let request = ToolCallRequest {
+            id: "tool_1".to_string(),
+            name: "View".to_string(),
+            arguments: "{not-json".to_string(),
+        };
+        assert!(!is_cacheable_tool_request(&request));
+    }
+
+    #[test]
+    fn builtin_tool_cacheability_respects_apply_flag() {
+        let cacheable = ToolCallRequest {
+            id: "tool_2".to_string(),
+            name: "View".to_string(),
+            arguments: "{\"file_path\":\"README.md\"}".to_string(),
+        };
+        let non_cacheable = ToolCallRequest {
+            id: "tool_3".to_string(),
+            name: "View".to_string(),
+            arguments: "{\"file_path\":\"README.md\",\"apply\":true}".to_string(),
+        };
+        assert!(is_cacheable_tool_request(&cacheable));
+        assert!(!is_cacheable_tool_request(&non_cacheable));
     }
 
     #[test]

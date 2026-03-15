@@ -8,6 +8,7 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::{
     cli::ConfigCommands,
+    config::{normalize_chat_interaction_mode, parse_config_text},
     error::{AppError, ExitCode},
     i18n::{self, Language},
 };
@@ -77,7 +78,9 @@ fn run_set(
     let (mut doc, file_exists) = read_document_with_state(config_path)?;
     let existed_before = get_item_by_path(&doc, key).is_some();
     let value_item = parse_user_value(value_raw)?;
+    validate_key_value_before_write(key, &value_item)?;
     set_item_by_path(&mut doc, key, value_item.clone())?;
+    ensure_config_document_parseable(config_path, &doc)?;
 
     write_document(config_path, &doc)?;
 
@@ -92,6 +95,30 @@ fn run_set(
         ),
         exit_code: ExitCode::Success,
     })
+}
+
+fn ensure_config_document_parseable(config_path: &Path, doc: &DocumentMut) -> Result<(), AppError> {
+    let raw = doc.to_string();
+    parse_config_text(&raw, &config_path.display().to_string())
+        .map(|_| ())
+        .map_err(|err| AppError::Config(format!("failed to parse updated config: {err}")))
+}
+
+fn validate_key_value_before_write(key: &str, value_item: &Item) -> Result<(), AppError> {
+    if key != "ai.chat.mode" {
+        return Ok(());
+    }
+    let raw = value_item
+        .as_value()
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| AppError::Config("ai.chat.mode must be string: chat|task".to_string()))?;
+    let normalized = normalize_chat_interaction_mode(raw);
+    if matches!(normalized, "chat" | "task") {
+        return Ok(());
+    }
+    Err(AppError::Config(
+        "ai.chat.mode must be one of: chat, task".to_string(),
+    ))
 }
 
 fn read_document_if_exists(path: &Path) -> Result<DocumentMut, AppError> {
@@ -299,6 +326,7 @@ pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
         "ai.retry.max-retries" => Some("2"),
         "ai.retry.backoff-millis" => Some("1500"),
         "ai.chat.show-tool" => Some("false"),
+        "ai.chat.mode" => Some("\"chat\""),
         "ai.chat.show-tool-ok" => Some("false"),
         "ai.chat.show-tool-err" => Some("false"),
         "ai.chat.show-tool-timeout" => Some("false"),
@@ -329,6 +357,14 @@ pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
         "ai.tools.bash.write-cmd-allow-patterns" => Some("[]"),
         "ai.tools.bash.write-cmd-deny-patterns" => Some("[]"),
         "ai.tools.bash.command-output-max-bytes" => Some("262144"),
+        "ai.tools.builtin.enabled" => Some("true"),
+        "ai.tools.builtin.web-search-enabled" => Some("true"),
+        "ai.tools.builtin.web-search-timeout-seconds" => Some("10"),
+        "ai.tools.builtin.web-search-max-results" => Some("5"),
+        "ai.tools.builtin.max-read-bytes" => Some("131072"),
+        "ai.tools.builtin.max-search-results" => Some("100"),
+        "ai.tools.builtin.write-tools-enabled" => Some("false"),
+        "ai.tools.builtin.workspace-only" => Some("true"),
         "ai.tools.skills.enabled" => Some("false"),
         "ai.tools.skills.dir" => Some("\"~/.skills\""),
         "ai.tools.mcp.enabled" => Some("false"),
@@ -358,6 +394,7 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
         "ai.retry.max-retries",
         "ai.retry.backoff-millis",
         "ai.chat.show-tool",
+        "ai.chat.mode",
         "ai.chat.show-tool-ok",
         "ai.chat.show-tool-err",
         "ai.chat.show-tool-timeout",
@@ -388,6 +425,14 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
         "ai.tools.bash.write-cmd-allow-patterns",
         "ai.tools.bash.write-cmd-deny-patterns",
         "ai.tools.bash.command-output-max-bytes",
+        "ai.tools.builtin.enabled",
+        "ai.tools.builtin.web-search-enabled",
+        "ai.tools.builtin.web-search-timeout-seconds",
+        "ai.tools.builtin.web-search-max-results",
+        "ai.tools.builtin.max-read-bytes",
+        "ai.tools.builtin.max-search-results",
+        "ai.tools.builtin.write-tools-enabled",
+        "ai.tools.builtin.workspace-only",
         "ai.tools.skills.enabled",
         "ai.tools.skills.dir",
         "ai.tools.mcp.enabled",
@@ -556,7 +601,14 @@ fn format_value_for_display(key: &str, value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_known_config_key;
+    use std::path::Path;
+
+    use toml_edit::DocumentMut;
+
+    use super::{
+        ensure_config_document_parseable, is_known_config_key, parse_literal_to_item,
+        validate_key_value_before_write,
+    };
 
     #[test]
     fn known_config_keys_include_ai_tools_mcp_fields() {
@@ -565,6 +617,7 @@ mod tests {
         ));
         assert!(is_known_config_key("ai.tools.mcp.enabled"));
         assert!(is_known_config_key("ai.tools.mcp.dir"));
+        assert!(is_known_config_key("ai.chat.mode"));
     }
 
     #[test]
@@ -577,5 +630,39 @@ mod tests {
     fn legacy_cmd_keys_are_not_supported_anymore() {
         assert!(!is_known_config_key("cmd.command-timeout-seconds"));
         assert!(!is_known_config_key("cmd.write-cmd-run-confirm"));
+    }
+
+    #[test]
+    fn validate_ai_chat_mode_before_write_accepts_chat_and_task() {
+        let chat = parse_literal_to_item("\"chat\"").expect("chat literal");
+        let task = parse_literal_to_item("\"task\"").expect("task literal");
+        assert!(validate_key_value_before_write("ai.chat.mode", &chat).is_ok());
+        assert!(validate_key_value_before_write("ai.chat.mode", &task).is_ok());
+    }
+
+    #[test]
+    fn validate_ai_chat_mode_before_write_rejects_invalid_values() {
+        let invalid = parse_literal_to_item("\"invalid\"").expect("invalid literal");
+        let non_string = parse_literal_to_item("123").expect("number literal");
+        assert!(validate_key_value_before_write("ai.chat.mode", &invalid).is_err());
+        assert!(validate_key_value_before_write("ai.chat.mode", &non_string).is_err());
+    }
+
+    #[test]
+    fn config_set_parse_guard_rejects_invalid_scalar_types() {
+        let doc = r#"
+[ai]
+base-url = "https://example.com/v1"
+token = "sk-test"
+model = "test-model"
+
+[ai.retry]
+max-retries = "invalid"
+"#
+        .parse::<DocumentMut>()
+        .expect("parse test doc");
+        let err = ensure_config_document_parseable(Path::new("inline"), &doc)
+            .expect_err("invalid type must fail parse guard");
+        assert!(err.to_string().contains("failed to parse updated config"));
     }
 }
