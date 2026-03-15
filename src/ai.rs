@@ -5,13 +5,14 @@ use std::{
     io::{BufRead, BufReader, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        RwLock,
+        Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crossterm::terminal::is_raw_mode_enabled;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::StatusCode;
@@ -38,6 +39,8 @@ const AI_HTTP_CONNECT_TIMEOUT_SECS: u64 = 8;
 const AI_HTTP_REQUEST_TIMEOUT_SECS: u64 = 60;
 const AI_HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 30;
 const AI_HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
+const REQUEST_TRACE_FILE_VERSION: u32 = 1;
+const REQUEST_TRACE_MAX_ENTRIES: usize = 1000;
 const CHAT_CANCELLED_ERROR: &str = "chat request cancelled by user";
 const CLAUDE_MAX_TOKENS: u32 = 4096;
 const CLAUDE_API_VERSION: &str = "2023-06-01";
@@ -148,6 +151,7 @@ pub struct AiClient {
     model: String,
     colorful: bool,
     model_price_cache_path: PathBuf,
+    request_trace_dir: PathBuf,
     debug: bool,
     max_retries: u32,
     backoff_millis: u64,
@@ -179,6 +183,7 @@ impl Clone for AiClient {
             model: self.model.clone(),
             colorful: self.colorful,
             model_price_cache_path: self.model_price_cache_path.clone(),
+            request_trace_dir: self.request_trace_dir.clone(),
             debug: self.debug,
             max_retries: self.max_retries,
             backoff_millis: self.backoff_millis,
@@ -286,7 +291,7 @@ struct ChatCompletionStreamResponse {
     usage: Usage,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct Usage {
     #[serde(default)]
     prompt_tokens: u64,
@@ -372,6 +377,36 @@ struct PersistedModelPriceEntry {
     checked_at_epoch_secs: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct SessionRequestTraceFile {
+    #[serde(default = "default_request_trace_file_version")]
+    version: u32,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    entries: Vec<RequestTraceEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RequestTraceEntry {
+    timestamp_epoch_ms: u128,
+    event: String,
+    stream: bool,
+    attempt: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_packets: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_packets: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 impl AiClient {
     fn build_http_client() -> Result<Client, AppError> {
         ensure_rustls_crypto_provider();
@@ -391,6 +426,10 @@ impl AiClient {
     ) -> Result<Self, AppError> {
         let client = Self::build_http_client()?;
         let provider = provider_protocol_from_config_type(cfg.r#type.as_str());
+        let request_trace_dir = model_price_cache_path
+            .parent()
+            .unwrap_or_else(|| Path::new(".machineclaw"))
+            .join("requests");
         Ok(Self {
             client: RwLock::new(client),
             provider,
@@ -399,6 +438,7 @@ impl AiClient {
             model: cfg.model.clone(),
             colorful,
             model_price_cache_path,
+            request_trace_dir,
             debug: cfg.debug,
             max_retries: cfg.retry.max_retries,
             backoff_millis: cfg.retry.backoff_millis,
@@ -549,6 +589,16 @@ impl AiClient {
         system_prompt: &str,
         user_prompt: &str,
     ) -> Result<String, AppError> {
+        self.chat_with_debug_session(history, system_prompt, user_prompt, None)
+    }
+
+    pub fn chat_with_debug_session(
+        &self,
+        history: &[ChatMessage],
+        system_prompt: &str,
+        user_prompt: &str,
+        debug_session_id: Option<&str>,
+    ) -> Result<String, AppError> {
         let messages = build_base_messages(history, system_prompt, user_prompt);
         let request = ChatCompletionRequest {
             model: self.model.clone(),
@@ -558,7 +608,7 @@ impl AiClient {
             tool_choice: None,
             stream: None,
         };
-        let call = self.send_chat_completion(&request, None)?;
+        let call = self.send_chat_completion(&request, None, debug_session_id)?;
         let assistant = call.assistant;
 
         let content = assistant_content_text(&assistant);
@@ -568,7 +618,7 @@ impl AiClient {
         Ok(content)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn chat_with_shell_tool<F, G>(
         &self,
         history: &[ChatMessage],
@@ -580,6 +630,44 @@ impl AiClient {
         stream_output: bool,
         extra_tools: &[ExternalToolDefinition],
         cancel_requested: Option<&AtomicBool>,
+        execute_tool: F,
+        on_round_event: impl FnMut(ChatRoundEvent),
+        on_stream_event: G,
+    ) -> Result<ChatToolResponse, AppError>
+    where
+        F: FnMut(&ToolCallRequest) -> String,
+        G: FnMut(ChatStreamEvent),
+    {
+        self.chat_with_shell_tool_with_debug_session(
+            history,
+            system_prompt,
+            user_prompt,
+            policy,
+            max_tool_rounds,
+            max_total_tool_calls,
+            stream_output,
+            extra_tools,
+            cancel_requested,
+            None,
+            execute_tool,
+            on_round_event,
+            on_stream_event,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_with_shell_tool_with_debug_session<F, G>(
+        &self,
+        history: &[ChatMessage],
+        system_prompt: &str,
+        user_prompt: &str,
+        policy: ToolUsePolicy,
+        max_tool_rounds: usize,
+        max_total_tool_calls: usize,
+        stream_output: bool,
+        extra_tools: &[ExternalToolDefinition],
+        cancel_requested: Option<&AtomicBool>,
+        debug_session_id: Option<&str>,
         mut execute_tool: F,
         mut on_round_event: impl FnMut(ChatRoundEvent),
         mut on_stream_event: G,
@@ -645,6 +733,7 @@ impl AiClient {
                 stream_output,
                 &mut on_stream_event,
                 cancel_requested,
+                debug_session_id,
             ) {
                 Ok(call) => call,
                 Err(err) => {
@@ -863,6 +952,7 @@ impl AiClient {
                         stream_output,
                         &mut on_stream_event,
                         cancel_requested,
+                        debug_session_id,
                     );
                 }
                 continue;
@@ -998,6 +1088,7 @@ impl AiClient {
             stream_output,
             &mut on_stream_event,
             cancel_requested,
+            debug_session_id,
         )
     }
 
@@ -1005,6 +1096,7 @@ impl AiClient {
         &self,
         body: &ChatCompletionRequest,
         cancel_requested: Option<&AtomicBool>,
+        debug_session_id: Option<&str>,
     ) -> Result<ApiChatCallResult, AppError> {
         let mut effective_body = normalize_request_for_provider(body, &self.base_url);
         let mut stripped_reasoning_retry_used = false;
@@ -1051,6 +1143,24 @@ impl AiClient {
                 self.current_http_client()?
             };
             let request_body = self.build_provider_request_body(&effective_body);
+            let request_body_text = mask_sensitive(&serialize_debug_json(&request_body));
+            let user_packets = collect_role_packets(&effective_body.messages, "user");
+            let tool_packets = collect_role_packets(&effective_body.messages, "tool");
+            self.append_request_trace_entry(
+                debug_session_id,
+                RequestTraceEntry {
+                    timestamp_epoch_ms: now_epoch_ms(),
+                    event: "request".to_string(),
+                    stream: false,
+                    attempt,
+                    status_code: None,
+                    request_body: Some(request_body_text),
+                    response_body: None,
+                    user_packets: (!user_packets.is_empty()).then_some(user_packets),
+                    tool_packets: (!tool_packets.is_empty()).then_some(tool_packets),
+                    error: None,
+                },
+            );
             let request_builder = self.apply_provider_auth(client.post(&self.base_url));
             let resp = request_builder.json(&request_body).send();
 
@@ -1058,6 +1168,21 @@ impl AiClient {
                 Ok(resp) => resp,
                 Err(err) => {
                     let err_msg = format!("AI request failed: {}", format_reqwest_error(&err));
+                    self.append_request_trace_entry(
+                        debug_session_id,
+                        RequestTraceEntry {
+                            timestamp_epoch_ms: now_epoch_ms(),
+                            event: "response".to_string(),
+                            stream: false,
+                            attempt,
+                            status_code: None,
+                            request_body: None,
+                            response_body: None,
+                            user_packets: None,
+                            tool_packets: None,
+                            error: Some(mask_sensitive(&err_msg)),
+                        },
+                    );
                     logging::warn(&err_msg);
                     if attempt <= self.max_retries {
                         retry_with_fresh_client =
@@ -1089,6 +1214,21 @@ impl AiClient {
                     .text()
                     .unwrap_or_else(|_| "<unreadable body>".to_string());
                 let safe_body = mask_sensitive(&body);
+                self.append_request_trace_entry(
+                    debug_session_id,
+                    RequestTraceEntry {
+                        timestamp_epoch_ms: now_epoch_ms(),
+                        event: "response".to_string(),
+                        stream: false,
+                        attempt,
+                        status_code: Some(status.as_u16()),
+                        request_body: None,
+                        response_body: Some(safe_body.clone()),
+                        user_packets: None,
+                        tool_packets: None,
+                        error: None,
+                    },
+                );
                 let err_msg = format!("AI HTTP status={status}, body={safe_body}");
                 self.debug_emit(
                     AiDebugLevel::Error,
@@ -1138,6 +1278,21 @@ impl AiClient {
                         "failed to read AI response body: {}",
                         format_reqwest_error(&err)
                     );
+                    self.append_request_trace_entry(
+                        debug_session_id,
+                        RequestTraceEntry {
+                            timestamp_epoch_ms: now_epoch_ms(),
+                            event: "response".to_string(),
+                            stream: false,
+                            attempt,
+                            status_code: Some(status.as_u16()),
+                            request_body: None,
+                            response_body: None,
+                            user_packets: None,
+                            tool_packets: None,
+                            error: Some(mask_sensitive(&err_msg)),
+                        },
+                    );
                     logging::warn(&err_msg);
                     if attempt <= self.max_retries {
                         retry_with_fresh_client =
@@ -1160,6 +1315,22 @@ impl AiClient {
             self.debug_emit(
                 AiDebugLevel::Debug,
                 &format!("AI response body: {}", mask_sensitive(&response_text)),
+            );
+            let safe_response = mask_sensitive(&response_text);
+            self.append_request_trace_entry(
+                debug_session_id,
+                RequestTraceEntry {
+                    timestamp_epoch_ms: now_epoch_ms(),
+                    event: "response".to_string(),
+                    stream: false,
+                    attempt,
+                    status_code: Some(status.as_u16()),
+                    request_body: None,
+                    response_body: Some(safe_response),
+                    user_packets: None,
+                    tool_packets: None,
+                    error: None,
+                },
             );
             let parsed = self.parse_provider_response_text(&response_text)?;
             logging::info("AI request finished successfully");
@@ -1189,12 +1360,13 @@ impl AiClient {
         stream_output: bool,
         on_stream_event: &mut G,
         cancel_requested: Option<&AtomicBool>,
+        debug_session_id: Option<&str>,
     ) -> Result<ApiChatCallResult, AppError>
     where
         G: FnMut(ChatStreamEvent),
     {
         if !stream_output {
-            return self.send_chat_completion(body, cancel_requested);
+            return self.send_chat_completion(body, cancel_requested, debug_session_id);
         }
         let allow_tool_round_compat_fallback =
             body.tools.is_some() && model_prefers_non_streaming_tool_rounds(&self.model);
@@ -1215,7 +1387,7 @@ impl AiClient {
                 AiDebugLevel::Warn,
                 "AI streaming is not enabled for current provider protocol; fallback to non-streaming mode",
             );
-            return self.send_chat_completion(body, cancel_requested);
+            return self.send_chat_completion(body, cancel_requested, debug_session_id);
         }
 
         let mut effective_body = normalize_request_for_provider(body, &self.base_url);
@@ -1239,12 +1411,30 @@ impl AiClient {
             let started = Instant::now();
             let mut stream_body = effective_body.clone();
             stream_body.stream = Some(true);
+            let stream_request_body = self.build_provider_request_body(&stream_body);
             self.debug_emit(
                 AiDebugLevel::Debug,
                 &format!(
                     "AI streaming request body: {}",
-                    serialize_debug_json(&stream_body)
+                    serialize_debug_json(&stream_request_body)
                 ),
+            );
+            let user_packets = collect_role_packets(&effective_body.messages, "user");
+            let tool_packets = collect_role_packets(&effective_body.messages, "tool");
+            self.append_request_trace_entry(
+                debug_session_id,
+                RequestTraceEntry {
+                    timestamp_epoch_ms: now_epoch_ms(),
+                    event: "request".to_string(),
+                    stream: true,
+                    attempt,
+                    status_code: None,
+                    request_body: Some(mask_sensitive(&serialize_debug_json(&stream_request_body))),
+                    response_body: None,
+                    user_packets: (!user_packets.is_empty()).then_some(user_packets),
+                    tool_packets: (!tool_packets.is_empty()).then_some(tool_packets),
+                    error: None,
+                },
             );
             if !refreshed_for_idle_hint && take_interactive_input_refresh_hint() {
                 self.reconnect_http_client()?;
@@ -1271,6 +1461,21 @@ impl AiClient {
                 Ok(resp) => resp,
                 Err(err) => {
                     let err_msg = format!("AI request failed: {}", format_reqwest_error(&err));
+                    self.append_request_trace_entry(
+                        debug_session_id,
+                        RequestTraceEntry {
+                            timestamp_epoch_ms: now_epoch_ms(),
+                            event: "response".to_string(),
+                            stream: true,
+                            attempt,
+                            status_code: None,
+                            request_body: None,
+                            response_body: None,
+                            user_packets: None,
+                            tool_packets: None,
+                            error: Some(mask_sensitive(&err_msg)),
+                        },
+                    );
                     self.debug_emit(AiDebugLevel::Error, &err_msg);
                     logging::warn(&err_msg);
                     if attempt <= self.max_retries {
@@ -1296,7 +1501,7 @@ impl AiClient {
                             AiDebugLevel::Warn,
                             "AI streaming transport retries exhausted on compatibility model; fallback to non-streaming mode",
                         );
-                        return self.send_chat_completion(body, cancel_requested);
+                        return self.send_chat_completion(body, cancel_requested, debug_session_id);
                     }
                     return Err(AppError::Ai(err_msg));
                 }
@@ -1313,6 +1518,21 @@ impl AiClient {
                     .text()
                     .unwrap_or_else(|_| "<unreadable body>".to_string());
                 let safe_body = mask_sensitive(&response_body);
+                self.append_request_trace_entry(
+                    debug_session_id,
+                    RequestTraceEntry {
+                        timestamp_epoch_ms: now_epoch_ms(),
+                        event: "response".to_string(),
+                        stream: true,
+                        attempt,
+                        status_code: Some(status.as_u16()),
+                        request_body: None,
+                        response_body: Some(safe_body.clone()),
+                        user_packets: None,
+                        tool_packets: None,
+                        error: None,
+                    },
+                );
                 self.debug_emit(
                     AiDebugLevel::Error,
                     &format!("AI streaming response error body: {safe_body}"),
@@ -1344,7 +1564,7 @@ impl AiClient {
                             "AI streaming fallback to non-streaming triggered: status={status}, body={safe_body}"
                         ),
                     );
-                    return self.send_chat_completion(body, cancel_requested);
+                    return self.send_chat_completion(body, cancel_requested, debug_session_id);
                 }
                 let err_msg = format!("AI HTTP status={status}, body={safe_body}");
                 logging::warn(&err_msg);
@@ -1370,9 +1590,25 @@ impl AiClient {
                 resp,
                 on_stream_event,
                 self.debug,
+                self.debug && debug_session_id.is_some(),
                 cancel_requested,
             ) {
                 Ok(parsed) => {
+                    self.append_request_trace_entry(
+                        debug_session_id,
+                        RequestTraceEntry {
+                            timestamp_epoch_ms: now_epoch_ms(),
+                            event: "response".to_string(),
+                            stream: true,
+                            attempt,
+                            status_code: Some(status.as_u16()),
+                            request_body: None,
+                            response_body: Some(build_stream_response_trace_summary(&parsed)),
+                            user_packets: None,
+                            tool_packets: None,
+                            error: None,
+                        },
+                    );
                     logging::info("AI streaming request finished successfully");
                     self.debug_emit(
                         AiDebugLevel::Info,
@@ -1395,6 +1631,21 @@ impl AiClient {
                     })
                 }
                 Err(StreamParseResult::FallbackJson(body_text)) => {
+                    self.append_request_trace_entry(
+                        debug_session_id,
+                        RequestTraceEntry {
+                            timestamp_epoch_ms: now_epoch_ms(),
+                            event: "response".to_string(),
+                            stream: true,
+                            attempt,
+                            status_code: Some(status.as_u16()),
+                            request_body: None,
+                            response_body: Some(mask_sensitive(&body_text)),
+                            user_packets: None,
+                            tool_packets: None,
+                            error: None,
+                        },
+                    );
                     logging::warn(
                         "AI streaming response was not SSE; fallback to non-streaming JSON parsing",
                     );
@@ -1415,6 +1666,21 @@ impl AiClient {
                     })
                 }
                 Err(StreamParseResult::Retryable(err_msg)) => {
+                    self.append_request_trace_entry(
+                        debug_session_id,
+                        RequestTraceEntry {
+                            timestamp_epoch_ms: now_epoch_ms(),
+                            event: "response".to_string(),
+                            stream: true,
+                            attempt,
+                            status_code: Some(status.as_u16()),
+                            request_body: None,
+                            response_body: None,
+                            user_packets: None,
+                            tool_packets: None,
+                            error: Some(mask_sensitive(&err_msg)),
+                        },
+                    );
                     self.debug_emit(AiDebugLevel::Warn, &err_msg);
                     logging::warn(&err_msg);
                     if attempt <= self.max_retries {
@@ -1437,14 +1703,44 @@ impl AiClient {
                             AiDebugLevel::Warn,
                             "AI streaming retries exhausted on compatibility model; fallback to non-streaming mode",
                         );
-                        return self.send_chat_completion(body, cancel_requested);
+                        return self.send_chat_completion(body, cancel_requested, debug_session_id);
                     }
                     Err(AppError::Ai(err_msg))
                 }
                 Err(StreamParseResult::Cancelled) => {
+                    self.append_request_trace_entry(
+                        debug_session_id,
+                        RequestTraceEntry {
+                            timestamp_epoch_ms: now_epoch_ms(),
+                            event: "response".to_string(),
+                            stream: true,
+                            attempt,
+                            status_code: Some(status.as_u16()),
+                            request_body: None,
+                            response_body: None,
+                            user_packets: None,
+                            tool_packets: None,
+                            error: Some(CHAT_CANCELLED_ERROR.to_string()),
+                        },
+                    );
                     Err(AppError::Ai(CHAT_CANCELLED_ERROR.to_string()))
                 }
                 Err(StreamParseResult::Fatal(err_msg)) => {
+                    self.append_request_trace_entry(
+                        debug_session_id,
+                        RequestTraceEntry {
+                            timestamp_epoch_ms: now_epoch_ms(),
+                            event: "response".to_string(),
+                            stream: true,
+                            attempt,
+                            status_code: Some(status.as_u16()),
+                            request_body: None,
+                            response_body: None,
+                            user_packets: None,
+                            tool_packets: None,
+                            error: Some(mask_sensitive(&err_msg)),
+                        },
+                    );
                     self.debug_emit(AiDebugLevel::Error, &err_msg);
                     logging::warn(&err_msg);
                     if allow_tool_round_compat_fallback {
@@ -1455,7 +1751,7 @@ impl AiClient {
                             AiDebugLevel::Warn,
                             "AI streaming parse failed on compatibility model; fallback to non-streaming mode",
                         );
-                        return self.send_chat_completion(body, cancel_requested);
+                        return self.send_chat_completion(body, cancel_requested, debug_session_id);
                     }
                     Err(AppError::Ai(err_msg))
                 }
@@ -1471,6 +1767,7 @@ impl AiClient {
         stream_output: bool,
         on_stream_event: &mut impl FnMut(ChatStreamEvent),
         cancel_requested: Option<&AtomicBool>,
+        debug_session_id: Option<&str>,
     ) -> Result<ChatToolResponse, AppError> {
         return_if_chat_cancelled(cancel_requested)?;
         messages.push(ApiMessage {
@@ -1493,6 +1790,7 @@ impl AiClient {
             stream_output,
             on_stream_event,
             cancel_requested,
+            debug_session_id,
         ) {
             Ok(call) => call,
             Err(err) => {
@@ -1597,6 +1895,74 @@ impl AiClient {
 
     fn debug_emit(&self, level: AiDebugLevel, message: &str) {
         emit_ai_debug(self.debug, level, message);
+    }
+
+    fn append_request_trace_entry(&self, session_id: Option<&str>, entry: RequestTraceEntry) {
+        if !self.debug {
+            return;
+        }
+        let Some(raw_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let session_id = sanitize_trace_session_id(raw_id);
+        if session_id.is_empty() {
+            return;
+        }
+        if let Err(err) = self.try_append_request_trace_entry(&session_id, entry) {
+            logging::warn(&format!(
+                "failed to append AI request trace for session {}: {}",
+                session_id,
+                mask_sensitive(&err.to_string())
+            ));
+        }
+    }
+
+    fn try_append_request_trace_entry(
+        &self,
+        session_id: &str,
+        entry: RequestTraceEntry,
+    ) -> Result<(), AppError> {
+        let _guard = AI_REQUEST_TRACE_FILE_LOCK
+            .lock()
+            .map_err(|_| AppError::Runtime("failed to lock AI request trace file".to_string()))?;
+        fs::create_dir_all(&self.request_trace_dir).map_err(|err| {
+            AppError::Runtime(format!(
+                "failed to create AI request trace directory {}: {err}",
+                self.request_trace_dir.display()
+            ))
+        })?;
+        let path = self
+            .request_trace_dir
+            .join(format!("request-{session_id}.json"));
+        let mut file = if path.exists() {
+            let raw = fs::read_to_string(&path).map_err(|err| {
+                AppError::Runtime(format!(
+                    "failed to read AI request trace file {}: {err}",
+                    path.display()
+                ))
+            })?;
+            serde_json::from_str::<SessionRequestTraceFile>(&raw).unwrap_or_default()
+        } else {
+            SessionRequestTraceFile::default()
+        };
+        if file.version == 0 {
+            file.version = REQUEST_TRACE_FILE_VERSION;
+        }
+        if file.session_id.trim().is_empty() {
+            file.session_id = session_id.to_string();
+        }
+        file.entries.push(entry);
+        if file.entries.len() > REQUEST_TRACE_MAX_ENTRIES {
+            let drop_count = file.entries.len().saturating_sub(REQUEST_TRACE_MAX_ENTRIES);
+            if drop_count > 0 {
+                file.entries.drain(0..drop_count);
+            }
+        }
+        let encoded = serde_json::to_string_pretty(&file).map_err(|err| {
+            AppError::Runtime(format!("failed to serialize AI request trace file: {err}"))
+        })?;
+        write_string_atomically(&path, &encoded)?;
+        Ok(())
     }
 
     fn current_http_client(&self) -> Result<Client, AppError> {
@@ -1783,7 +2149,7 @@ impl AiClient {
             tool_choice: None,
             stream: None,
         };
-        let call = self.send_chat_completion(&request, None)?;
+        let call = self.send_chat_completion(&request, None, None)?;
         let response_text = assistant_content_text(&call.assistant);
         self.debug_emit(
             AiDebugLevel::Debug,
@@ -1829,7 +2195,9 @@ fn emit_ai_debug(enabled: bool, level: AiDebugLevel, message: &str) {
         return;
     }
     let sanitized = mask_sensitive(message);
-    println!("{} {}", level.localized_tag(), sanitized);
+    if allows_direct_stdout_printing() {
+        println!("{} {}", level.localized_tag(), sanitized);
+    }
     let logging_line = format!("ai-debug[{}] {}", level.as_str(), sanitized);
     match level {
         AiDebugLevel::Info | AiDebugLevel::Debug => logging::info(&logging_line),
@@ -1902,6 +2270,7 @@ static DSML_PARAMETER_RE: Lazy<Regex> = Lazy::new(|| {
     )
     .expect("valid dsml parameter regex")
 });
+static AI_REQUEST_TRACE_FILE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Debug)]
 struct ApiChatCallResult {
@@ -1922,6 +2291,7 @@ struct ParsedStreamingChatResponse {
     usage: Usage,
     streamed_content: bool,
     streamed_thinking: bool,
+    sse_packets: Vec<String>,
 }
 
 enum StreamParseResult {
@@ -1991,6 +2361,7 @@ fn parse_streaming_chat_response<G>(
     response: reqwest::blocking::Response,
     on_stream_event: &mut G,
     debug_enabled: bool,
+    capture_sse_packets: bool,
     cancel_requested: Option<&AtomicBool>,
 ) -> Result<ParsedStreamingChatResponse, StreamParseResult>
 where
@@ -1999,6 +2370,7 @@ where
     let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut buffered_body = String::new();
+    let mut pending_sse_payload = String::new();
     let mut saw_sse = false;
     let mut usage = Usage::default();
     let mut content = String::new();
@@ -2006,6 +2378,7 @@ where
     let mut tool_calls = Vec::<PartialToolCall>::new();
     let mut streamed_content = false;
     let mut streamed_thinking = false;
+    let mut sse_packets = Vec::<String>::new();
 
     loop {
         if chat_cancel_requested(cancel_requested) {
@@ -2025,6 +2398,30 @@ where
         let trimmed_line = line.trim_end_matches(['\r', '\n']);
         let meaningful = trimmed_line.trim();
         if meaningful.is_empty() || meaningful.starts_with(':') {
+            if !pending_sse_payload.is_empty() {
+                if capture_sse_packets {
+                    if sse_packets.len() < 1000 {
+                        sse_packets.push(pending_sse_payload.clone());
+                    } else if sse_packets.len() == 1000 {
+                        sse_packets.push("{\"truncated\":true}".to_string());
+                    }
+                }
+                if process_streaming_sse_payload(
+                    pending_sse_payload.as_str(),
+                    on_stream_event,
+                    debug_enabled,
+                    &mut usage,
+                    &mut content,
+                    &mut reasoning,
+                    &mut tool_calls,
+                    &mut streamed_content,
+                    &mut streamed_thinking,
+                )? {
+                    pending_sse_payload.clear();
+                    break;
+                }
+                pending_sse_payload.clear();
+            }
             continue;
         }
         if !meaningful.starts_with("data:") {
@@ -2041,55 +2438,58 @@ where
 
         saw_sse = true;
         let payload = meaningful.trim_start_matches("data:").trim();
-        if payload == "[DONE]" {
-            break;
+        if payload.is_empty() {
+            continue;
         }
-        emit_ai_debug(
-            debug_enabled,
-            AiDebugLevel::Debug,
-            &format!("AI streaming chunk: {payload}"),
-        );
-        let parsed: ChatCompletionStreamResponse =
-            serde_json::from_str(payload).map_err(|err| {
-                emit_ai_debug(
-                    debug_enabled,
-                    AiDebugLevel::Error,
-                    &format!("AI streaming chunk parse error: {err}; payload={payload}"),
-                );
-                if streamed_content || streamed_thinking {
-                    StreamParseResult::Fatal(format!("failed to parse AI streaming chunk: {err}"))
-                } else {
-                    StreamParseResult::Retryable(format!(
-                        "failed to parse AI streaming chunk: {err}"
-                    ))
+        if !pending_sse_payload.is_empty() {
+            pending_sse_payload.push('\n');
+        }
+        pending_sse_payload.push_str(payload);
+        if streaming_sse_payload_is_complete(pending_sse_payload.as_str()) {
+            if capture_sse_packets {
+                if sse_packets.len() < 1000 {
+                    sse_packets.push(pending_sse_payload.clone());
+                } else if sse_packets.len() == 1000 {
+                    sse_packets.push("{\"truncated\":true}".to_string());
                 }
-            })?;
-        usage = merge_usage(usage, parsed.usage);
-        for choice in parsed.choices {
-            let thinking_delta = assistant_delta_reasoning_text(&choice.delta);
-            let added_thinking = merge_text_delta(&mut reasoning, &thinking_delta);
-            if !added_thinking.is_empty() {
-                streamed_thinking = true;
-                on_stream_event(ChatStreamEvent {
-                    kind: ChatStreamEventKind::Thinking,
-                    text: added_thinking,
-                });
             }
-
-            let content_delta = assistant_delta_content_text(&choice.delta);
-            let added_content = merge_text_delta(&mut content, &content_delta);
-            if !added_content.is_empty() {
-                streamed_content = true;
-                on_stream_event(ChatStreamEvent {
-                    kind: ChatStreamEventKind::Content,
-                    text: added_content,
-                });
+            if process_streaming_sse_payload(
+                pending_sse_payload.as_str(),
+                on_stream_event,
+                debug_enabled,
+                &mut usage,
+                &mut content,
+                &mut reasoning,
+                &mut tool_calls,
+                &mut streamed_content,
+                &mut streamed_thinking,
+            )? {
+                pending_sse_payload.clear();
+                break;
             }
+            pending_sse_payload.clear();
+        }
+    }
 
-            for tool_call_delta in choice.delta.tool_calls {
-                merge_tool_call_delta(&mut tool_calls, &tool_call_delta);
+    if !pending_sse_payload.is_empty() {
+        if capture_sse_packets {
+            if sse_packets.len() < 1000 {
+                sse_packets.push(pending_sse_payload.clone());
+            } else if sse_packets.len() == 1000 {
+                sse_packets.push("{\"truncated\":true}".to_string());
             }
         }
+        if process_streaming_sse_payload(
+            pending_sse_payload.as_str(),
+            on_stream_event,
+            debug_enabled,
+            &mut usage,
+            &mut content,
+            &mut reasoning,
+            &mut tool_calls,
+            &mut streamed_content,
+            &mut streamed_thinking,
+        )? {}
     }
 
     if !saw_sse {
@@ -2108,7 +2508,89 @@ where
         usage,
         streamed_content,
         streamed_thinking,
+        sse_packets,
     })
+}
+
+fn streaming_sse_payload_is_complete(payload: &str) -> bool {
+    let trimmed = payload.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed == "[DONE]" {
+        return true;
+    }
+    (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_streaming_sse_payload<G>(
+    payload: &str,
+    on_stream_event: &mut G,
+    debug_enabled: bool,
+    usage: &mut Usage,
+    content: &mut String,
+    reasoning: &mut String,
+    tool_calls: &mut Vec<PartialToolCall>,
+    streamed_content: &mut bool,
+    streamed_thinking: &mut bool,
+) -> Result<bool, StreamParseResult>
+where
+    G: FnMut(ChatStreamEvent),
+{
+    let normalized = payload.trim();
+    if normalized.is_empty() {
+        return Ok(false);
+    }
+    if normalized == "[DONE]" {
+        return Ok(true);
+    }
+    emit_ai_debug(
+        debug_enabled,
+        AiDebugLevel::Debug,
+        &format!("AI streaming chunk: {normalized}"),
+    );
+    let parsed: ChatCompletionStreamResponse = serde_json::from_str(normalized).map_err(|err| {
+        emit_ai_debug(
+            debug_enabled,
+            AiDebugLevel::Error,
+            &format!("AI streaming chunk parse error: {err}; payload={normalized}"),
+        );
+        if *streamed_content || *streamed_thinking {
+            StreamParseResult::Fatal(format!("failed to parse AI streaming chunk: {err}"))
+        } else {
+            StreamParseResult::Retryable(format!("failed to parse AI streaming chunk: {err}"))
+        }
+    })?;
+    let previous_usage = std::mem::take(usage);
+    *usage = merge_usage(previous_usage, parsed.usage);
+    for choice in parsed.choices {
+        let thinking_delta = assistant_delta_reasoning_text(&choice.delta);
+        let added_thinking = merge_text_delta(reasoning, &thinking_delta);
+        if !added_thinking.is_empty() {
+            *streamed_thinking = true;
+            on_stream_event(ChatStreamEvent {
+                kind: ChatStreamEventKind::Thinking,
+                text: added_thinking,
+            });
+        }
+
+        let content_delta = assistant_delta_content_text(&choice.delta);
+        let added_content = merge_text_delta(content, &content_delta);
+        if !added_content.is_empty() {
+            *streamed_content = true;
+            on_stream_event(ChatStreamEvent {
+                kind: ChatStreamEventKind::Content,
+                text: added_content,
+            });
+        }
+
+        for tool_call_delta in choice.delta.tool_calls {
+            merge_tool_call_delta(tool_calls, &tool_call_delta);
+        }
+    }
+    Ok(false)
 }
 
 fn assistant_delta_content_text(message: &AssistantDeltaMessage) -> String {
@@ -2136,25 +2618,44 @@ fn merge_text_delta(target: &mut String, incoming: &str) -> String {
         target.push_str(incoming);
         return incoming.to_string();
     }
-    if incoming.starts_with(target.as_str()) {
+    if incoming.len() > target.len() && incoming.starts_with(target.as_str()) {
         let suffix = &incoming[target.len()..];
         if !suffix.is_empty() {
             target.push_str(suffix);
         }
         return suffix.to_string();
     }
-    if target.ends_with(incoming) {
-        return String::new();
-    }
-    if target.contains(incoming) {
-        return String::new();
+    let overlap = stream_text_overlap_bytes(target.as_str(), incoming);
+    if overlap > 0 {
+        if overlap == incoming.len() && incoming.chars().count() == 1 {
+            target.push_str(incoming);
+            return incoming.to_string();
+        }
+        let suffix = &incoming[overlap..];
+        if !suffix.is_empty() {
+            target.push_str(suffix);
+        }
+        return suffix.to_string();
     }
     target.push_str(incoming);
     incoming.to_string()
 }
 
+fn stream_text_overlap_bytes(target: &str, incoming: &str) -> usize {
+    let max_overlap = target.len().min(incoming.len());
+    for size in (1..=max_overlap).rev() {
+        if !incoming.is_char_boundary(size) {
+            continue;
+        }
+        if target.ends_with(&incoming[..size]) {
+            return size;
+        }
+    }
+    0
+}
+
 fn merge_tool_call_delta(tool_calls: &mut Vec<PartialToolCall>, delta: &StreamToolCallDelta) {
-    let index = delta.index.unwrap_or(tool_calls.len());
+    let index = resolve_tool_call_delta_index(tool_calls, delta);
     while tool_calls.len() <= index {
         tool_calls.push(PartialToolCall::default());
     }
@@ -2179,27 +2680,52 @@ fn merge_tool_call_delta(tool_calls: &mut Vec<PartialToolCall>, delta: &StreamTo
     }
 }
 
+fn resolve_tool_call_delta_index(
+    tool_calls: &[PartialToolCall],
+    delta: &StreamToolCallDelta,
+) -> usize {
+    if let Some(index) = delta.index {
+        return index;
+    }
+    let matched_by_id = delta.id.as_deref().and_then(|id| {
+        let normalized = id.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+        tool_calls
+            .iter()
+            .position(|item| item.id.trim() == normalized)
+    });
+    matched_by_id.unwrap_or(tool_calls.len())
+}
+
 fn finalize_tool_calls(tool_calls: Vec<PartialToolCall>) -> Vec<ApiToolCall> {
     tool_calls
         .into_iter()
-        .filter_map(|item| {
-            if item.id.trim().is_empty()
-                || item.name.trim().is_empty()
-                || item.arguments.trim().is_empty()
-            {
+        .enumerate()
+        .filter_map(|(idx, item)| {
+            let PartialToolCall {
+                id,
+                r#type,
+                name,
+                arguments,
+            } = item;
+            if name.trim().is_empty() || arguments.trim().is_empty() {
                 return None;
             }
+            let resolved_id = if id.trim().is_empty() {
+                format!("stream_tool_call_{}", idx + 1)
+            } else {
+                id
+            };
             Some(ApiToolCall {
-                id: item.id,
-                r#type: if item.r#type.trim().is_empty() {
+                id: resolved_id,
+                r#type: if r#type.trim().is_empty() {
                     "function".to_string()
                 } else {
-                    item.r#type
+                    r#type
                 },
-                function: ApiToolFunction {
-                    name: item.name,
-                    arguments: item.arguments,
-                },
+                function: ApiToolFunction { name, arguments },
             })
         })
         .collect()
@@ -2878,11 +3404,78 @@ fn default_model_price_cache_version() -> u32 {
     MODEL_PRICE_CACHE_VERSION
 }
 
+fn default_request_trace_file_version() -> u32 {
+    REQUEST_TRACE_FILE_VERSION
+}
+
+fn now_epoch_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn sanitize_trace_session_id(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
+fn collect_role_packets(messages: &[ApiMessage], role: &str) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|item| item.role == role)
+        .map(|item| {
+            let content = item.content.clone().unwrap_or_default();
+            mask_sensitive(&content)
+        })
+        .collect()
+}
+
+fn build_stream_response_trace_summary(parsed: &ParsedStreamingChatResponse) -> String {
+    let content = assistant_content_text(&parsed.assistant);
+    let thinking = assistant_reasoning_text(&parsed.assistant);
+    let tool_calls = parsed
+        .assistant
+        .tool_calls
+        .iter()
+        .map(|call| {
+            json!({
+                "id": call.id,
+                "type": call.r#type,
+                "name": call.function.name,
+                "arguments": mask_sensitive(&call.function.arguments),
+            })
+        })
+        .collect::<Vec<_>>();
+    mask_sensitive(&serialize_debug_json(&json!({
+        "streamed_content": parsed.streamed_content,
+        "streamed_thinking": parsed.streamed_thinking,
+        "usage": {
+            "prompt_tokens": parsed.usage.prompt_tokens,
+            "completion_tokens": parsed.usage.completion_tokens,
+            "total_tokens": parsed.usage.total_tokens,
+        },
+        "assistant_content": content,
+        "assistant_thinking": thinking,
+        "assistant_tool_calls": tool_calls,
+        "sse_packets": parsed.sse_packets,
+    })))
 }
 
 fn strip_code_fence(text: &str) -> &str {
@@ -3098,7 +3691,7 @@ fn should_refresh_http_client_after_reqwest_error(err: &reqwest::Error) -> bool 
 }
 
 fn maybe_print_ai_reconnect_notice(message: &str, colorful: bool) {
-    if !std::io::stdout().is_terminal() {
+    if !allows_direct_stdout_printing() {
         return;
     }
     // Spinner uses carriage-return in-place refresh; clear that line before printing reconnect hint.
@@ -3108,6 +3701,14 @@ fn maybe_print_ai_reconnect_notice(message: &str, colorful: bool) {
         render::render_chat_reconnect_notice(message, colorful)
     );
     let _ = std::io::stdout().flush();
+}
+
+fn allows_direct_stdout_printing() -> bool {
+    should_write_direct_stdout(std::io::stdout().is_terminal(), is_raw_mode_enabled().ok())
+}
+
+fn should_write_direct_stdout(is_terminal: bool, raw_mode_enabled: Option<bool>) -> bool {
+    is_terminal && !raw_mode_enabled.unwrap_or(false)
 }
 
 fn model_prefers_omit_tool_choice(model: &str) -> bool {
@@ -4030,17 +4631,20 @@ mod tests {
         AiClient, AiProviderProtocol, ApiMessage, ApiToolCall, ApiToolFunction, AssistantMessage,
         ChatCompletionRequest, ChatCompletionStreamResponse, ChatMetrics, ChatStopReason,
         FinalizeWithoutToolsState, ModelPriceSource, PersistedModelPriceCatalog,
-        PersistedModelPriceEntry, assistant_reasoning_text, build_claude_request_body,
-        build_provider_chat_url, builtin_model_prices, extract_text_delta_from_value,
-        extract_text_from_value, fresh_model_price_catalog, is_rate_limited_error,
-        merge_text_delta, merge_visible_chunks, model_prefers_non_streaming_tool_rounds,
+        PersistedModelPriceEntry, REQUEST_TRACE_FILE_VERSION, REQUEST_TRACE_MAX_ENTRIES,
+        RequestTraceEntry, SessionRequestTraceFile, StreamToolCallDelta, StreamToolFunctionDelta,
+        assistant_reasoning_text, build_claude_request_body, build_provider_chat_url,
+        builtin_model_prices, extract_text_delta_from_value, extract_text_from_value,
+        finalize_tool_calls, fresh_model_price_catalog, is_rate_limited_error, merge_text_delta,
+        merge_tool_call_delta, merge_visible_chunks, model_prefers_non_streaming_tool_rounds,
         normalize_stepfun_chat_request, parse_claude_response_text, parse_gemini_response_text,
         parse_model_price_catalog_response, parse_model_price_probe_response,
         parse_rate_limit_retry_delay, price_probe_candidate_models,
         provider_protocol_from_config_type, provider_requires_reasoning_content_omission,
         request_contains_reasoning_content, resolve_effective_model_prices,
         should_fallback_to_non_streaming, should_refresh_http_client_after_reqwest_error,
-        should_retry_without_reasoning_content, strip_reasoning_content_from_request, with_cost,
+        should_retry_without_reasoning_content, should_write_direct_stdout,
+        strip_reasoning_content_from_request, with_cost,
     };
     use crate::{error::AppError, tls::ensure_rustls_crypto_provider};
 
@@ -4055,6 +4659,10 @@ mod tests {
             colorful: true,
             model_price_cache_path: env::temp_dir()
                 .join(format!("machineclaw-test-{}.json", uuid::Uuid::new_v4())),
+            request_trace_dir: env::temp_dir().join(format!(
+                "machineclaw-requests-test-{}",
+                uuid::Uuid::new_v4()
+            )),
             debug: false,
             max_retries: 0,
             backoff_millis: 0,
@@ -4282,9 +4890,9 @@ mod tests {
     fn merges_stream_deltas_without_duplicate_suffixes() {
         let mut target = String::new();
         assert_eq!(merge_text_delta(&mut target, "Hello"), "Hello");
-        assert_eq!(merge_text_delta(&mut target, "Hello"), "");
         assert_eq!(merge_text_delta(&mut target, "Hello world"), " world");
-        assert_eq!(target, "Hello world");
+        assert_eq!(merge_text_delta(&mut target, "!"), "!");
+        assert_eq!(target, "Hello world!");
     }
 
     #[test]
@@ -4292,9 +4900,95 @@ mod tests {
         let mut target = "pub fn ".to_string();
         assert_eq!(
             merge_text_delta(&mut target, "fn merge_sort<T: Ord + Clone>() {"),
-            "fn merge_sort<T: Ord + Clone>() {"
+            "merge_sort<T: Ord + Clone>() {"
         );
-        assert_eq!(target, "pub fn fn merge_sort<T: Ord + Clone>() {");
+        assert_eq!(target, "pub fn merge_sort<T: Ord + Clone>() {");
+    }
+
+    #[test]
+    fn preserves_repeated_markdown_markers_and_spaces_in_stream_deltas() {
+        let mut target = String::new();
+        assert_eq!(merge_text_delta(&mut target, "#"), "#");
+        assert_eq!(merge_text_delta(&mut target, "#"), "#");
+        assert_eq!(merge_text_delta(&mut target, " "), " ");
+        assert_eq!(merge_text_delta(&mut target, "*"), "*");
+        assert_eq!(merge_text_delta(&mut target, "*"), "*");
+        assert_eq!(target, "## **");
+    }
+
+    #[test]
+    fn preserves_repeated_quotes_in_stream_json_fragments() {
+        let mut target = "{\"command\":\"echo".to_string();
+        assert_eq!(merge_text_delta(&mut target, "\""), "\"");
+        assert_eq!(merge_text_delta(&mut target, "}"), "}");
+        assert_eq!(target, "{\"command\":\"echo\"}");
+    }
+
+    #[test]
+    fn merges_overlapping_stream_segments_without_duplicate_content() {
+        let mut target = "Hello wor".to_string();
+        assert_eq!(merge_text_delta(&mut target, "world"), "ld");
+        assert_eq!(target, "Hello world");
+    }
+
+    #[test]
+    fn deduplicates_replayed_snapshot_segment() {
+        let mut target = "Hello world".to_string();
+        assert_eq!(merge_text_delta(&mut target, "Hello world"), "");
+        assert_eq!(target, "Hello world");
+    }
+
+    #[test]
+    fn stream_tool_call_delta_uses_id_when_index_missing() {
+        let mut tool_calls = Vec::new();
+        merge_tool_call_delta(
+            &mut tool_calls,
+            &StreamToolCallDelta {
+                index: Some(0),
+                id: Some("call_1".to_string()),
+                r#type: Some("function".to_string()),
+                function: Some(StreamToolFunctionDelta {
+                    name: Some("run_shell_command".to_string()),
+                    arguments: Some("{\"command\":\"echo".to_string()),
+                }),
+            },
+        );
+        merge_tool_call_delta(
+            &mut tool_calls,
+            &StreamToolCallDelta {
+                index: None,
+                id: Some("call_1".to_string()),
+                r#type: None,
+                function: Some(StreamToolFunctionDelta {
+                    name: None,
+                    arguments: Some(" 1\"}".to_string()),
+                }),
+            },
+        );
+        let finalized = finalize_tool_calls(tool_calls);
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].id, "call_1");
+        assert_eq!(finalized[0].function.name, "run_shell_command");
+        assert_eq!(finalized[0].function.arguments, "{\"command\":\"echo 1\"}");
+    }
+
+    #[test]
+    fn stream_tool_call_without_id_receives_stable_generated_id() {
+        let finalized = finalize_tool_calls(vec![super::PartialToolCall {
+            id: String::new(),
+            r#type: "function".to_string(),
+            name: "run_shell_command".to_string(),
+            arguments: "{\"command\":\"echo hi\"}".to_string(),
+        }]);
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].id, "stream_tool_call_1");
+    }
+
+    #[test]
+    fn detects_complete_sse_payload_boundaries() {
+        assert!(super::streaming_sse_payload_is_complete("[DONE]"));
+        assert!(super::streaming_sse_payload_is_complete("{\"choices\":[]}"));
+        assert!(!super::streaming_sse_payload_is_complete("{\"choices\":[]"));
     }
 
     #[test]
@@ -4591,6 +5285,123 @@ mod tests {
         assert!(model_prefers_non_streaming_tool_rounds("deepseek-reasoner"));
         assert!(model_prefers_non_streaming_tool_rounds("deepseek-r1"));
         assert!(!model_prefers_non_streaming_tool_rounds("deepseek-chat"));
+    }
+
+    #[test]
+    fn direct_stdout_print_is_disabled_when_not_terminal_or_raw_mode() {
+        assert!(!should_write_direct_stdout(false, Some(false)));
+        assert!(!should_write_direct_stdout(true, Some(true)));
+    }
+
+    #[test]
+    fn direct_stdout_print_is_enabled_for_normal_terminal_mode() {
+        assert!(should_write_direct_stdout(true, Some(false)));
+        assert!(should_write_direct_stdout(true, None));
+    }
+
+    #[test]
+    fn debug_trace_file_is_written_per_session_when_debug_enabled() {
+        let mut client = test_ai_client();
+        client.debug = true;
+        client.request_trace_dir = env::temp_dir().join(format!(
+            "machineclaw-request-trace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let session_id = "session-abc-123";
+        let entry = RequestTraceEntry {
+            timestamp_epoch_ms: 1,
+            event: "request".to_string(),
+            stream: false,
+            attempt: 1,
+            status_code: None,
+            request_body: Some("{\"hello\":\"world\"}".to_string()),
+            response_body: None,
+            user_packets: Some(vec!["user packet".to_string()]),
+            tool_packets: Some(vec!["tool packet".to_string()]),
+            error: None,
+        };
+
+        client.append_request_trace_entry(Some(session_id), entry);
+
+        let path = client
+            .request_trace_dir
+            .join(format!("request-{session_id}.json"));
+        assert!(path.exists());
+        let raw = fs::read_to_string(path).expect("read request trace");
+        let parsed: SessionRequestTraceFile =
+            serde_json::from_str(&raw).expect("parse request trace json");
+        assert_eq!(parsed.version, REQUEST_TRACE_FILE_VERSION);
+        assert_eq!(parsed.session_id, session_id);
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].event, "request");
+    }
+
+    #[test]
+    fn debug_trace_is_skipped_when_session_id_missing() {
+        let mut client = test_ai_client();
+        client.debug = true;
+        client.request_trace_dir = env::temp_dir().join(format!(
+            "machineclaw-request-trace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        client.append_request_trace_entry(
+            None,
+            RequestTraceEntry {
+                timestamp_epoch_ms: 1,
+                event: "request".to_string(),
+                stream: false,
+                attempt: 1,
+                status_code: None,
+                request_body: Some("{}".to_string()),
+                response_body: None,
+                user_packets: None,
+                tool_packets: None,
+                error: None,
+            },
+        );
+        assert!(!client.request_trace_dir.exists());
+    }
+
+    #[test]
+    fn debug_trace_file_keeps_recent_entries_under_max_limit() {
+        let mut client = test_ai_client();
+        client.debug = true;
+        client.request_trace_dir = env::temp_dir().join(format!(
+            "machineclaw-request-trace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let session_id = "session-cap-test";
+        for idx in 0..(REQUEST_TRACE_MAX_ENTRIES + 5) {
+            client.append_request_trace_entry(
+                Some(session_id),
+                RequestTraceEntry {
+                    timestamp_epoch_ms: idx as u128,
+                    event: "request".to_string(),
+                    stream: false,
+                    attempt: 1,
+                    status_code: None,
+                    request_body: Some(format!("{{\"idx\":{idx}}}")),
+                    response_body: None,
+                    user_packets: None,
+                    tool_packets: None,
+                    error: None,
+                },
+            );
+        }
+        let path = client
+            .request_trace_dir
+            .join(format!("request-{session_id}.json"));
+        let raw = fs::read_to_string(path).expect("read request trace");
+        let parsed: SessionRequestTraceFile =
+            serde_json::from_str(&raw).expect("parse request trace json");
+        assert_eq!(parsed.entries.len(), REQUEST_TRACE_MAX_ENTRIES);
+        let first = parsed
+            .entries
+            .first()
+            .and_then(|item| item.request_body.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        assert!(first.contains("\"idx\":5"));
     }
 
     #[test]

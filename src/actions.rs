@@ -660,7 +660,8 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
         let chat_cancel_requested = Arc::new(AtomicBool::new(false));
         let mut cancel_watcher =
             ChatCancelWatcher::start(chat_cancel_requested.clone(), services.cfg.console.colorful);
-        let response_result = services.ai.chat_with_shell_tool(
+        let debug_session_id = services.session.session_id().to_string();
+        let response_result = services.ai.chat_with_shell_tool_with_debug_session(
             &history,
             &system_prompt,
             &message,
@@ -670,6 +671,7 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
             stream_output,
             &external_mcp_tools,
             Some(chat_cancel_requested.as_ref()),
+            Some(debug_session_id.as_str()),
             |tool_call| {
                 execute_tool_call(
                     services,
@@ -946,7 +948,12 @@ fn generate_ai_summary(
         services.cfg.console.colorful,
     );
     let history = services.session.build_chat_history();
-    let summary = services.ai.chat(&history, &system_prompt, &user_prompt)?;
+    let summary = services.ai.chat_with_debug_session(
+        &history,
+        &system_prompt,
+        &user_prompt,
+        Some(services.session.session_id()),
+    )?;
     spinner.stop();
     logging::info(&format!(
         "AI summarize finished: action={action}, target={target}"
@@ -3288,7 +3295,12 @@ fn ensure_chat_environment_profile(
         i18n::chat_profile_analyzing().to_string(),
         services.cfg.console.colorful,
     );
-    let profile_summary_result = services.ai.chat(&[], system_prompt, &profile_prompt);
+    let profile_summary_result = services.ai.chat_with_debug_session(
+        &[],
+        system_prompt,
+        &profile_prompt,
+        Some(services.session.session_id()),
+    );
     ai_spinner.stop();
     match profile_summary_result {
         Ok(summary) => {
@@ -3372,7 +3384,12 @@ fn maybe_run_ai_context_compression(
         i18n::chat_compression_running().to_string(),
         services.cfg.console.colorful,
     );
-    let summary_result = services.ai.chat(&[], system_prompt, &prompt);
+    let summary_result = services.ai.chat_with_debug_session(
+        &[],
+        system_prompt,
+        &prompt,
+        Some(services.session.session_id()),
+    );
     ai_spinner.stop();
     let summary = match summary_result {
         Ok(content) => content,

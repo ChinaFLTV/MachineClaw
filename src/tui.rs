@@ -26,7 +26,7 @@ use dialoguer::Editor;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
@@ -399,6 +399,10 @@ struct InspectWorkerHandle {
     join: Option<thread::JoinHandle<()>>,
 }
 
+struct AiConnectivityCheckHandle {
+    rx: mpsc::Receiver<Result<(), AppError>>,
+}
+
 impl InputBuffer {
     fn new() -> Self {
         Self {
@@ -510,6 +514,7 @@ struct ChatUiState {
     token_usage_committed: u64,
     token_live_estimate: u64,
     token_display_value: u64,
+    ai_connectivity_checking: bool,
 }
 
 impl ChatUiState {
@@ -558,6 +563,7 @@ impl ChatUiState {
             token_usage_committed: 0,
             token_live_estimate: 0,
             token_display_value: 0,
+            ai_connectivity_checking: false,
         };
         state.sync_thread_selection_to_active();
         state
@@ -771,16 +777,11 @@ impl ChatUiState {
         }
         let bubble_max_inner_width =
             conversation_bubble_max_inner_width(self.conversation_wrap_width);
+        let conversation_width = self.conversation_wrap_width.max(1) as usize;
         let live_streaming = self.ai_live.is_some();
         let last_message_idx = self.messages.len().saturating_sub(1);
         let mut lines = Vec::<ConversationLine>::new();
         for (idx, item) in self.messages.iter().enumerate() {
-            lines.push(ConversationLine {
-                kind: ConversationLineKind::Header,
-                role: item.role,
-                text: role_tag(item.role).to_string(),
-                message_index: Some(idx),
-            });
             let rendered = render_conversation_markdown(
                 item.text.trim(),
                 live_streaming
@@ -808,10 +809,37 @@ impl ChatUiState {
                 .max()
                 .unwrap_or(1)
                 .max(1);
+            let bubble_outer_width = inner_width.saturating_add(4);
+            let header_label = format!("{} {}", role_avatar(item.role), role_tag(item.role));
+            let header_text = if item.role == UiRole::User {
+                let header_width = text_display_width(&header_label);
+                let left_pad = bubble_outer_width.saturating_sub(header_width);
+                format!("{}{}", " ".repeat(left_pad), header_label)
+            } else {
+                header_label
+            };
+            let bubble_left_pad = if item.role == UiRole::User {
+                conversation_width.saturating_sub(bubble_outer_width)
+            } else {
+                0
+            };
+            let apply_left_pad = |text: String| {
+                if bubble_left_pad == 0 {
+                    text
+                } else {
+                    format!("{}{}", " ".repeat(bubble_left_pad), text)
+                }
+            };
+            lines.push(ConversationLine {
+                kind: ConversationLineKind::Header,
+                role: item.role,
+                text: apply_left_pad(header_text),
+                message_index: Some(idx),
+            });
             lines.push(ConversationLine {
                 kind: ConversationLineKind::BubbleBorder,
                 role: item.role,
-                text: format!("╭{}╮", "─".repeat(inner_width + 2)),
+                text: apply_left_pad(format!("╭{}╮", "─".repeat(inner_width + 2))),
                 message_index: Some(idx),
             });
             for body_line in body_lines {
@@ -819,14 +847,14 @@ impl ChatUiState {
                 lines.push(ConversationLine {
                     kind: ConversationLineKind::Body,
                     role: item.role,
-                    text: format!("│ {}{} │", body_line, " ".repeat(pad)),
+                    text: apply_left_pad(format!("│ {}{} │", body_line, " ".repeat(pad))),
                     message_index: Some(idx),
                 });
             }
             lines.push(ConversationLine {
                 kind: ConversationLineKind::BubbleBorder,
                 role: item.role,
-                text: format!("╰{}╯", "─".repeat(inner_width + 2)),
+                text: apply_left_pad(format!("╰{}╯", "─".repeat(inner_width + 2))),
                 message_index: Some(idx),
             });
             if idx + 1 < self.messages.len() {
@@ -1005,11 +1033,15 @@ pub fn run_chat_tui(services: &mut ActionServices<'_>) -> Result<ActionOutcome, 
     let mut chat_turns = 0usize;
     let mut last_assistant_reply = String::new();
     let mut inspect_worker = spawn_inspect_worker(services.os_type);
-    if let Err(err) = run_startup_checks_in_tui(&mut terminal, services, &mut state) {
-        inspect_worker.stop();
-        let _ = restore_terminal(&mut terminal);
-        return Err(err);
-    }
+    let mut ai_connectivity_check =
+        match run_startup_checks_in_tui(&mut terminal, services, &mut state) {
+            Ok(handle) => handle,
+            Err(err) => {
+                inspect_worker.stop();
+                let _ = restore_terminal(&mut terminal);
+                return Err(err);
+            }
+        };
     let loop_result = run_loop(
         &mut terminal,
         services,
@@ -1018,6 +1050,7 @@ pub fn run_chat_tui(services: &mut ActionServices<'_>) -> Result<ActionOutcome, 
         &mut chat_turns,
         &mut last_assistant_reply,
         &mut inspect_worker,
+        &mut ai_connectivity_check,
     );
     inspect_worker.stop();
     let restore_result = restore_terminal(&mut terminal);
@@ -1059,7 +1092,7 @@ fn run_startup_checks_in_tui(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     services: &mut ActionServices<'_>,
     state: &mut ChatUiState,
-) -> Result<(), AppError> {
+) -> Result<Option<AiConnectivityCheckHandle>, AppError> {
     let started = Instant::now();
     state.push(UiRole::System, i18n::preflight_notice_start());
     state.push(UiRole::System, i18n::preflight_notice_config_check());
@@ -1068,12 +1101,15 @@ fn run_startup_checks_in_tui(
         UiRole::System,
         i18n::preflight_notice_permission_check_skipped(),
     );
-    draw_once(terminal, services, state)?;
+    let mut ai_connectivity_check = None;
     if services.cfg.ai.connectivity_check {
+        state.ai_connectivity_checking = true;
         state.status = ui_text_status_ai_connectivity().to_string();
-        draw_once(terminal, services, state)?;
-        validate_connectivity_with_live_refresh(terminal, services, state)?;
-        state.push(UiRole::System, ui_text_status_ai_connectivity_ok());
+        state.push(
+            UiRole::System,
+            ui_text_status_ai_connectivity_background_started(),
+        );
+        ai_connectivity_check = Some(spawn_ai_connectivity_check_worker(services.ai.clone()));
     } else {
         state.push(UiRole::System, i18n::preflight_notice_ai_check_skipped());
     }
@@ -1082,9 +1118,11 @@ fn run_startup_checks_in_tui(
         UiRole::System,
         i18n::preflight_notice_done(&i18n::human_duration_ms(started.elapsed().as_millis())),
     );
-    state.status = ui_text_ready().to_string();
+    if !state.ai_connectivity_checking {
+        state.status = ui_text_ready().to_string();
+    }
     draw_once(terminal, services, state)?;
-    Ok(())
+    Ok(ai_connectivity_check)
 }
 
 fn run_loop(
@@ -1095,6 +1133,7 @@ fn run_loop(
     chat_turns: &mut usize,
     last_assistant_reply: &mut String,
     inspect_worker: &mut InspectWorkerHandle,
+    ai_connectivity_check: &mut Option<AiConnectivityCheckHandle>,
 ) -> Result<(), AppError> {
     let mut worker_enabled = false;
     let mut worker_target = state.inspect.target;
@@ -1106,11 +1145,13 @@ fn run_loop(
             &mut worker_target,
         );
         drain_inspect_worker_updates(inspect_worker, state);
+        poll_ai_connectivity_check(ai_connectivity_check, state);
         draw_once(terminal, services, state)?;
         if !event::poll(Duration::from_millis(50))
             .map_err(|err| AppError::Command(format!("failed to poll input event: {err}")))?
         {
             drain_inspect_worker_updates(inspect_worker, state);
+            poll_ai_connectivity_check(ai_connectivity_check, state);
             continue;
         }
         match event::read()
@@ -1293,37 +1334,51 @@ fn handle_tui_resize_only(
     clear_tui_terminal(terminal)
 }
 
-fn validate_connectivity_with_live_refresh(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    services: &ActionServices<'_>,
-    state: &mut ChatUiState,
-) -> Result<(), AppError> {
-    let ai = services.ai.clone();
+fn spawn_ai_connectivity_check_worker(ai: crate::ai::AiClient) -> AiConnectivityCheckHandle {
     let (tx, rx) = mpsc::channel::<Result<(), AppError>>();
     thread::spawn(move || {
         let _ = tx.send(ai.validate_connectivity());
     });
-    loop {
-        match rx.try_recv() {
-            Ok(result) => return result,
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Err(AppError::Runtime(
-                    "AI connectivity worker channel disconnected".to_string(),
-                ));
+    AiConnectivityCheckHandle { rx }
+}
+
+fn poll_ai_connectivity_check(
+    ai_connectivity_check: &mut Option<AiConnectivityCheckHandle>,
+    state: &mut ChatUiState,
+) {
+    let Some(handle) = ai_connectivity_check.as_mut() else {
+        return;
+    };
+    let check_result = match handle.rx.try_recv() {
+        Ok(result) => Some(result),
+        Err(mpsc::TryRecvError::Empty) => None,
+        Err(mpsc::TryRecvError::Disconnected) => Some(Err(AppError::Runtime(
+            "AI connectivity worker channel disconnected".to_string(),
+        ))),
+    };
+    let Some(result) = check_result else {
+        return;
+    };
+    state.ai_connectivity_checking = false;
+    *ai_connectivity_check = None;
+    match result {
+        Ok(()) => {
+            state.push(UiRole::System, ui_text_status_ai_connectivity_ok());
+            if state.status == ui_text_status_ai_connectivity() {
+                state.status = ui_text_ready().to_string();
             }
         }
-        while event::poll(Duration::from_millis(0))
-            .map_err(|err| AppError::Command(format!("failed to poll resize event: {err}")))?
-        {
-            if let Event::Resize(_, _) = event::read()
-                .map_err(|err| AppError::Command(format!("failed to read resize event: {err}")))?
-            {
-                handle_tui_resize_redraw(terminal, services, state)?;
-            }
+        Err(err) => {
+            state.push(
+                UiRole::System,
+                format!(
+                    "{}: {}",
+                    ui_text_status_ai_connectivity_failed(),
+                    i18n::localize_error(&err)
+                ),
+            );
+            state.status = ui_text_status_ai_connectivity_failed().to_string();
         }
-        draw_once(terminal, services, state)?;
-        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -2638,6 +2693,23 @@ fn submit_chat_message(
         state.push(UiRole::System, i18n::chat_unknown_builtin_command(unknown));
         return Ok(false);
     }
+    if state.ai_connectivity_checking {
+        state.input.text = message.clone();
+        state.input.cursor_char = state.input.char_count();
+        state.input.view_char_offset = 0;
+        state.status = ui_text_status_ai_connectivity_pending_send_blocked().to_string();
+        let already_reported = state.messages.back().is_some_and(|item| {
+            item.role == UiRole::System
+                && item.text == ui_text_status_ai_connectivity_pending_send_blocked()
+        });
+        if !already_reported {
+            state.push(
+                UiRole::System,
+                ui_text_status_ai_connectivity_pending_send_blocked(),
+            );
+        }
+        return Ok(false);
+    }
     *chat_turns = chat_turns.saturating_add(1);
     let group_id = Uuid::new_v4().to_string();
     services
@@ -2673,6 +2745,7 @@ fn submit_chat_message(
         history,
         system_prompt.to_string(),
         message.clone(),
+        services.session.session_id().to_string(),
         policy,
         services.cfg.ai.chat.max_tool_rounds,
         services.cfg.ai.chat.max_total_tool_calls,
@@ -2694,6 +2767,7 @@ fn submit_chat_message(
     }
     let response = wait_outcome.response;
     state.ai_live = None;
+    state.conversation_dirty = true;
     match response {
         Ok(chat_result) => {
             if let Some(thinking) = chat_result.thinking.as_deref()
@@ -2751,6 +2825,7 @@ fn spawn_chat_worker(
     history: Vec<crate::ai::ChatMessage>,
     system_prompt: String,
     message: String,
+    session_id: String,
     policy: ToolUsePolicy,
     max_tool_rounds: usize,
     max_total_tool_calls: usize,
@@ -2763,7 +2838,7 @@ fn spawn_chat_worker(
         let tool_event_tx = event_tx.clone();
         let round_event_tx = event_tx.clone();
         let stream_event_tx = event_tx.clone();
-        let result = ai.chat_with_shell_tool(
+        let result = ai.chat_with_shell_tool_with_debug_session(
             &history,
             &system_prompt,
             &message,
@@ -2773,6 +2848,7 @@ fn spawn_chat_worker(
             stream_output,
             &external_mcp_tools,
             Some(cancel_requested.as_ref()),
+            Some(session_id.as_str()),
             |tool_call| {
                 let (reply_tx, reply_rx) = mpsc::channel::<String>();
                 if tool_event_tx
@@ -4516,6 +4592,7 @@ fn draw_main_panel(
                     palette,
                 ))),
         );
+    frame.render_widget(Clear, layout.conversation);
     frame.render_widget(conversation, layout.conversation);
     draw_conversation_hover_copy_button(frame, state, layout, palette);
 
@@ -4707,52 +4784,28 @@ fn draw_main_header(
 }
 
 fn conversation_text(state: &ChatUiState, palette: ThemePalette) -> Text<'static> {
-    let align_line = |line: Line<'static>, role: UiRole| -> Line<'static> {
-        if role == UiRole::User {
-            line.alignment(Alignment::Right)
-        } else {
-            line
-        }
-    };
     let mut lines = Vec::<Line<'static>>::new();
     for line in &state.conversation_lines {
         match line.kind {
             ConversationLineKind::Header => {
-                lines.push(align_line(
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{} ", role_avatar(line.role)),
-                            Style::default()
-                                .fg(role_tag_color(line.role, palette))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            line.text.clone(),
-                            Style::default()
-                                .fg(role_tag_color(line.role, palette))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]),
-                    line.role,
-                ));
+                lines.push(Line::from(Span::styled(
+                    line.text.clone(),
+                    Style::default()
+                        .fg(role_tag_color(line.role, palette))
+                        .add_modifier(Modifier::BOLD),
+                )));
             }
             ConversationLineKind::BubbleBorder => {
-                lines.push(align_line(
-                    Line::from(Span::styled(
-                        line.text.clone(),
-                        Style::default().fg(role_border_color(line.role, palette)),
-                    )),
-                    line.role,
-                ));
+                lines.push(Line::from(Span::styled(
+                    line.text.clone(),
+                    Style::default().fg(role_border_color(line.role, palette)),
+                )));
             }
             ConversationLineKind::Body => {
-                lines.push(align_line(
-                    Line::from(Span::styled(
-                        line.text.clone(),
-                        Style::default().fg(role_body_color(line.role, palette)),
-                    )),
-                    line.role,
-                ));
+                lines.push(Line::from(Span::styled(
+                    line.text.clone(),
+                    Style::default().fg(role_body_color(line.role, palette)),
+                )));
             }
             ConversationLineKind::Spacer => lines.push(Line::from(String::new())),
         }
@@ -7471,11 +7524,19 @@ fn mcp_panel_regions(layout: UiLayout) -> (Rect, Rect) {
         horizontal: 1,
         vertical: 1,
     });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(8)])
+        .split(inner);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(28), Constraint::Min(20)])
-        .split(inner);
-    (cols[0], cols[1])
+        .split(rows[1]);
+    let right_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(7), Constraint::Length(5)])
+        .split(cols[1]);
+    (cols[0], right_rows[0])
 }
 
 fn mcp_selected_server(state: &ChatUiState) -> Option<&McpUiServer> {
@@ -8501,9 +8562,14 @@ fn char_to_byte_idx(text: &str, char_idx: usize) -> usize {
 }
 
 fn text_display_width(text: &str) -> usize {
-    text.chars()
-        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(1).max(1))
-        .sum::<usize>()
+    text.chars().map(char_display_width).sum::<usize>()
+}
+
+fn char_display_width(ch: char) -> usize {
+    if ch == '\n' || ch == '\r' {
+        return 0;
+    }
+    UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
 }
 
 fn normalize_conversation_line(text: &str) -> String {
@@ -8511,10 +8577,11 @@ fn normalize_conversation_line(text: &str) -> String {
 }
 
 fn render_conversation_markdown(raw: &str, streaming_inflight: bool) -> String {
-    if streaming_inflight {
+    let rendered = render::render_markdown_for_terminal(raw, false);
+    if streaming_inflight && rendered.trim().is_empty() && !raw.trim().is_empty() {
         return normalize_conversation_markdown_for_bubble(raw);
     }
-    normalize_conversation_markdown_for_bubble(&render::render_markdown_for_terminal(raw, false))
+    normalize_conversation_markdown_for_bubble(&rendered)
 }
 
 fn normalize_conversation_markdown_for_bubble(rendered: &str) -> String {
@@ -8572,7 +8639,7 @@ fn strip_markdown_heading_prefix(line: &str) -> String {
 
 fn conversation_bubble_max_inner_width(wrap_width: u16) -> usize {
     let width = wrap_width.max(1) as usize;
-    width.saturating_sub(8).max(12)
+    width.saturating_sub(10).max(12)
 }
 
 fn wrap_text_by_display_width(text: &str, max_width: usize) -> Vec<String> {
@@ -8586,7 +8653,11 @@ fn wrap_text_by_display_width(text: &str, max_width: usize) -> Vec<String> {
     let mut current = String::new();
     let mut current_width = 0usize;
     for ch in text.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
+        let ch_width = char_display_width(ch);
+        if ch_width == 0 {
+            current.push(ch);
+            continue;
+        }
         if current_width + ch_width > max_width && !current.is_empty() {
             out.push(current);
             current = String::new();
@@ -8615,7 +8686,7 @@ fn display_width_between(text: &str, from_char: usize, to_char: usize) -> usize 
     text.chars()
         .skip(from_char)
         .take(to_char - from_char)
-        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(1).max(1))
+        .map(char_display_width)
         .sum::<usize>()
 }
 
@@ -9238,8 +9309,23 @@ fn ui_text_mode_write() -> &'static str {
 fn ui_text_status_ai_connectivity() -> &'static str {
     zh_or_en("正在检查 AI 连通性...", "Checking AI connectivity...")
 }
+fn ui_text_status_ai_connectivity_background_started() -> &'static str {
+    zh_or_en(
+        "AI 连通性检查已在后台运行，可继续输入与切换面板；检查完成前消息不会发送",
+        "AI connectivity check is running in background; you can keep typing and switching panels, but messages will not be sent until it finishes",
+    )
+}
+fn ui_text_status_ai_connectivity_pending_send_blocked() -> &'static str {
+    zh_or_en(
+        "AI 连通性检查进行中，消息暂未发送",
+        "AI connectivity check in progress, message not sent yet",
+    )
+}
 fn ui_text_status_ai_connectivity_ok() -> &'static str {
     zh_or_en("AI 连通性检查通过", "AI connectivity check passed")
+}
+fn ui_text_status_ai_connectivity_failed() -> &'static str {
+    zh_or_en("AI 连通性检查失败", "AI connectivity check failed")
 }
 fn ui_text_theme_switched() -> &'static str {
     zh_or_en("主题已切换", "Theme switched")
@@ -9346,6 +9432,51 @@ model = "test-model"
     }
 
     #[test]
+    fn connectivity_check_success_unblocks_chat_and_resets_status() {
+        let mut state = new_state();
+        state.ai_connectivity_checking = true;
+        state.status = ui_text_status_ai_connectivity().to_string();
+        let (tx, rx) = mpsc::channel::<Result<(), AppError>>();
+        tx.send(Ok(())).expect("send check result");
+        let mut handle = Some(AiConnectivityCheckHandle { rx });
+
+        poll_ai_connectivity_check(&mut handle, &mut state);
+
+        assert!(!state.ai_connectivity_checking);
+        assert!(handle.is_none());
+        assert_eq!(state.status, ui_text_ready());
+        assert!(
+            state
+                .messages
+                .back()
+                .is_some_and(|item| item.text.contains(ui_text_status_ai_connectivity_ok()))
+        );
+    }
+
+    #[test]
+    fn connectivity_check_failure_unblocks_chat_and_surfaces_error() {
+        let mut state = new_state();
+        state.ai_connectivity_checking = true;
+        state.status = ui_text_status_ai_connectivity().to_string();
+        let (tx, rx) = mpsc::channel::<Result<(), AppError>>();
+        tx.send(Err(AppError::Ai("network down".to_string())))
+            .expect("send check result");
+        let mut handle = Some(AiConnectivityCheckHandle { rx });
+
+        poll_ai_connectivity_check(&mut handle, &mut state);
+
+        assert!(!state.ai_connectivity_checking);
+        assert!(handle.is_none());
+        assert_eq!(state.status, ui_text_status_ai_connectivity_failed());
+        assert!(
+            state
+                .messages
+                .back()
+                .is_some_and(|item| item.text.contains(ui_text_status_ai_connectivity_failed()))
+        );
+    }
+
+    #[test]
     fn apply_selected_inspect_target_switches_mode_and_focus() {
         let mut state = new_state();
         state.mode = UiMode::Chat;
@@ -9407,6 +9538,40 @@ model = "test-model"
     }
 
     #[test]
+    fn mcp_mouse_click_can_select_first_server_row() {
+        let mut state = new_state();
+        state.mode = UiMode::Mcp;
+        state.mcp_ui.servers = vec![
+            McpUiServer {
+                name: "srv-a".to_string(),
+                config: McpServerConfig::default(),
+                dirty: false,
+            },
+            McpUiServer {
+                name: "srv-b".to_string(),
+                config: McpServerConfig::default(),
+                dirty: false,
+            },
+        ];
+        state.mcp_ui.selected_server = 1;
+        let layout = compute_layout(Rect::new(0, 0, 120, 40));
+        let (servers_rect, _) = mcp_panel_regions(layout);
+        let inner = servers_rect.inner(ratatui::layout::Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x.saturating_add(1),
+            row: inner.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        mcp_select_by_mouse(layout, mouse, &mut state);
+        assert_eq!(state.mcp_ui.selected_server, 0);
+        assert!(state.mcp_ui.focus_servers);
+    }
+
+    #[test]
     fn conversation_bubble_border_is_closed_for_long_system_line() {
         let mut state = new_state();
         state.messages.push_back(UiMessage {
@@ -9442,8 +9607,65 @@ model = "test-model"
     }
 
     #[test]
-    fn conversation_user_lines_are_right_aligned() {
+    fn conversation_thinking_bubble_right_border_stays_collinear_for_mixed_text() {
         let mut state = new_state();
+        state.messages.push_back(UiMessage {
+            role: UiRole::Thinking,
+            text: "看起来有一些音频相关进程（如AudioToolbox），但没有明显的音乐播放器。用户可能只是想要一些时间，或者想让我等一下。\n\n考虑到我的角色是系统巡检助手，我可以提供系统状态摘要，并说明一首歌的时间大约是3-5分钟，期间系统可以继续运行。".to_string(),
+        });
+        state.conversation_wrap_width = 92;
+        state.conversation_dirty = true;
+        state.ensure_conversation_cache();
+
+        let mut widths = Vec::<usize>::new();
+        for line in state.conversation_lines.iter().filter(|line| {
+            line.message_index == Some(0)
+                && matches!(
+                    line.kind,
+                    ConversationLineKind::BubbleBorder | ConversationLineKind::Body
+                )
+        }) {
+            widths.push(text_display_width(&line.text));
+        }
+        assert!(!widths.is_empty());
+        let expected = widths[0];
+        assert!(widths.iter().all(|item| *item == expected));
+    }
+
+    #[test]
+    fn conversation_user_header_right_edge_matches_bubble_width() {
+        let mut state = new_state();
+        state.messages.push_back(UiMessage {
+            role: UiRole::User,
+            text: "给我写一个冒泡排序！".to_string(),
+        });
+        state.conversation_wrap_width = 54;
+        state.conversation_dirty = true;
+        state.ensure_conversation_cache();
+
+        let header = state
+            .conversation_lines
+            .iter()
+            .find(|line| line.message_index == Some(0) && line.kind == ConversationLineKind::Header)
+            .expect("user header line");
+        let top_border = state
+            .conversation_lines
+            .iter()
+            .find(|line| {
+                line.message_index == Some(0) && line.kind == ConversationLineKind::BubbleBorder
+            })
+            .expect("user bubble top line");
+        assert_eq!(
+            text_display_width(&header.text),
+            text_display_width(&top_border.text)
+        );
+    }
+
+    #[test]
+    fn conversation_user_lines_fill_viewport_width_after_padding() {
+        let mut state = new_state();
+        let layout = compute_layout(Rect::new(0, 0, 120, 40));
+        state.set_conversation_wrap_width(layout.conversation_body.width.max(1));
         state.messages.push_back(UiMessage {
             role: UiRole::User,
             text: "hello".to_string(),
@@ -9462,7 +9684,10 @@ model = "test-model"
                 continue;
             }
             if source_line.role == UiRole::User {
-                assert_eq!(rendered_line.alignment, Some(Alignment::Right));
+                assert_eq!(
+                    text_display_width(&source_line.text),
+                    layout.conversation_body.width as usize
+                );
             } else {
                 assert_eq!(rendered_line.alignment, None);
             }
@@ -9621,14 +9846,15 @@ model = "test-model"
     }
 
     #[test]
-    fn streaming_inflight_markdown_uses_lightweight_normalization() {
+    fn streaming_inflight_markdown_keeps_markdown_rendering_enabled() {
         let inflight = render_conversation_markdown("### title\n- item", true);
         let finalized = render_conversation_markdown("### title\n- item", false);
         assert!(inflight.contains("title"));
-        assert!(inflight.contains("- item"));
         assert!(!inflight.contains("### title"));
+        assert!(inflight.contains("• item") || inflight.contains("- item"));
         assert!(finalized.contains("title"));
         assert!(finalized.contains("• item") || finalized.contains("- item"));
+        assert_eq!(inflight, finalized);
     }
 
     #[test]
