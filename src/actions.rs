@@ -1365,7 +1365,7 @@ fn execute_mcp_tool_call(
             let payload = json!({
                 "ok": true,
                 "tool": tool_call.name,
-                "content": trim_text(&mask_sensitive(&content), 3000)
+                "content": mask_sensitive(&content)
             })
             .to_string();
             services.session.add_tool_message(

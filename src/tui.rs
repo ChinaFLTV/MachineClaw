@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashSet, VecDeque},
+    env,
     fs,
     io::{self, IsTerminal, Stdout, Write},
     path::{Path, PathBuf},
@@ -50,7 +51,7 @@ use crate::{
     },
     cli::InspectTarget,
     config::{AppConfig, McpServerConfig, expand_tilde},
-    context::{SessionMessage, SessionOverview},
+    context::{SessionMessage, SessionOverview, ToolExecutionMeta},
     error::{AppError, ExitCode},
     i18n, mask,
     mcp::{self, McpServerRecord},
@@ -71,6 +72,11 @@ const THREAD_DOUBLE_CLICK_WINDOW_MS: u128 = 320;
 const STARTUP_SPLASH_MIN_DURATION_MS: u64 = 280;
 const STARTUP_SPLASH_FRAME_INTERVAL_MS: u64 = 56;
 const STREAM_RENDER_BATCH_CHARS: usize = 24;
+const THINKING_STREAM_PERSIST_INTERVAL_MS: u64 = 500;
+const TOOL_RESULT_MODAL_MAX_RESULT_CHARS: usize = 120_000;
+const MCP_TOOL_RESULT_CONTENT_MAX_CHARS: usize = 120_000;
+const SESSION_AUTO_TITLE_MAX_UNITS: usize = 15;
+const SESSION_AUTO_TITLE_SOURCE_MAX_CHARS: usize = 1200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiRole {
@@ -85,6 +91,7 @@ enum UiRole {
 struct UiMessage {
     role: UiRole,
     text: String,
+    tool_meta: Option<ToolExecutionMeta>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -147,9 +154,16 @@ struct ConversationDeleteButton {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct ConversationToolResultButton {
+    message_index: usize,
+    rect: Rect,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ConversationHoverButtons {
     message_index: usize,
     copy_rect: Rect,
+    result_rect: Option<Rect>,
     delete_rect: Rect,
 }
 
@@ -189,6 +203,49 @@ struct ThreadMetadataModalState {
     session_name: String,
     rows: Vec<(String, String)>,
     scroll: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ToolResultModalState {
+    message_index: usize,
+    lines: Vec<String>,
+    scroll: u16,
+}
+
+#[derive(Debug, Clone)]
+struct ToolResultDetail {
+    tool_call_id: String,
+    function_name: String,
+    command: String,
+    arguments: String,
+    result_payload: String,
+    executed_at_epoch_ms: u128,
+    account: String,
+    environment: String,
+    os_name: String,
+    cwd: String,
+    mode: String,
+    label: String,
+    exit_code: Option<i32>,
+    duration_ms: u128,
+    timed_out: bool,
+    interrupted: bool,
+    blocked: bool,
+}
+
+struct ToolExecutionMetaInput<'a> {
+    tool_call_id: &'a str,
+    function_name: &'a str,
+    command: &'a str,
+    arguments: &'a str,
+    result_payload: &'a str,
+    mode: &'a str,
+    label: &'a str,
+    exit_code: Option<i32>,
+    duration_ms: u128,
+    timed_out: bool,
+    interrupted: bool,
+    blocked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,6 +502,12 @@ struct AiConnectivityCheckHandle {
     rx: mpsc::Receiver<Result<(), AppError>>,
 }
 
+#[derive(Debug)]
+struct SessionAutoTitleHandle {
+    session_id: String,
+    rx: mpsc::Receiver<Result<String, AppError>>,
+}
+
 impl InputBuffer {
     fn new() -> Self {
         Self {
@@ -549,6 +612,7 @@ struct ChatUiState {
     pending_thread_rename: Option<ThreadRenameModalState>,
     pending_thread_delete_confirm: Option<ThreadDeleteConfirmState>,
     pending_thread_metadata_modal: Option<ThreadMetadataModalState>,
+    pending_tool_result_modal: Option<ToolResultModalState>,
     last_thread_click: Option<ThreadClickState>,
     ai_live: Option<AiLiveState>,
     config_ui: ConfigUiState,
@@ -564,6 +628,8 @@ struct ChatUiState {
     token_live_estimate: u64,
     token_display_value: u64,
     ai_connectivity_checking: bool,
+    session_auto_title_workers: Vec<SessionAutoTitleHandle>,
+    session_auto_title_attempted: HashSet<String>,
 }
 
 impl ChatUiState {
@@ -615,6 +681,7 @@ impl ChatUiState {
             pending_thread_rename: None,
             pending_thread_delete_confirm: None,
             pending_thread_metadata_modal: None,
+            pending_tool_result_modal: None,
             last_thread_click: None,
             ai_live: None,
             config_ui: build_config_ui_state(cfg, config_path),
@@ -630,6 +697,8 @@ impl ChatUiState {
             token_live_estimate: 0,
             token_display_value: 0,
             ai_connectivity_checking: false,
+            session_auto_title_workers: Vec::new(),
+            session_auto_title_attempted: HashSet::new(),
         };
         state.sync_thread_selection_to_active();
         state
@@ -644,10 +713,18 @@ impl ChatUiState {
     }
 
     fn push_with_persisted(&mut self, role: UiRole, text: impl Into<String>, persisted: bool) {
-        self.messages.push_back(UiMessage {
-            role,
-            text: text.into(),
-        });
+        self.push_message_with_persisted(
+            UiMessage {
+                role,
+                text: text.into(),
+                tool_meta: None,
+            },
+            persisted,
+        );
+    }
+
+    fn push_message_with_persisted(&mut self, message: UiMessage, persisted: bool) {
+        self.messages.push_back(message);
         self.message_persisted.push_back(persisted);
         while self.messages.len() > CHAT_RENDER_LIMIT {
             self.messages.pop_front();
@@ -684,7 +761,11 @@ impl ChatUiState {
                 text.push_str(prefix_text);
             }
             text.push_str(chunk);
-            self.messages.push_back(UiMessage { role, text });
+            self.messages.push_back(UiMessage {
+                role,
+                text,
+                tool_meta: None,
+            });
             self.message_persisted.push_back(false);
             while self.messages.len() > CHAT_RENDER_LIMIT {
                 self.messages.pop_front();
@@ -744,6 +825,7 @@ impl ChatUiState {
         self.hovered_message_idx = None;
         self.pending_delete_confirm = None;
         self.pending_thread_delete_confirm = None;
+        self.pending_tool_result_modal = None;
     }
 
     fn is_message_persisted(&self, index: usize) -> bool {
@@ -762,6 +844,26 @@ impl ChatUiState {
         }
     }
 
+    fn mark_all_unpersisted_messages_by_role(&mut self, role: UiRole) -> usize {
+        let mut updated = 0usize;
+        for idx in 0..self.messages.len() {
+            if self.is_message_persisted(idx) {
+                continue;
+            }
+            let Some(item) = self.messages.get(idx) else {
+                continue;
+            };
+            if item.role != role {
+                continue;
+            }
+            if let Some(flag) = self.message_persisted.get_mut(idx) {
+                *flag = true;
+                updated = updated.saturating_add(1);
+            }
+        }
+        updated
+    }
+
     fn remove_message_at(&mut self, index: usize) -> bool {
         if index >= self.messages.len() {
             return false;
@@ -770,6 +872,11 @@ impl ChatUiState {
         let _ = self.message_persisted.remove(index);
         self.conversation_dirty = true;
         self.follow_tail = true;
+        if let Some(modal) = self.pending_tool_result_modal.as_ref()
+            && modal.message_index == index
+        {
+            self.pending_tool_result_modal = None;
+        }
         if let Some(hovered) = self.hovered_message_idx {
             self.hovered_message_idx = if hovered == index {
                 None
@@ -778,6 +885,11 @@ impl ChatUiState {
             } else {
                 Some(hovered)
             };
+        }
+        if let Some(modal) = self.pending_tool_result_modal.as_mut()
+            && modal.message_index > index
+        {
+            modal.message_index -= 1;
         }
         true
     }
@@ -829,10 +941,26 @@ impl ChatUiState {
             .retain(|session_id, _| keep.contains(session_id));
     }
 
+    fn prune_session_auto_title_tracking_for_known_threads(&mut self) {
+        if self.threads.is_empty() {
+            return;
+        }
+        let mut keep = HashSet::<String>::new();
+        keep.insert(self.current_session_id.clone());
+        for item in &self.threads {
+            keep.insert(item.session_id.clone());
+        }
+        self.session_auto_title_attempted
+            .retain(|session_id| keep.contains(session_id));
+        self.session_auto_title_workers
+            .retain(|worker| keep.contains(&worker.session_id));
+    }
+
     fn set_threads(&mut self, threads: Vec<SessionOverview>) {
         if self.threads.is_empty() {
             self.threads = threads;
             self.prune_session_cache_for_known_threads();
+            self.prune_session_auto_title_tracking_for_known_threads();
             self.sync_thread_selection_to_active();
             return;
         }
@@ -853,6 +981,7 @@ impl ChatUiState {
         ordered.extend(incoming);
         self.threads = ordered;
         self.prune_session_cache_for_known_threads();
+        self.prune_session_auto_title_tracking_for_known_threads();
         if self.threads.is_empty() {
             self.thread_selected = 0;
             return;
@@ -903,9 +1032,8 @@ impl ChatUiState {
             let header_label = role_tag(item.role).to_string();
             let header_label = trim_ui_text(header_label.as_str(), conversation_width.max(1));
             let header_width = text_display_width(header_label.as_str());
-            let render_source = conversation_render_source_text(item);
-            let rendered = render_conversation_markdown(
-                render_source.trim(),
+            let rendered = render_conversation_item_text(
+                item,
                 live_streaming
                     && idx == last_message_idx
                     && matches!(item.role, UiRole::Assistant | UiRole::Thinking),
@@ -1276,12 +1404,14 @@ fn run_loop(
         );
         drain_inspect_worker_updates(inspect_worker, state);
         poll_ai_connectivity_check(ai_connectivity_check, state);
+        poll_session_auto_title_workers(services, state);
         draw_once(terminal, services, state)?;
         if !event::poll(Duration::from_millis(50))
             .map_err(|err| AppError::Command(format!("failed to poll input event: {err}")))?
         {
             drain_inspect_worker_updates(inspect_worker, state);
             poll_ai_connectivity_check(ai_connectivity_check, state);
+            poll_session_auto_title_workers(services, state);
             continue;
         }
         match event::read()
@@ -1603,6 +1733,274 @@ fn poll_ai_connectivity_check(
     }
 }
 
+fn spawn_session_auto_title_worker(
+    ai: crate::ai::AiClient,
+    session_id: String,
+    first_user_message: String,
+    language: i18n::Language,
+) -> SessionAutoTitleHandle {
+    let (tx, rx) = mpsc::channel::<Result<String, AppError>>();
+    thread::spawn(move || {
+        let result = request_session_auto_title_from_ai(&ai, &first_user_message, language);
+        let _ = tx.send(result);
+    });
+    SessionAutoTitleHandle { session_id, rx }
+}
+
+fn maybe_start_session_auto_title_worker(
+    services: &ActionServices<'_>,
+    state: &mut ChatUiState,
+    first_user_message: &str,
+) {
+    let session_id = services.session.session_id().to_string();
+    let session_name = services.session.session_name().to_string();
+    let user_message_count = services.session.archived_role_counts().user;
+    if !should_schedule_session_auto_title(
+        &state.session_auto_title_attempted,
+        &session_id,
+        &session_name,
+        user_message_count,
+    ) {
+        return;
+    }
+    state.session_auto_title_attempted.insert(session_id.clone());
+    let language = i18n::resolve_language(services.cfg.app.language.as_deref());
+    state
+        .session_auto_title_workers
+        .push(spawn_session_auto_title_worker(
+            services.ai.clone(),
+            session_id,
+            first_user_message.to_string(),
+            language,
+        ));
+}
+
+fn poll_session_auto_title_workers(services: &mut ActionServices<'_>, state: &mut ChatUiState) {
+    if state.session_auto_title_workers.is_empty() {
+        return;
+    }
+    let mut pending = Vec::<SessionAutoTitleHandle>::new();
+    for handle in std::mem::take(&mut state.session_auto_title_workers) {
+        match handle.rx.try_recv() {
+            Ok(Ok(title)) => {
+                apply_session_auto_title(services, state, handle.session_id.as_str(), &title);
+            }
+            Ok(Err(_)) => {}
+            Err(mpsc::TryRecvError::Empty) => pending.push(handle),
+            Err(mpsc::TryRecvError::Disconnected) => {}
+        }
+    }
+    state.session_auto_title_workers = pending;
+}
+
+fn apply_session_auto_title(
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+    session_id: &str,
+    title: &str,
+) {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let default_name = default_session_name_for_id(session_id);
+    let current_name = if services.session.session_id() == session_id {
+        services.session.session_name().to_string()
+    } else {
+        match services.session.list_sessions() {
+            Ok(items) => items
+                .into_iter()
+                .find(|item| item.session_id == session_id)
+                .map(|item| item.session_name)
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        }
+    };
+    if current_name != default_name {
+        return;
+    }
+    if services
+        .session
+        .rename_session_by_id(session_id, trimmed)
+        .is_err()
+    {
+        return;
+    }
+    if let Ok(threads) = services.session.list_sessions() {
+        state.set_threads(threads);
+    }
+}
+
+fn should_schedule_session_auto_title(
+    attempted: &HashSet<String>,
+    session_id: &str,
+    session_name: &str,
+    user_message_count: usize,
+) -> bool {
+    if session_id.trim().is_empty() {
+        return false;
+    }
+    if attempted.contains(session_id) {
+        return false;
+    }
+    if session_name != default_session_name_for_id(session_id) {
+        return false;
+    }
+    user_message_count == 1
+}
+
+fn default_session_name_for_id(session_id: &str) -> String {
+    format!("session-{session_id}")
+}
+
+fn request_session_auto_title_from_ai(
+    ai: &crate::ai::AiClient,
+    first_user_message: &str,
+    language: i18n::Language,
+) -> Result<String, AppError> {
+    let clipped = trim_ui_text(first_user_message, SESSION_AUTO_TITLE_SOURCE_MAX_CHARS);
+    let (system_prompt, user_prompt) = build_session_auto_title_prompts(language, clipped.as_str());
+    let raw = ai.chat(&[], system_prompt, user_prompt.as_str())?;
+    normalize_session_auto_title_candidate(raw.as_str(), SESSION_AUTO_TITLE_MAX_UNITS)
+        .ok_or_else(|| AppError::Ai("AI returned invalid session title".to_string()))
+}
+
+fn build_session_auto_title_prompts(
+    language: i18n::Language,
+    first_user_message: &str,
+) -> (&'static str, String) {
+    match language {
+        i18n::Language::ZhCn => (
+            "你负责生成简洁的会话标题。",
+            format!(
+                "用户首条消息：\n{first_user_message}\n\n请生成一个能准确概括意图的会话标题。\n要求：\n1. 仅输出标题，不要解释。\n2. 必须使用简体中文。\n3. 不超过15个汉字。\n4. 优先使用具体主题词和动作词。"
+            ),
+        ),
+        i18n::Language::ZhTw => (
+            "你負責產生精簡的會話標題。",
+            format!(
+                "使用者首條訊息：\n{first_user_message}\n\n請產生一個能準確概括意圖的會話標題。\n要求：\n1. 僅輸出標題，不要解釋。\n2. 必須使用繁體中文。\n3. 不超過15個漢字。\n4. 優先使用具體主題詞和動作詞。"
+            ),
+        ),
+        i18n::Language::Fr => (
+            "Vous générez des titres de session concis.",
+            format!(
+                "Premier message utilisateur :\n{first_user_message}\n\nGénérez un titre de session concis qui résume l'intention.\nRègles :\n1. Retournez uniquement le titre.\n2. La langue de sortie doit être le français.\n3. Maximum 15 mots.\n4. Privilégiez des termes concrets et orientés action."
+            ),
+        ),
+        i18n::Language::De => (
+            "Sie erstellen prägnante Sitzungstitel.",
+            format!(
+                "Erste Nutzernachricht:\n{first_user_message}\n\nErstellen Sie einen kurzen Sitzungstitel, der die Absicht zusammenfasst.\nRegeln:\n1. Geben Sie nur den Titel zurück.\n2. Die Ausgabesprache muss Deutsch sein.\n3. Maximal 15 Wörter.\n4. Nutzen Sie konkrete Themen- und Aktionsbegriffe."
+            ),
+        ),
+        i18n::Language::Ja => (
+            "あなたは簡潔なセッションタイトルを生成します。",
+            format!(
+                "ユーザーの最初のメッセージ:\n{first_user_message}\n\n意図を要約した短いセッションタイトルを作成してください。\nルール:\n1. タイトルのみを出力する。\n2. 出力言語は日本語にする。\n3. 15語以内（または15文字以内）にする。\n4. 具体的なトピック語と行動語を優先する。"
+            ),
+        ),
+        i18n::Language::En => (
+            "You generate concise chat session titles.",
+            format!(
+                "First user message:\n{first_user_message}\n\nGenerate a concise session title that captures the user's intent.\nRules:\n1. Return title text only, no explanation.\n2. Output language must be English.\n3. Keep it within 15 words.\n4. Prefer concrete topic nouns and action phrases."
+            ),
+        ),
+    }
+}
+
+fn normalize_session_auto_title_candidate(raw: &str, max_units: usize) -> Option<String> {
+    let first_line = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '“' | '”' | '‘' | '’'))
+        .trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    let mut compact = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    for prefix in ["标题：", "标题:", "Title:", "title:"] {
+        if let Some(rest) = compact.strip_prefix(prefix) {
+            compact = rest.trim().to_string();
+            break;
+        }
+    }
+    let limited = limit_title_by_units(compact.as_str(), max_units);
+    if limited.is_empty() {
+        None
+    } else {
+        Some(limited)
+    }
+}
+
+fn limit_title_by_units(text: &str, max_units: usize) -> String {
+    if max_units == 0 || text.trim().is_empty() {
+        return String::new();
+    }
+    let mut units = 0usize;
+    let mut in_word = false;
+    let mut pending_space = false;
+    let mut out = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !out.is_empty() {
+                pending_space = true;
+            }
+            in_word = false;
+            continue;
+        }
+        if is_cjk_title_char(ch) {
+            if units >= max_units {
+                break;
+            }
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            out.push(ch);
+            units = units.saturating_add(1);
+            pending_space = false;
+            in_word = false;
+            continue;
+        }
+        if is_title_word_char(ch) {
+            if !in_word {
+                if units >= max_units {
+                    break;
+                }
+                if pending_space && !out.is_empty() {
+                    out.push(' ');
+                }
+                units = units.saturating_add(1);
+                pending_space = false;
+                in_word = true;
+            }
+            out.push(ch);
+            continue;
+        }
+        in_word = false;
+        if !out.is_empty() {
+            pending_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn is_cjk_title_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{3040}'..='\u{30FF}'
+            | '\u{AC00}'..='\u{D7AF}'
+    )
+}
+
+fn is_title_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '-' | '_' | '/' | '&' | '+')
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_key_event(
     key: KeyEvent,
@@ -1646,6 +2044,9 @@ fn handle_key_event(
     }
     if state.pending_thread_metadata_modal.is_some() {
         return handle_thread_metadata_modal_key(key, state);
+    }
+    if state.pending_tool_result_modal.is_some() {
+        return handle_tool_result_modal_key(key, state);
     }
     if state.pending_thread_rename.is_some() {
         return handle_thread_rename_modal_key(key, services, state);
@@ -2338,6 +2739,10 @@ fn handle_mouse_event(
         handle_thread_metadata_modal_mouse(mouse, state, layout)?;
         return Ok(());
     }
+    if state.pending_tool_result_modal.is_some() {
+        handle_tool_result_modal_mouse(mouse, state, layout)?;
+        return Ok(());
+    }
     if state.pending_thread_rename.is_some() {
         handle_thread_rename_modal_mouse(mouse, services, state, layout)?;
         return Ok(());
@@ -2415,6 +2820,12 @@ fn handle_mouse_event(
                 selected: 1,
             });
             state.status = ui_text_message_delete_confirm_prompt().to_string();
+            return Ok(());
+        }
+        if let Some(button) = conversation_tool_result_button_data(state, layout)
+            && rect_contains(button.rect, mouse.column, mouse.row)
+        {
+            open_tool_result_modal(state, button.message_index);
             return Ok(());
         }
     }
@@ -2664,6 +3075,187 @@ fn handle_thread_metadata_modal_mouse(
     Ok(())
 }
 
+fn handle_tool_result_modal_mouse(
+    mouse: MouseEvent,
+    state: &mut ChatUiState,
+    layout: UiLayout,
+) -> Result<(), AppError> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if let Some(modal) = state.pending_tool_result_modal.as_mut() {
+                modal.scroll = modal.scroll.saturating_sub(1);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some(modal) = state.pending_tool_result_modal.as_mut() {
+                let max_scroll = tool_result_modal_scroll_max(modal, layout);
+                modal.scroll = modal.scroll.saturating_add(1).min(max_scroll);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !rect_contains(tool_result_modal_rect(layout), mouse.column, mouse.row) {
+                state.pending_tool_result_modal = None;
+                state.status = ui_text_message_tool_result_modal_closed().to_string();
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_tool_result_modal_key(key: KeyEvent, state: &mut ChatUiState) -> Result<bool, AppError> {
+    let Some(modal) = state.pending_tool_result_modal.as_mut() else {
+        return Ok(false);
+    };
+    match key.code {
+        KeyCode::Esc => {
+            state.pending_tool_result_modal = None;
+            state.status = ui_text_message_tool_result_modal_closed().to_string();
+        }
+        KeyCode::Up => modal.scroll = modal.scroll.saturating_sub(1),
+        KeyCode::Down => modal.scroll = modal.scroll.saturating_add(1),
+        KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(8),
+        KeyCode::PageDown => modal.scroll = modal.scroll.saturating_add(8),
+        KeyCode::Home => modal.scroll = 0,
+        KeyCode::End => modal.scroll = u16::MAX,
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn open_tool_result_modal(state: &mut ChatUiState, message_index: usize) {
+    let Some(message) = state.messages.get(message_index) else {
+        state.status = ui_text_message_tool_result_unavailable().to_string();
+        return;
+    };
+    let Some(detail) = tool_result_detail_from_message(message) else {
+        state.status = ui_text_message_tool_result_unavailable().to_string();
+        return;
+    };
+    let mut lines = Vec::<String>::new();
+    lines.push(format!(
+        "{} {}",
+        ui_text_message_tool_result_modal_subtitle(),
+        detail.function_name
+    ));
+    lines.push(String::new());
+    lines.push(format!(
+        "{} {}",
+        ui_text_message_tool_result_meta_call_id(),
+        detail.tool_call_id
+    ));
+    lines.push(format!(
+        "{} {}",
+        ui_text_message_tool_result_meta_time(),
+        format_epoch_ms(detail.executed_at_epoch_ms)
+    ));
+    lines.push(format!(
+        "{} {}",
+        ui_text_message_tool_result_meta_account(),
+        if detail.account.trim().is_empty() {
+            ui_text_na().to_string()
+        } else {
+            detail.account.clone()
+        }
+    ));
+    lines.push(format!(
+        "{} {}",
+        ui_text_message_tool_result_meta_env(),
+        if detail.environment.trim().is_empty() {
+            ui_text_na().to_string()
+        } else {
+            detail.environment.clone()
+        }
+    ));
+    lines.push(format!(
+        "{} {}",
+        ui_text_message_tool_result_meta_os(),
+        if detail.os_name.trim().is_empty() {
+            ui_text_na().to_string()
+        } else {
+            detail.os_name.clone()
+        }
+    ));
+    lines.push(format!(
+        "{} {}",
+        ui_text_message_tool_result_meta_cwd(),
+        if detail.cwd.trim().is_empty() {
+            ui_text_na().to_string()
+        } else {
+            detail.cwd.clone()
+        }
+    ));
+    lines.push(format!(
+        "{} {}",
+        ui_text_message_tool_result_meta_label(),
+        if detail.label.trim().is_empty() {
+            ui_text_na().to_string()
+        } else {
+            detail.label.clone()
+        }
+    ));
+    lines.push(format!(
+        "{} {}",
+        ui_text_message_tool_result_meta_mode(),
+        if detail.mode.trim().is_empty() {
+            ui_text_na().to_string()
+        } else {
+            detail.mode.clone()
+        }
+    ));
+    lines.push(format!(
+        "{} {}",
+        ui_text_message_tool_result_meta_exit_code(),
+        detail
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| ui_text_na().to_string())
+    ));
+    lines.push(format!(
+        "{} {}",
+        ui_text_message_tool_result_meta_duration(),
+        if detail.duration_ms == 0 {
+            ui_text_na().to_string()
+        } else {
+            format!("{}ms", detail.duration_ms)
+        }
+    ));
+    lines.push(format!(
+        "{} timeout={} interrupted={} blocked={}",
+        ui_text_message_tool_result_meta_status(),
+        detail.timed_out,
+        detail.interrupted,
+        detail.blocked
+    ));
+    lines.push(String::new());
+    lines.push(format!("{}:", ui_text_message_tool_result_meta_command()));
+    lines.push(if detail.command.trim().is_empty() {
+        ui_text_na().to_string()
+    } else {
+        detail.command
+    });
+    lines.push(String::new());
+    lines.push(format!("{}:", ui_text_message_tool_result_meta_arguments()));
+    lines.push(if detail.arguments.trim().is_empty() {
+        ui_text_na().to_string()
+    } else {
+        detail.arguments
+    });
+    lines.push(String::new());
+    lines.push(format!("{}:", ui_text_message_tool_result_meta_output()));
+    lines.push(if detail.result_payload.trim().is_empty() {
+        ui_text_na().to_string()
+    } else {
+        detail.result_payload
+    });
+    state.pending_tool_result_modal = Some(ToolResultModalState {
+        message_index,
+        lines,
+        scroll: 0,
+    });
+    state.status = ui_text_message_tool_result_modal_opened().to_string();
+}
+
 fn handle_thread_action_menu_mouse(
     mouse: MouseEvent,
     services: &mut ActionServices<'_>,
@@ -2781,7 +3373,7 @@ fn ui_role_to_session_role(role: UiRole) -> Option<&'static str> {
         UiRole::Assistant => Some("assistant"),
         UiRole::System => Some("system"),
         UiRole::Tool => Some("tool"),
-        UiRole::Thinking => None,
+        UiRole::Thinking => Some("thinking"),
     }
 }
 
@@ -2817,12 +3409,19 @@ fn switch_selected_thread(
         recent_messages_to_ui_messages(&current),
     );
     for (item, persisted) in restored {
-        state.push_with_persisted(item.role, item.text, persisted);
+        state.push_message_with_persisted(item, persisted);
     }
     state.remember_current_session_messages();
     state.set_threads(services.session.list_sessions().unwrap_or_default());
     services.session.persist()?;
     Ok(())
+}
+
+fn selected_thread_is_active_session(state: &ChatUiState) -> bool {
+    state
+        .threads
+        .get(state.thread_selected)
+        .is_some_and(|item| item.session_id == state.current_session_id)
 }
 
 fn handle_inspect_menu_key(key: KeyEvent, state: &mut ChatUiState) -> Result<bool, AppError> {
@@ -3119,6 +3718,10 @@ fn delete_thread_session_by_index(
     let previous_active_id = services.session.session_id().to_string();
     let active_after = services.session.delete_session_by_id(&target.session_id)?;
     state.drop_session_cache(&target.session_id);
+    state.session_auto_title_attempted.remove(&target.session_id);
+    state
+        .session_auto_title_workers
+        .retain(|item| item.session_id != target.session_id);
     state.pending_thread_rename = None;
     state.pending_thread_action_menu = None;
     state.pending_thread_delete_confirm = None;
@@ -3143,7 +3746,7 @@ fn delete_thread_session_by_index(
             recent_messages_to_ui_messages(&current),
         );
         for (item, persisted) in restored {
-            state.push_with_persisted(item.role, item.text, persisted);
+            state.push_message_with_persisted(item, persisted);
         }
         state.remember_current_session_messages();
     }
@@ -3187,6 +3790,7 @@ fn activate_nav_item(
     state.pending_thread_rename = None;
     state.pending_thread_delete_confirm = None;
     state.pending_thread_metadata_modal = None;
+    state.pending_tool_result_modal = None;
     match state.nav_selected {
         0 => {
             state.mode = UiMode::Chat;
@@ -3396,6 +4000,7 @@ fn submit_chat_message(
         .session
         .add_user_message(message.clone(), Some(group_id.clone()));
     services.session.persist()?;
+    maybe_start_session_auto_title_worker(services, state, &message);
     state.push_persisted(UiRole::User, message.clone());
     state.reset_live_token_estimate();
     state.add_live_token_estimate(estimate_tokens_from_text_delta(&message));
@@ -3453,7 +4058,11 @@ fn submit_chat_message(
             if let Some(thinking) = chat_result.thinking.as_deref()
                 && should_append_final_thinking(thinking, wait_outcome.thinking_rendered_in_ui)
             {
-                state.push(UiRole::Thinking, thinking.trim());
+                services
+                    .session
+                    .add_thinking_message(thinking.trim().to_string(), Some(group_id.clone()));
+                services.session.persist()?;
+                state.push_persisted(UiRole::Thinking, thinking.trim());
             }
             if let Some(stop_reason) = chat_result.stop_reason {
                 state.push(
@@ -3464,7 +4073,7 @@ fn submit_chat_message(
             let reply = chat_result.archived_content.trim().to_string();
             services
                 .session
-                .add_assistant_message(reply.clone(), Some(group_id));
+                .add_assistant_message(reply.clone(), Some(group_id.clone()));
             services.session.persist()?;
             let final_content_already_printed = !wait_outcome.last_round_content.trim().is_empty()
                 && wait_outcome.last_round_content.trim() == reply.trim();
@@ -3589,10 +4198,13 @@ fn wait_chat_worker_result(
 ) -> Result<PendingAiWaitOutcome, AppError> {
     let mut finished: Option<Result<ChatToolResponse, String>> = None;
     let mut thinking_rendered_in_ui = false;
+    let mut streamed_thinking_dirty = false;
+    let mut streamed_thinking_last_flush = Instant::now();
     let mut last_round_content = String::new();
     let mut saw_stream_events = false;
     let mut last_idle_draw = Instant::now();
     while finished.is_none() {
+        poll_session_auto_title_workers(services, state);
         let mut ui_dirty = false;
         let mut stream_draw_happened = false;
         loop {
@@ -3603,10 +4215,15 @@ fn wait_chat_worker_result(
                         && !thinking.trim().is_empty()
                         && !event.streamed_thinking
                     {
-                        state.push(UiRole::Thinking, thinking.trim());
+                        let thinking_text = thinking.trim();
+                        state.push_persisted(UiRole::Thinking, thinking_text);
+                        services
+                            .session
+                            .add_thinking_message(thinking_text.to_string(), Some(group_id.to_string()));
+                        services.session.persist()?;
                         thinking_rendered_in_ui = true;
                         state.add_live_token_estimate(estimate_tokens_from_text_delta(
-                            thinking.trim(),
+                            thinking_text,
                         ));
                     }
                     if !event.content.trim().is_empty() {
@@ -3640,6 +4257,10 @@ fn wait_chat_worker_result(
                         saw_stream_events = true;
                         if !event.text.is_empty() {
                             thinking_rendered_in_ui = true;
+                            services
+                                .session
+                                .append_or_add_thinking_chunk(&event.text, Some(group_id));
+                            streamed_thinking_dirty = true;
                         }
                         state.add_live_token_estimate(estimate_tokens_from_text_delta(&event.text));
                         render_stream_event_typewriter(
@@ -3674,6 +4295,15 @@ fn wait_chat_worker_result(
                     break;
                 }
             }
+        }
+        if streamed_thinking_dirty
+            && streamed_thinking_last_flush.elapsed()
+                >= Duration::from_millis(THINKING_STREAM_PERSIST_INTERVAL_MS)
+        {
+            services.session.persist()?;
+            let _ = state.mark_all_unpersisted_messages_by_role(UiRole::Thinking);
+            streamed_thinking_dirty = false;
+            streamed_thinking_last_flush = Instant::now();
         }
         if (!stream_draw_happened && ui_dirty) || last_idle_draw.elapsed() >= Duration::from_millis(120) {
             draw_once(terminal, services, state)?;
@@ -3711,6 +4341,10 @@ fn wait_chat_worker_result(
             draw_once(terminal, services, state)?;
             last_idle_draw = Instant::now();
         }
+    }
+    if streamed_thinking_dirty {
+        services.session.persist()?;
+        let _ = state.mark_all_unpersisted_messages_by_role(UiRole::Thinking);
     }
     Ok(PendingAiWaitOutcome {
         response: finished.unwrap_or_else(|| Err(ui_text_ai_channel_closed().to_string())),
@@ -3829,6 +4463,9 @@ fn handle_pending_ai_key_event(
     if state.pending_thread_metadata_modal.is_some() {
         return handle_thread_metadata_modal_key(key, state);
     }
+    if state.pending_tool_result_modal.is_some() {
+        return handle_tool_result_modal_key(key, state);
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         cancel_requested.store(true, Ordering::SeqCst);
         if let Some(live) = state.ai_live.as_mut() {
@@ -3894,6 +4531,10 @@ fn handle_pending_ai_mouse_event(
         handle_thread_metadata_modal_mouse(mouse, state, layout)?;
         return Ok(());
     }
+    if state.pending_tool_result_modal.is_some() {
+        handle_tool_result_modal_mouse(mouse, state, layout)?;
+        return Ok(());
+    }
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
         if rect_contains(layout.nav, mouse.column, mouse.row) {
             let nav_idx = mouse.row.saturating_sub(layout.nav.y.saturating_add(1)) as usize;
@@ -3907,10 +4548,19 @@ fn handle_pending_ai_mouse_event(
         if rect_contains(layout.threads_body, mouse.column, mouse.row) {
             state.focus = FocusPanel::Threads;
             let row = mouse.row.saturating_sub(layout.threads_body.y) as usize;
+            let mut clicked_valid_thread = false;
             if row < state.threads.len() {
                 state.thread_selected = row;
+                clicked_valid_thread = true;
             }
-            state.status = ui_text_status_ai_pending_session_switch_blocked().to_string();
+            if clicked_valid_thread && selected_thread_is_active_session(state) {
+                state.mode = UiMode::Chat;
+                state.inspect_menu_open = false;
+                state.skill_doc_modal = None;
+                state.status = ui_text_focus_hint(state.focus).to_string();
+            } else {
+                state.status = ui_text_status_ai_pending_session_switch_blocked().to_string();
+            }
             return Ok(());
         }
     }
@@ -3956,7 +4606,14 @@ fn handle_pending_ai_threads_key(
             }
         }
         KeyCode::Enter => {
-            state.status = ui_text_status_ai_pending_session_switch_blocked().to_string();
+            if selected_thread_is_active_session(state) {
+                state.mode = UiMode::Chat;
+                state.inspect_menu_open = false;
+                state.skill_doc_modal = None;
+                state.status = ui_text_focus_hint(state.focus).to_string();
+            } else {
+                state.status = ui_text_status_ai_pending_session_switch_blocked().to_string();
+            }
         }
         KeyCode::Char('/') if state.mode == UiMode::Chat => {
             state.focus = FocusPanel::Input;
@@ -4197,7 +4854,7 @@ fn execute_builtin_command(
                     recent_messages_to_ui_messages(&current),
                 );
                 for (item, persisted) in restored {
-                    state.push_with_persisted(item.role, item.text, persisted);
+                    state.push_message_with_persisted(item, persisted);
                 }
                 state.remember_current_session_messages();
                 state.set_threads(services.session.list_sessions().unwrap_or_default());
@@ -4226,6 +4883,7 @@ fn execute_builtin_command(
             for message in items {
                 let role = match message.role.as_str() {
                     "assistant" => UiRole::Assistant,
+                    "thinking" => UiRole::Thinking,
                     "tool" => UiRole::Tool,
                     "system" => UiRole::System,
                     _ => UiRole::User,
@@ -4248,11 +4906,34 @@ fn execute_tool_call_tui(
         if services.mcp.has_ai_tool(&tool_call.name) {
             return execute_mcp_tool_call_tui(services, group_id, tool_call, state);
         }
-        return json!({
+        let payload = json!({
             "ok": false,
             "error": format!("unsupported tool function: {}", tool_call.name),
         })
         .to_string();
+        persist_tool_call_record(
+            services,
+            state,
+            group_id,
+            tool_call,
+            &tool_call.arguments,
+            payload.as_str(),
+            build_tool_execution_meta(services, ToolExecutionMetaInput {
+                tool_call_id: tool_call.id.as_str(),
+                function_name: tool_call.name.as_str(),
+                command: "",
+                arguments: tool_call.arguments.as_str(),
+                result_payload: payload.as_str(),
+                mode: "",
+                label: "",
+                exit_code: None,
+                duration_ms: 0,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            }),
+        );
+        return payload;
     }
     let parsed: ShellToolArgs = match mcp::parse_json_object_arguments(&tool_call.arguments)
         .and_then(|value| {
@@ -4260,21 +4941,67 @@ fn execute_tool_call_tui(
         }) {
         Ok(value) => value,
         Err(err) => {
-            return json!({
+            let payload = json!({
                 "ok": false,
                 "error": format!("invalid tool arguments: {err}"),
                 "raw_arguments": trim_tool_text(&tool_call.arguments, 300),
             })
             .to_string();
+            persist_tool_call_record(
+                services,
+                state,
+                group_id,
+                tool_call,
+                &tool_call.arguments,
+                payload.as_str(),
+                build_tool_execution_meta(services, ToolExecutionMetaInput {
+                    tool_call_id: tool_call.id.as_str(),
+                    function_name: tool_call.name.as_str(),
+                    command: "",
+                    arguments: tool_call.arguments.as_str(),
+                    result_payload: payload.as_str(),
+                    mode: "",
+                    label: "",
+                    exit_code: None,
+                    duration_ms: 0,
+                    timed_out: false,
+                    interrupted: false,
+                    blocked: false,
+                }),
+            );
+            return payload;
         }
     };
     let command = parsed.command.trim().to_string();
     if command.is_empty() {
-        return json!({
+        let payload = json!({
             "ok": false,
             "error": "command is empty",
         })
         .to_string();
+        persist_tool_call_record(
+            services,
+            state,
+            group_id,
+            tool_call,
+            tool_call.arguments.as_str(),
+            payload.as_str(),
+            build_tool_execution_meta(services, ToolExecutionMetaInput {
+                tool_call_id: tool_call.id.as_str(),
+                function_name: tool_call.name.as_str(),
+                command: "",
+                arguments: tool_call.arguments.as_str(),
+                result_payload: payload.as_str(),
+                mode: "",
+                label: "",
+                exit_code: None,
+                duration_ms: 0,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            }),
+        );
+        return payload;
     }
     let mode = if parsed
         .mode
@@ -4307,12 +5034,39 @@ fn execute_tool_call_tui(
             &effective_command,
         ) {
             Ok(WriteDecision::Reject) => {
-                return json!({
+                let payload = json!({
                     "ok": false,
                     "error": i18n::command_write_denied_by_user(),
                     "blocked": true
                 })
                 .to_string();
+                persist_tool_call_record(
+                    services,
+                    state,
+                    group_id,
+                    tool_call,
+                    tool_call.arguments.as_str(),
+                    payload.as_str(),
+                    build_tool_execution_meta(services, ToolExecutionMetaInput {
+                        tool_call_id: tool_call.id.as_str(),
+                        function_name: tool_call.name.as_str(),
+                        command: effective_command.as_str(),
+                        arguments: tool_call.arguments.as_str(),
+                        result_payload: payload.as_str(),
+                        mode: if matches!(mode, CommandMode::Write) {
+                            ui_text_mode_write()
+                        } else {
+                            ui_text_mode_read()
+                        },
+                        label: "",
+                        exit_code: None,
+                        duration_ms: 0,
+                        timed_out: false,
+                        interrupted: false,
+                        blocked: true,
+                    }),
+                );
+                return payload;
             }
             Ok(WriteDecision::ApproveSession) => {
                 state.write_session_approved = true;
@@ -4321,29 +5075,110 @@ fn execute_tool_call_tui(
                 match prompt_edit_command_in_tui(terminal, services, state, &effective_command) {
                     Ok(Some(edited)) => effective_command = edited,
                     Ok(None) => {
-                        return json!({
+                        let payload = json!({
                             "ok": false,
                             "error": i18n::command_write_denied_by_user(),
                             "blocked": true
                         })
                         .to_string();
+                        persist_tool_call_record(
+                            services,
+                            state,
+                            group_id,
+                            tool_call,
+                            tool_call.arguments.as_str(),
+                            payload.as_str(),
+                            build_tool_execution_meta(services, ToolExecutionMetaInput {
+                                tool_call_id: tool_call.id.as_str(),
+                                function_name: tool_call.name.as_str(),
+                                command: effective_command.as_str(),
+                                arguments: tool_call.arguments.as_str(),
+                                result_payload: payload.as_str(),
+                                mode: if matches!(mode, CommandMode::Write) {
+                                    ui_text_mode_write()
+                                } else {
+                                    ui_text_mode_read()
+                                },
+                                label: "",
+                                exit_code: None,
+                                duration_ms: 0,
+                                timed_out: false,
+                                interrupted: false,
+                                blocked: true,
+                            }),
+                        );
+                        return payload;
                     }
                     Err(err) => {
-                        return json!({
+                        let payload = json!({
                             "ok": false,
                             "error": err.to_string(),
                         })
                         .to_string();
+                        persist_tool_call_record(
+                            services,
+                            state,
+                            group_id,
+                            tool_call,
+                            tool_call.arguments.as_str(),
+                            payload.as_str(),
+                            build_tool_execution_meta(services, ToolExecutionMetaInput {
+                                tool_call_id: tool_call.id.as_str(),
+                                function_name: tool_call.name.as_str(),
+                                command: effective_command.as_str(),
+                                arguments: tool_call.arguments.as_str(),
+                                result_payload: payload.as_str(),
+                                mode: if matches!(mode, CommandMode::Write) {
+                                    ui_text_mode_write()
+                                } else {
+                                    ui_text_mode_read()
+                                },
+                                label: "",
+                                exit_code: None,
+                                duration_ms: 0,
+                                timed_out: false,
+                                interrupted: false,
+                                blocked: false,
+                            }),
+                        );
+                        return payload;
                     }
                 }
             }
             Ok(WriteDecision::Approve) => {}
             Err(err) => {
-                return json!({
+                let payload = json!({
                     "ok": false,
                     "error": err.to_string(),
                 })
                 .to_string();
+                persist_tool_call_record(
+                    services,
+                    state,
+                    group_id,
+                    tool_call,
+                    tool_call.arguments.as_str(),
+                    payload.as_str(),
+                    build_tool_execution_meta(services, ToolExecutionMetaInput {
+                        tool_call_id: tool_call.id.as_str(),
+                        function_name: tool_call.name.as_str(),
+                        command: effective_command.as_str(),
+                        arguments: tool_call.arguments.as_str(),
+                        result_payload: payload.as_str(),
+                        mode: if matches!(mode, CommandMode::Write) {
+                            ui_text_mode_write()
+                        } else {
+                            ui_text_mode_read()
+                        },
+                        label: "",
+                        exit_code: None,
+                        duration_ms: 0,
+                        timed_out: false,
+                        interrupted: false,
+                        blocked: false,
+                    }),
+                );
+                return payload;
             }
         }
     }
@@ -4356,20 +5191,24 @@ fn execute_tool_call_tui(
         command: effective_command.clone(),
         mode,
     };
-    state.push(
-        UiRole::Tool,
-        format!(
-            "{}: {} [{}]\n{}",
-            ui_text_tool_running(),
-            spec.label,
-            if matches!(spec.mode, CommandMode::Write) {
-                ui_text_mode_write()
-            } else {
-                ui_text_mode_read()
-            },
-            trim_tool_text(&spec.command, 280),
-        ),
+    let running_message = format!(
+        "{}: {} [{}]\n{}",
+        ui_text_tool_running(),
+        spec.label,
+        if matches!(spec.mode, CommandMode::Write) {
+            ui_text_mode_write()
+        } else {
+            ui_text_mode_read()
+        },
+        trim_tool_text(&spec.command, 280),
     );
+    state.push_persisted(UiRole::Tool, running_message.clone());
+    services
+        .session
+        .add_tool_message(running_message, Some(group_id.to_string()));
+    if let Err(err) = services.session.persist() {
+        report_tool_session_persist_failure(state, &err, ui_text_tool_running());
+    }
     let timeout = Duration::from_secs(services.cfg.ai.chat.cmd_run_timout);
     let run_result = services
         .shell
@@ -4388,17 +5227,31 @@ fn execute_tool_call_tui(
                     result.blocked
                 ),
             );
-            services.session.add_tool_message(
-                format!(
-                    "tool_call_id={} function={} args={} result={}",
-                    tool_call.id,
-                    tool_call.name,
-                    trim_tool_text(&tool_call.arguments, 400),
-                    trim_tool_text(&payload, 2400)
-                ),
-                Some(group_id.to_string()),
+            let tool_meta = build_tool_execution_meta(services, ToolExecutionMetaInput {
+                tool_call_id: tool_call.id.as_str(),
+                function_name: tool_call.name.as_str(),
+                command: effective_command.as_str(),
+                arguments: tool_call.arguments.as_str(),
+                result_payload: payload.as_str(),
+                mode: result.mode.as_str(),
+                label: result.label.as_str(),
+                exit_code: result.exit_code,
+                duration_ms: result.duration_ms,
+                timed_out: result.timed_out,
+                interrupted: result.interrupted,
+                blocked: result.blocked,
+            });
+            persist_tool_call_record(
+                services,
+                state,
+                group_id,
+                tool_call,
+                &tool_call.arguments,
+                payload.as_str(),
+                tool_meta.clone(),
             );
-            let _ = services.session.persist();
+            attach_tool_meta_to_last_tool_message(state, &tool_meta);
+            attach_tool_meta_to_recent_running_tool_message(state, &tool_meta);
             payload
         }
         Err(err) => {
@@ -4408,17 +5261,35 @@ fn execute_tool_call_tui(
             })
             .to_string();
             state.push(UiRole::Tool, format!("{}: {}", ui_text_tool_error(), err));
-            services.session.add_tool_message(
-                format!(
-                    "tool_call_id={} function={} args={} result={}",
-                    tool_call.id,
-                    tool_call.name,
-                    trim_tool_text(&tool_call.arguments, 400),
-                    trim_tool_text(&payload, 2400)
-                ),
-                Some(group_id.to_string()),
+            let tool_meta = build_tool_execution_meta(services, ToolExecutionMetaInput {
+                tool_call_id: tool_call.id.as_str(),
+                function_name: tool_call.name.as_str(),
+                command: effective_command.as_str(),
+                arguments: tool_call.arguments.as_str(),
+                result_payload: payload.as_str(),
+                mode: if matches!(mode, CommandMode::Write) {
+                    ui_text_mode_write()
+                } else {
+                    ui_text_mode_read()
+                },
+                label: spec.label.as_str(),
+                exit_code: None,
+                duration_ms: 0,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            });
+            persist_tool_call_record(
+                services,
+                state,
+                group_id,
+                tool_call,
+                &tool_call.arguments,
+                payload.as_str(),
+                tool_meta.clone(),
             );
-            let _ = services.session.persist();
+            attach_tool_meta_to_last_tool_message(state, &tool_meta);
+            attach_tool_meta_to_recent_running_tool_message(state, &tool_meta);
             payload
         }
     }
@@ -4937,6 +5808,63 @@ fn draw_thread_metadata_modal(
     );
 }
 
+fn draw_tool_result_modal(
+    frame: &mut Frame<'_>,
+    state: &ChatUiState,
+    layout: UiLayout,
+    palette: ThemePalette,
+) {
+    let Some(modal_state) = state.pending_tool_result_modal.as_ref() else {
+        return;
+    };
+    draw_modal_overlay(frame, palette);
+    let modal = tool_result_modal_rect(layout);
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(ui_text_message_tool_result_modal_title())
+            .style(Style::default().bg(palette.panel_bg))
+            .border_style(Style::default().fg(palette.border_focus)),
+        modal,
+    );
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(1)])
+        .margin(1)
+        .split(modal);
+    let max_scroll = tool_result_modal_scroll_max(modal_state, layout);
+    let scroll = modal_state.scroll.min(max_scroll);
+    let content = modal_state.lines.join("\n");
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .style(Style::default().fg(palette.text))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(palette.border)),
+            ),
+        body[0],
+    );
+    let hint = if max_scroll == 0 {
+        ui_text_message_tool_result_modal_hint().to_string()
+    } else {
+        format!(
+            "{} · {}/{}",
+            ui_text_message_tool_result_modal_hint(),
+            scroll + 1,
+            max_scroll + 1
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(trim_ui_text(hint.as_str(), body[1].width.max(1) as usize))
+            .style(Style::default().fg(palette.muted)),
+        body[1],
+    );
+}
+
 fn draw_thread_action_menu_modal(
     frame: &mut Frame<'_>,
     state: &ChatUiState,
@@ -5057,35 +5985,75 @@ fn execute_mcp_tool_call_tui(
         UiRole::Tool,
         format!("{}: {}", ui_text_mcp_tool_call(), tool_call.name),
     );
-    let payload = match services
+    let started = Instant::now();
+    let outcome = services
         .mcp
-        .call_ai_tool(&tool_call.name, &tool_call.arguments)
-    {
-        Ok(content) => json!({
-            "ok": true,
-            "tool": tool_call.name,
-            "content": trim_tool_text(&content, 3000),
-        })
-        .to_string(),
-        Err(err) => json!({
-            "ok": false,
-            "tool": tool_call.name,
-            "error": err.to_string(),
-            "troubleshooting": mcp_troubleshooting_hints_tui(),
-        })
-        .to_string(),
+        .call_ai_tool(&tool_call.name, &tool_call.arguments);
+    let duration_ms = started.elapsed().as_millis();
+    let (payload, exit_code) = match outcome {
+        Ok(content) => {
+            let exit_code = 200;
+            (
+                json!({
+                    "ok": true,
+                    "tool": tool_call.name,
+                    "command": tool_call.name,
+                    "exit_code": exit_code,
+                    "duration_ms": duration_ms,
+                    "content": trim_tool_text(&content, MCP_TOOL_RESULT_CONTENT_MAX_CHARS),
+                })
+                .to_string(),
+                exit_code,
+            )
+        }
+        Err(err) => {
+            let exit_code = mcp_exit_code_from_error(&err);
+            (
+                json!({
+                    "ok": false,
+                    "tool": tool_call.name,
+                    "command": tool_call.name,
+                    "exit_code": exit_code,
+                    "duration_ms": duration_ms,
+                    "error": err.to_string(),
+                    "troubleshooting": mcp_troubleshooting_hints_tui(),
+                })
+                .to_string(),
+                exit_code,
+            )
+        }
     };
-    services.session.add_tool_message(
-        format!(
-            "tool_call_id={} function={} args={} result={}",
-            tool_call.id,
-            tool_call.name,
-            trim_tool_text(&tool_call.arguments, 400),
-            trim_tool_text(&payload, 2400)
-        ),
-        Some(group_id.to_string()),
+    let extracted_command = extract_shell_command_from_tool_args(tool_call.arguments.as_str());
+    let effective_command = if extracted_command.trim().is_empty() {
+        tool_call.name.clone()
+    } else {
+        extracted_command
+    };
+    let tool_meta = build_tool_execution_meta(services, ToolExecutionMetaInput {
+        tool_call_id: tool_call.id.as_str(),
+        function_name: tool_call.name.as_str(),
+        command: effective_command.as_str(),
+        arguments: tool_call.arguments.as_str(),
+        result_payload: payload.as_str(),
+        mode: "mcp",
+        label: tool_call.name.as_str(),
+        exit_code: Some(exit_code),
+        duration_ms,
+        timed_out: false,
+        interrupted: false,
+        blocked: false,
+    });
+    persist_tool_call_record(
+        services,
+        state,
+        group_id,
+        tool_call,
+        &tool_call.arguments,
+        payload.as_str(),
+        tool_meta.clone(),
     );
-    let _ = services.session.persist();
+    attach_tool_meta_to_last_tool_message(state, &tool_meta);
+    attach_tool_meta_to_recent_running_tool_message(state, &tool_meta);
     payload
 }
 
@@ -5095,6 +6063,22 @@ fn mcp_troubleshooting_hints_tui() -> Vec<&'static str> {
         "Verify MCP endpoint/auth/header settings; for HTTP mode prefer /mcp over legacy /sse paths.",
         "Run /mcps to inspect server and tool availability, then retry with valid JSON arguments.",
     ]
+}
+
+fn mcp_exit_code_from_error(err: &AppError) -> i32 {
+    extract_http_status_code(err.to_string().as_str()).unwrap_or(500)
+}
+
+fn extract_http_status_code(raw: &str) -> Option<i32> {
+    let marker_idx = raw.find("status=")?;
+    let status = raw[marker_idx + "status=".len()..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if status.is_empty() {
+        return None;
+    }
+    status.parse::<i32>().ok()
 }
 
 fn format_live_tool_label(name: &str) -> String {
@@ -5180,6 +6164,126 @@ fn format_tool_result_payload(result: &CommandResult) -> String {
         "stderr": trim_tool_text(result.stderr.trim(), 2000),
     })
     .to_string()
+}
+
+fn persist_tool_call_record(
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+    group_id: &str,
+    tool_call: &ToolCallRequest,
+    raw_arguments: &str,
+    payload: &str,
+    tool_meta: ToolExecutionMeta,
+) {
+    services.session.add_tool_message_with_meta(
+        format!(
+            "tool_call_id={} function={} args={} result={}",
+            tool_call.id,
+            tool_call.name,
+            trim_tool_text(raw_arguments, 400),
+            trim_tool_text(payload, 2400)
+        ),
+        Some(group_id.to_string()),
+        Some(tool_meta),
+    );
+    if let Err(err) = services.session.persist() {
+        report_tool_session_persist_failure(state, &err, tool_call.name.as_str());
+    }
+}
+
+fn report_tool_session_persist_failure(
+    state: &mut ChatUiState,
+    err: &AppError,
+    stage: &str,
+) {
+    state.push(
+        UiRole::System,
+        format!(
+            "{}: {} ({})。{}",
+            ui_text_tool_persist_failed(),
+            i18n::localize_error(err),
+            stage,
+            ui_text_tool_persist_failed_hint()
+        ),
+    );
+    state.status = ui_text_tool_persist_failed().to_string();
+}
+
+fn attach_tool_meta_to_last_tool_message(state: &mut ChatUiState, tool_meta: &ToolExecutionMeta) {
+    for message in state.messages.iter_mut().rev() {
+        if message.role == UiRole::Tool {
+            message.tool_meta = Some(tool_meta.clone());
+            state.conversation_dirty = true;
+            return;
+        }
+    }
+}
+
+fn attach_tool_meta_to_recent_running_tool_message(
+    state: &mut ChatUiState,
+    tool_meta: &ToolExecutionMeta,
+) {
+    let running_prefix = format!("{}:", ui_text_tool_running());
+    for message in state.messages.iter_mut().rev() {
+        if message.role != UiRole::Tool {
+            continue;
+        }
+        if message.text.starts_with(running_prefix.as_str()) {
+            message.tool_meta = Some(tool_meta.clone());
+            state.conversation_dirty = true;
+            return;
+        }
+    }
+}
+
+fn build_tool_execution_meta(
+    services: &ActionServices<'_>,
+    input: ToolExecutionMetaInput<'_>,
+) -> ToolExecutionMeta {
+    let masked_command = mask_ui_sensitive(input.command);
+    let masked_arguments = mask_ui_sensitive(input.arguments);
+    let masked_payload = mask_ui_sensitive(input.result_payload);
+    let account = resolve_runtime_account();
+    let cwd = resolve_runtime_cwd();
+    ToolExecutionMeta {
+        tool_call_id: input.tool_call_id.to_string(),
+        function_name: input.function_name.to_string(),
+        command: masked_command,
+        arguments: masked_arguments,
+        result_payload: masked_payload,
+        executed_at_epoch_ms: now_epoch_ms(),
+        account: trim_tool_text(account.as_str(), 120),
+        environment: trim_tool_text(services.cfg.app.env_mode.as_str(), 64),
+        os_name: trim_tool_text(services.os_name, 64),
+        cwd: trim_tool_text(cwd.as_str(), 260),
+        mode: trim_tool_text(input.mode, 32),
+        label: trim_tool_text(input.label, 120),
+        exit_code: input.exit_code,
+        duration_ms: input.duration_ms,
+        timed_out: input.timed_out,
+        interrupted: input.interrupted,
+        blocked: input.blocked,
+    }
+}
+
+fn resolve_runtime_account() -> String {
+    const ACCOUNT_ENV_KEYS: [&str; 3] = ["USER", "LOGNAME", "USERNAME"];
+    ACCOUNT_ENV_KEYS
+        .iter()
+        .find_map(|key| {
+            env::var(key)
+                .ok()
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn resolve_runtime_cwd() -> String {
+    std::env::current_dir()
+        .ok()
+        .map(|item| item.display().to_string())
+        .unwrap_or_default()
 }
 
 fn should_require_tool_call(message: &str) -> bool {
@@ -5604,6 +6708,9 @@ fn draw_ui(frame: &mut Frame<'_>, services: &ActionServices<'_>, state: &mut Cha
     }
     if state.pending_thread_metadata_modal.is_some() {
         draw_thread_metadata_modal(frame, state, layout, palette);
+    }
+    if state.pending_tool_result_modal.is_some() {
+        draw_tool_result_modal(frame, state, layout, palette);
     }
 }
 
@@ -6052,6 +7159,18 @@ fn draw_conversation_hover_copy_button(
         ),
         buttons.copy_rect,
     );
+    if let Some(result_rect) = buttons.result_rect {
+        let result_label = ui_text_message_tool_result_button();
+        frame.render_widget(
+            Paragraph::new(result_label).style(
+                Style::default()
+                    .fg(Color::Rgb(130, 205, 255))
+                    .bg(palette.panel_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            result_rect,
+        );
+    }
     let delete_label = ui_text_message_delete_button();
     frame.render_widget(
         Paragraph::new(delete_label).style(
@@ -6086,6 +7205,18 @@ fn conversation_delete_button_data(
     })
 }
 
+fn conversation_tool_result_button_data(
+    state: &ChatUiState,
+    layout: UiLayout,
+) -> Option<ConversationToolResultButton> {
+    let buttons = conversation_hover_buttons_data(state, layout)?;
+    let result_rect = buttons.result_rect?;
+    Some(ConversationToolResultButton {
+        message_index: buttons.message_index,
+        rect: result_rect,
+    })
+}
+
 fn conversation_hover_buttons_data(
     state: &ChatUiState,
     layout: UiLayout,
@@ -6111,13 +7242,29 @@ fn conversation_hover_buttons_data(
         return None;
     }
     let copy_label = ui_text_message_copy_button();
+    let result_label = ui_text_message_tool_result_button();
     let delete_label = ui_text_message_delete_button();
     let copy_width = text_display_width(copy_label) as u16;
+    let result_width = text_display_width(result_label) as u16;
     let delete_width = text_display_width(delete_label) as u16;
-    let total_width = copy_width
-        .saturating_add(1)
-        .saturating_add(delete_width)
-        .max(1);
+    let has_result = state
+        .messages
+        .get(hovered)
+        .and_then(tool_result_detail_from_message)
+        .is_some();
+    let total_width = if has_result {
+        copy_width
+            .saturating_add(1)
+            .saturating_add(result_width)
+            .saturating_add(1)
+            .saturating_add(delete_width)
+            .max(1)
+    } else {
+        copy_width
+            .saturating_add(1)
+            .saturating_add(delete_width)
+            .max(1)
+    };
     if total_width > layout.conversation_body.width {
         return None;
     }
@@ -6139,8 +7286,23 @@ fn conversation_hover_buttons_data(
         width: copy_width.max(1),
         height: 1,
     };
+    let result_rect = if has_result {
+        Some(Rect {
+            x: x.saturating_add(copy_rect.width).saturating_add(1),
+            y,
+            width: result_width.max(1),
+            height: 1,
+        })
+    } else {
+        None
+    };
+    let delete_x = if let Some(rect) = result_rect {
+        rect.x.saturating_add(rect.width).saturating_add(1)
+    } else {
+        x.saturating_add(copy_rect.width).saturating_add(1)
+    };
     let delete_rect = Rect {
-        x: x.saturating_add(copy_rect.width).saturating_add(1),
+        x: delete_x,
         y,
         width: delete_width.max(1),
         height: 1,
@@ -6148,6 +7310,7 @@ fn conversation_hover_buttons_data(
     Some(ConversationHoverButtons {
         message_index: hovered,
         copy_rect,
+        result_rect,
         delete_rect,
     })
 }
@@ -6189,6 +7352,11 @@ fn refresh_hovered_message_from_mouse(
         return;
     }
     if let Some(button) = conversation_delete_button_data(state, layout)
+        && rect_contains(button.rect, mouse.column, mouse.row)
+    {
+        return;
+    }
+    if let Some(button) = conversation_tool_result_button_data(state, layout)
         && rect_contains(button.rect, mouse.column, mouse.row)
     {
         return;
@@ -9421,6 +10589,38 @@ fn thread_rename_modal_rect(layout: UiLayout) -> Rect {
     centered_rect(layout.conversation, 62, 9)
 }
 
+fn tool_result_modal_rect(layout: UiLayout) -> Rect {
+    centered_rect(layout.conversation, 88, 24)
+}
+
+fn tool_result_modal_scroll_max(modal: &ToolResultModalState, layout: UiLayout) -> u16 {
+    let rect = tool_result_modal_rect(layout);
+    let inner = rect.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(1)])
+        .split(inner);
+    let text_width = rows[0].width.saturating_sub(2).max(1) as usize;
+    let viewport_height = rows[0].height.saturating_sub(2).max(1) as usize;
+    let wrapped_lines = modal
+        .lines
+        .iter()
+        .map(|line| {
+            line.split('\n')
+                .map(|part| wrap_text_by_display_width(part, text_width).len().max(1))
+                .sum::<usize>()
+                .max(1)
+        })
+        .sum::<usize>()
+        .max(1);
+    wrapped_lines
+        .saturating_sub(viewport_height)
+        .min(u16::MAX as usize) as u16
+}
+
 fn thread_delete_modal_button_rects(modal: Rect) -> (Rect, Rect) {
     delete_message_modal_button_rects(modal)
 }
@@ -9969,11 +11169,13 @@ fn recent_messages_to_ui_messages(items: &[SessionMessage]) -> Vec<UiMessage> {
         .map(|item| UiMessage {
             role: match item.role.as_str() {
                 "assistant" => UiRole::Assistant,
+                "thinking" => UiRole::Thinking,
                 "tool" => UiRole::Tool,
                 "system" => UiRole::System,
                 _ => UiRole::User,
             },
             text: item.content.clone(),
+            tool_meta: item.tool_meta.clone(),
         })
         .collect()
 }
@@ -9982,7 +11184,25 @@ fn conversation_render_source_text(item: &UiMessage) -> Cow<'_, str> {
     if item.role != UiRole::Tool {
         return Cow::Borrowed(item.text.as_str());
     }
+    if let Some(meta) = item.tool_meta.as_ref() {
+        let raw = item.text.as_str();
+        if parse_persisted_tool_message(raw).is_some()
+            || format_legacy_tool_message_fallback(raw).is_some()
+        {
+            return Cow::Owned(format_tool_status_summary_from_meta(meta));
+        }
+    }
     format_persisted_tool_message_for_display(item.text.as_str())
+}
+
+fn render_conversation_item_text(item: &UiMessage, streaming_inflight: bool) -> String {
+    let render_source = conversation_render_source_text(item);
+    let source = render_source.trim();
+    if item.role == UiRole::Tool {
+        // Keep structured line breaks for persisted tool traces; markdown may collapse single '\n'.
+        return normalize_conversation_markdown_for_bubble(source);
+    }
+    render_conversation_markdown(source, streaming_inflight)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -10023,6 +11243,9 @@ fn tool_payload_to_display_text(raw: &str) -> String {
 
 fn format_persisted_tool_message_for_display(raw: &str) -> Cow<'_, str> {
     let Some(parts) = parse_persisted_tool_message(raw) else {
+        if let Some(fallback) = format_legacy_tool_message_fallback(raw) {
+            return Cow::Owned(fallback);
+        }
         return Cow::Borrowed(raw);
     };
     Cow::Owned(format!(
@@ -10032,6 +11255,186 @@ fn format_persisted_tool_message_for_display(raw: &str) -> Cow<'_, str> {
         tool_payload_to_display_text(parts.args),
         tool_payload_to_display_text(parts.result)
     ))
+}
+
+fn format_legacy_tool_message_fallback(raw: &str) -> Option<String> {
+    let body = raw.trim();
+    if !(body.contains("tool_call_id=") && body.contains(" function=")) {
+        return None;
+    }
+    let mut normalized = body.replace(" function=", "\nfunction=");
+    normalized = normalized.replace(" args=", "\nargs=");
+    normalized = normalized.replace(" result=", "\nresult=");
+    normalized = normalized.replace(" cache_hit=", "\ncache_hit=");
+    Some(normalized)
+}
+
+fn tool_result_detail_from_message(message: &UiMessage) -> Option<ToolResultDetail> {
+    if message.role != UiRole::Tool {
+        return None;
+    }
+    if let Some(meta) = message.tool_meta.as_ref() {
+        return Some(ToolResultDetail {
+            tool_call_id: meta.tool_call_id.clone(),
+            function_name: meta.function_name.clone(),
+            command: meta.command.clone(),
+            arguments: tool_payload_to_display_text(meta.arguments.as_str()),
+            result_payload: tool_result_output_for_modal(meta.result_payload.as_str()),
+            executed_at_epoch_ms: meta.executed_at_epoch_ms,
+            account: meta.account.clone(),
+            environment: meta.environment.clone(),
+            os_name: meta.os_name.clone(),
+            cwd: meta.cwd.clone(),
+            mode: meta.mode.clone(),
+            label: meta.label.clone(),
+            exit_code: meta.exit_code,
+            duration_ms: meta.duration_ms,
+            timed_out: meta.timed_out,
+            interrupted: meta.interrupted,
+            blocked: meta.blocked,
+        });
+    }
+    let parts = parse_persisted_tool_message(message.text.as_str())?;
+    let result_payload = tool_result_output_for_modal(parts.result);
+    let command = {
+        let extracted = extract_shell_command_from_tool_args(parts.args);
+        if extracted.trim().is_empty() {
+            parts.function.to_string()
+        } else {
+            extracted
+        }
+    };
+    let arguments = tool_payload_to_display_text(parts.args);
+    let result_value = serde_json::from_str::<serde_json::Value>(parts.result).ok();
+    Some(ToolResultDetail {
+        tool_call_id: parts.tool_call_id.to_string(),
+        function_name: parts.function.to_string(),
+        command,
+        arguments,
+        result_payload,
+        executed_at_epoch_ms: 0,
+        account: String::new(),
+        environment: String::new(),
+        os_name: String::new(),
+        cwd: String::new(),
+        mode: result_value
+            .as_ref()
+            .and_then(|item| item.get("mode"))
+            .and_then(|item| item.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        label: result_value
+            .as_ref()
+            .and_then(|item| item.get("label"))
+            .and_then(|item| item.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        exit_code: result_value
+            .as_ref()
+            .and_then(|item| item.get("exit_code"))
+            .and_then(|item| item.as_i64())
+            .and_then(|value| i32::try_from(value).ok()),
+        duration_ms: result_value
+            .as_ref()
+            .and_then(|item| item.get("duration_ms"))
+            .and_then(|item| item.as_u64())
+            .map(|value| value as u128)
+            .unwrap_or_default(),
+        timed_out: result_value
+            .as_ref()
+            .and_then(|item| item.get("timed_out"))
+            .and_then(|item| item.as_bool())
+            .unwrap_or(false),
+        interrupted: result_value
+            .as_ref()
+            .and_then(|item| item.get("interrupted"))
+            .and_then(|item| item.as_bool())
+            .unwrap_or(false),
+        blocked: result_value
+            .as_ref()
+            .and_then(|item| item.get("blocked"))
+            .and_then(|item| item.as_bool())
+            .unwrap_or(false),
+    })
+}
+
+fn extract_shell_command_from_tool_args(raw_args: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_args) else {
+        return String::new();
+    };
+    value
+        .get("command")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn tool_result_output_for_modal(raw_payload: &str) -> String {
+    let trimmed = raw_payload.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return trim_ui_text(trimmed, TOOL_RESULT_MODAL_MAX_RESULT_CHARS);
+    };
+    let stdout = value
+        .get("stdout")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    let stderr = value
+        .get("stderr")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    if !stdout.is_empty() || !stderr.is_empty() {
+        if !stdout.is_empty() && stderr.is_empty() {
+            return trim_ui_text(stdout, TOOL_RESULT_MODAL_MAX_RESULT_CHARS);
+        }
+        if stdout.is_empty() && !stderr.is_empty() {
+            return trim_ui_text(stderr, TOOL_RESULT_MODAL_MAX_RESULT_CHARS);
+        }
+        return trim_ui_text(
+            format!("stdout:\n{}\n\nstderr:\n{}", stdout, stderr).as_str(),
+            TOOL_RESULT_MODAL_MAX_RESULT_CHARS,
+        );
+    }
+    trim_ui_text(
+        serde_json::to_string_pretty(&value)
+            .unwrap_or_else(|_| trimmed.to_string())
+            .as_str(),
+        TOOL_RESULT_MODAL_MAX_RESULT_CHARS,
+    )
+}
+
+fn format_tool_status_summary_from_meta(meta: &ToolExecutionMeta) -> String {
+    let ok = tool_result_ok_from_payload(meta.result_payload.as_str()).unwrap_or_else(|| {
+        meta.exit_code == Some(0) && !meta.timed_out && !meta.interrupted && !meta.blocked
+    });
+    let exit_text = meta
+        .exit_code
+        .map(|code| format!("Some({code})"))
+        .unwrap_or_else(|| "None".to_string());
+    format!(
+        "{}: ok={} exit={} timeout={} blocked={}",
+        if ok {
+            ui_text_tool_finished()
+        } else {
+            ui_text_tool_error()
+        },
+        ok,
+        exit_text,
+        meta.timed_out,
+        meta.blocked
+    )
+}
+
+fn tool_result_ok_from_payload(raw_payload: &str) -> Option<bool> {
+    let trimmed = raw_payload.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|item| item.get("ok").and_then(|v| v.as_bool()))
 }
 
 fn char_to_byte_idx(text: &str, char_idx: usize) -> usize {
@@ -10092,6 +11495,11 @@ fn normalize_conversation_line(text: &str) -> String {
 
 fn render_conversation_markdown(raw: &str, streaming_inflight: bool) -> String {
     if streaming_inflight && !might_need_markdown_render(raw) {
+        return normalize_conversation_markdown_for_bubble(raw);
+    }
+    if streaming_inflight
+        && (has_inline_markdown_link_syntax(raw) || contains_plain_url_candidate(raw))
+    {
         return normalize_conversation_markdown_for_bubble(raw);
     }
     let rendered = render::render_markdown_for_terminal(raw, false);
@@ -10200,6 +11608,65 @@ fn has_unfinished_inline_markdown_link(text: &str) -> bool {
         i += 1;
     }
     false
+}
+
+fn has_inline_markdown_link_syntax(text: &str) -> bool {
+    if !text.contains("](") {
+        return false;
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() < 4 {
+        return false;
+    }
+    let mut label_stack = Vec::<usize>::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' {
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        if ch == '`' {
+            let mut tick_len = 1usize;
+            while i + tick_len < chars.len() && chars[i + tick_len] == '`' {
+                tick_len += 1;
+            }
+            i += tick_len;
+            while i < chars.len() {
+                if chars[i] == '\\' {
+                    i = (i + 2).min(chars.len());
+                    continue;
+                }
+                let mut closing_ticks = 0usize;
+                while i + closing_ticks < chars.len() && chars[i + closing_ticks] == '`' {
+                    closing_ticks += 1;
+                }
+                if closing_ticks >= tick_len {
+                    i += tick_len;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        match ch {
+            '[' => label_stack.push(i),
+            ']' => {
+                let has_label = label_stack.pop().is_some();
+                let starts_link = i + 1 < chars.len() && chars[i + 1] == '(';
+                if has_label && starts_link {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+fn contains_plain_url_candidate(text: &str) -> bool {
+    text.contains("https://") || text.contains("http://")
 }
 
 fn normalize_conversation_markdown_for_bubble(rendered: &str) -> String {
@@ -10938,6 +12405,9 @@ fn ui_text_tag_tool() -> &'static str {
 fn ui_text_message_copy_button() -> &'static str {
     zh_or_en("[复制]", "[Copy]")
 }
+fn ui_text_message_tool_result_button() -> &'static str {
+    zh_or_en("[执行结果]", "[Result]")
+}
 fn ui_text_message_delete_button() -> &'static str {
     zh_or_en("[删除]", "[Delete]")
 }
@@ -10946,6 +12416,69 @@ fn ui_text_message_copy_success() -> &'static str {
 }
 fn ui_text_message_copy_failed() -> &'static str {
     zh_or_en("复制消息失败", "Failed to copy message")
+}
+fn ui_text_message_tool_result_modal_title() -> &'static str {
+    zh_or_en("工具执行结果", "Tool Execution Result")
+}
+fn ui_text_message_tool_result_modal_subtitle() -> &'static str {
+    zh_or_en("工具函数:", "Function:")
+}
+fn ui_text_message_tool_result_modal_hint() -> &'static str {
+    zh_or_en(
+        "方向键/PageUp/PageDown滚动，Esc关闭",
+        "Use arrows/PageUp/PageDown to scroll, Esc to close",
+    )
+}
+fn ui_text_message_tool_result_modal_opened() -> &'static str {
+    zh_or_en("已打开执行结果弹窗", "Execution result modal opened")
+}
+fn ui_text_message_tool_result_modal_closed() -> &'static str {
+    zh_or_en("已关闭执行结果弹窗", "Execution result modal closed")
+}
+fn ui_text_message_tool_result_unavailable() -> &'static str {
+    zh_or_en("当前消息没有可展示的执行结果", "No execution result for this message")
+}
+fn ui_text_message_tool_result_meta_call_id() -> &'static str {
+    zh_or_en("调用ID:", "Call ID:")
+}
+fn ui_text_message_tool_result_meta_time() -> &'static str {
+    zh_or_en("执行时间:", "Executed At:")
+}
+fn ui_text_message_tool_result_meta_account() -> &'static str {
+    zh_or_en("执行账号:", "Account:")
+}
+fn ui_text_message_tool_result_meta_env() -> &'static str {
+    zh_or_en("环境:", "Environment:")
+}
+fn ui_text_message_tool_result_meta_os() -> &'static str {
+    zh_or_en("操作系统:", "OS:")
+}
+fn ui_text_message_tool_result_meta_cwd() -> &'static str {
+    zh_or_en("工作目录:", "CWD:")
+}
+fn ui_text_message_tool_result_meta_label() -> &'static str {
+    zh_or_en("标签:", "Label:")
+}
+fn ui_text_message_tool_result_meta_mode() -> &'static str {
+    zh_or_en("模式:", "Mode:")
+}
+fn ui_text_message_tool_result_meta_exit_code() -> &'static str {
+    zh_or_en("退出码:", "Exit Code:")
+}
+fn ui_text_message_tool_result_meta_duration() -> &'static str {
+    zh_or_en("耗时:", "Duration:")
+}
+fn ui_text_message_tool_result_meta_status() -> &'static str {
+    zh_or_en("状态:", "Status:")
+}
+fn ui_text_message_tool_result_meta_command() -> &'static str {
+    zh_or_en("命令", "Command")
+}
+fn ui_text_message_tool_result_meta_arguments() -> &'static str {
+    zh_or_en("参数", "Arguments")
+}
+fn ui_text_message_tool_result_meta_output() -> &'static str {
+    zh_or_en("输出", "Output")
 }
 fn ui_text_message_delete_confirm_prompt() -> &'static str {
     zh_or_en("请确认是否删除该消息", "Confirm message deletion")
@@ -11025,6 +12558,15 @@ fn ui_text_tool_finished() -> &'static str {
 fn ui_text_tool_error() -> &'static str {
     zh_or_en("Bash执行错误", "Bash tool error")
 }
+fn ui_text_tool_persist_failed() -> &'static str {
+    zh_or_en("工具消息写入会话失败", "Failed to persist tool message to session")
+}
+fn ui_text_tool_persist_failed_hint() -> &'static str {
+    zh_or_en(
+        "该条工具消息可能无法在重启后完整回放",
+        "This tool message may not replay completely after restart",
+    )
+}
 fn ui_text_mcp_tool_call() -> &'static str {
     zh_or_en("MCP工具调用", "MCP tool call")
 }
@@ -11099,6 +12641,8 @@ fn inspect_target_label(target: InspectTarget) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::MessageKind;
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
     fn test_cfg() -> AppConfig {
@@ -11267,6 +12811,7 @@ model = "test-model"
                 messages: vec![UiMessage {
                     role: UiRole::System,
                     text: "active".to_string(),
+                    tool_meta: None,
                 }],
                 message_persisted: vec![true],
             },
@@ -11277,6 +12822,7 @@ model = "test-model"
                 messages: vec![UiMessage {
                     role: UiRole::System,
                     text: "known".to_string(),
+                    tool_meta: None,
                 }],
                 message_persisted: vec![true],
             },
@@ -11287,6 +12833,7 @@ model = "test-model"
                 messages: vec![UiMessage {
                     role: UiRole::System,
                     text: "stale".to_string(),
+                    tool_meta: None,
                 }],
                 message_persisted: vec![true],
             },
@@ -11297,6 +12844,36 @@ model = "test-model"
         assert!(state.session_conversation_cache.contains_key("a"));
         assert!(state.session_conversation_cache.contains_key("b"));
         assert!(!state.session_conversation_cache.contains_key("orphan"));
+    }
+
+    #[test]
+    fn set_threads_prunes_orphaned_auto_title_tracking() {
+        let mut state = new_state();
+        state.set_active_session("a".to_string());
+        state.threads = vec![mock_overview("a", "A", true), mock_overview("b", "B", false)];
+        state.session_auto_title_attempted.insert("a".to_string());
+        state.session_auto_title_attempted.insert("b".to_string());
+        state
+            .session_auto_title_attempted
+            .insert("orphan".to_string());
+        let (_tx_keep, rx_keep) = mpsc::channel::<Result<String, AppError>>();
+        state.session_auto_title_workers.push(SessionAutoTitleHandle {
+            session_id: "a".to_string(),
+            rx: rx_keep,
+        });
+        let (_tx_drop, rx_drop) = mpsc::channel::<Result<String, AppError>>();
+        state.session_auto_title_workers.push(SessionAutoTitleHandle {
+            session_id: "orphan".to_string(),
+            rx: rx_drop,
+        });
+
+        state.set_threads(vec![mock_overview("a", "A", true), mock_overview("b", "B", false)]);
+
+        assert!(state.session_auto_title_attempted.contains("a"));
+        assert!(state.session_auto_title_attempted.contains("b"));
+        assert!(!state.session_auto_title_attempted.contains("orphan"));
+        assert_eq!(state.session_auto_title_workers.len(), 1);
+        assert_eq!(state.session_auto_title_workers[0].session_id, "a");
     }
 
     #[test]
@@ -11361,6 +12938,7 @@ model = "test-model"
         state.messages.push_back(UiMessage {
             role: UiRole::System,
             text: "当前命令不强制要求 root/管理员权限，按当前用户继续运行".to_string(),
+            tool_meta: None,
         });
         state.conversation_wrap_width = 48;
         state.conversation_dirty = true;
@@ -11396,6 +12974,7 @@ model = "test-model"
         state.messages.push_back(UiMessage {
             role: UiRole::Thinking,
             text: "看起来有一些音频相关进程（如AudioToolbox），但没有明显的音乐播放器。用户可能只是想要一些时间，或者想让我等一下。\n\n考虑到我的角色是系统巡检助手，我可以提供系统状态摘要，并说明一首歌的时间大约是3-5分钟，期间系统可以继续运行。".to_string(),
+            tool_meta: None,
         });
         state.conversation_wrap_width = 92;
         state.conversation_dirty = true;
@@ -11434,6 +13013,7 @@ model = "test-model"
         state.messages.push_back(UiMessage {
             role: UiRole::Assistant,
             text: "🔍️ 下一步建议\n👨‍👩‍👧‍👦 家庭表情也应保持边框对齐".to_string(),
+            tool_meta: None,
         });
         state.conversation_wrap_width = 64;
         state.conversation_dirty = true;
@@ -11461,6 +13041,7 @@ model = "test-model"
         state.messages.push_back(UiMessage {
             role: UiRole::Assistant,
             text: "窄窗口也不应出现气泡宽度超出会话区".to_string(),
+            tool_meta: None,
         });
         state.conversation_wrap_width = 8;
         state.conversation_dirty = true;
@@ -11488,6 +13069,7 @@ model = "test-model"
         state.messages.push_back(UiMessage {
             role: UiRole::User,
             text: "给我写一个冒泡排序！".to_string(),
+            tool_meta: None,
         });
         state.conversation_wrap_width = 54;
         state.conversation_dirty = true;
@@ -11519,10 +13101,12 @@ model = "test-model"
         state.messages.push_back(UiMessage {
             role: UiRole::User,
             text: "hello".to_string(),
+            tool_meta: None,
         });
         state.messages.push_back(UiMessage {
             role: UiRole::Assistant,
             text: "world".to_string(),
+            tool_meta: None,
         });
         state.conversation_dirty = true;
         state.ensure_conversation_cache();
@@ -11552,14 +13136,17 @@ model = "test-model"
         state.messages.push_back(UiMessage {
             role: UiRole::System,
             text: "session switched".to_string(),
+            tool_meta: None,
         });
         state.messages.push_back(UiMessage {
             role: UiRole::Thinking,
             text: "reasoning text".to_string(),
+            tool_meta: None,
         });
         state.messages.push_back(UiMessage {
             role: UiRole::Assistant,
             text: "reply".to_string(),
+            tool_meta: None,
         });
         state.conversation_dirty = true;
         state.ensure_conversation_cache();
@@ -11647,6 +13234,50 @@ model = "test-model"
     }
 
     #[test]
+    fn tool_message_with_meta_renders_result_button_between_copy_and_delete() {
+        let mut state = new_state();
+        state.messages.push_back(UiMessage {
+            role: UiRole::Tool,
+            text: "Bash执行完成: ok=true exit=Some(0) timeout=false blocked=false".to_string(),
+            tool_meta: Some(ToolExecutionMeta {
+                tool_call_id: "call_1".to_string(),
+                function_name: "run_shell_command".to_string(),
+                command: "pwd".to_string(),
+                arguments: "{\"command\":\"pwd\"}".to_string(),
+                result_payload: "{\"ok\":true,\"stdout\":\"/tmp\"}".to_string(),
+                executed_at_epoch_ms: 1,
+                account: "tester".to_string(),
+                environment: "dev".to_string(),
+                os_name: "macOS".to_string(),
+                cwd: "/tmp".to_string(),
+                mode: "read".to_string(),
+                label: "chat_tool".to_string(),
+                exit_code: Some(0),
+                duration_ms: 12,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            }),
+        });
+        state.message_persisted.push_back(false);
+        let layout = compute_layout(Rect::new(0, 0, 120, 40));
+        state.set_conversation_wrap_width(layout.conversation_body.width.max(1));
+        state.ensure_conversation_cache();
+        state.clamp_scroll(layout.conversation_body.height.max(1));
+        state.hovered_message_idx = Some(0);
+
+        let copy = conversation_copy_button_data(&state, layout).expect("copy button should exist");
+        let result = conversation_tool_result_button_data(&state, layout)
+            .expect("result button should exist");
+        let delete =
+            conversation_delete_button_data(&state, layout).expect("delete button should exist");
+        assert_eq!(copy.rect.y, result.rect.y);
+        assert_eq!(result.rect.y, delete.rect.y);
+        assert!(copy.rect.x < result.rect.x);
+        assert!(result.rect.x < delete.rect.x);
+    }
+
+    #[test]
     fn pending_ai_send_block_notice_is_deduplicated_and_keeps_input() {
         let mut state = new_state();
         stage_blocked_pending_message(&mut state, "next message");
@@ -11680,6 +13311,119 @@ model = "test-model"
         assert!(!handled);
         assert_eq!(state.input.text, "queued question");
         assert_eq!(state.status, ui_text_status_ai_pending_send_blocked());
+    }
+
+    #[test]
+    fn should_schedule_session_auto_title_requires_default_name_and_first_user_message() {
+        let attempted = HashSet::<String>::new();
+        assert!(should_schedule_session_auto_title(
+            &attempted,
+            "abc",
+            "session-abc",
+            1
+        ));
+        assert!(!should_schedule_session_auto_title(
+            &attempted,
+            "abc",
+            "session-abc",
+            2
+        ));
+        assert!(!should_schedule_session_auto_title(
+            &attempted,
+            "abc",
+            "custom-name",
+            1
+        ));
+        let mut attempted = HashSet::<String>::new();
+        attempted.insert("abc".to_string());
+        assert!(!should_schedule_session_auto_title(
+            &attempted,
+            "abc",
+            "session-abc",
+            1
+        ));
+    }
+
+    #[test]
+    fn normalize_session_auto_title_candidate_trims_prefix_and_limits_units() {
+        let en = normalize_session_auto_title_candidate(
+            " Title: Build a robust async thread switch regression fix with tests ",
+            6,
+        )
+        .expect("title should be normalized");
+        assert_eq!(en, "Build a robust async thread switch");
+
+        let zh = normalize_session_auto_title_candidate(
+            "标题：这是一个用于验证会话标题自动截断行为的中文标题示例",
+            15,
+        )
+        .expect("title should be normalized");
+        assert!(zh.chars().count() <= 15);
+    }
+
+    #[test]
+    fn session_auto_title_prompts_follow_app_language() {
+        let (_, zh_cn_prompt) =
+            build_session_auto_title_prompts(i18n::Language::ZhCn, "测试消息");
+        assert!(zh_cn_prompt.contains("简体中文"));
+
+        let (_, zh_tw_prompt) =
+            build_session_auto_title_prompts(i18n::Language::ZhTw, "測試訊息");
+        assert!(zh_tw_prompt.contains("繁體中文"));
+
+        let (_, en_prompt) =
+            build_session_auto_title_prompts(i18n::Language::En, "test message");
+        assert!(en_prompt.contains("Output language must be English"));
+    }
+
+    #[test]
+    fn selected_thread_is_active_session_matches_current_session_id() {
+        let mut state = new_state();
+        state.threads = vec![
+            mock_overview("session-a", "A", true),
+            mock_overview("session-b", "B", false),
+        ];
+        state.set_active_session("session-a".to_string());
+        state.thread_selected = 0;
+        assert!(selected_thread_is_active_session(&state));
+        state.thread_selected = 1;
+        assert!(!selected_thread_is_active_session(&state));
+    }
+
+    #[test]
+    fn pending_ai_threads_enter_allows_return_to_chat_for_active_thread_only() {
+        let mut state = new_state();
+        state.mode = UiMode::Skills;
+        state.focus = FocusPanel::Threads;
+        state.threads = vec![
+            mock_overview("session-a", "A", true),
+            mock_overview("session-b", "B", false),
+        ];
+        state.set_active_session("session-a".to_string());
+
+        state.thread_selected = 0;
+        let handled = handle_pending_ai_threads_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+        )
+        .expect("pending ai threads key should not fail");
+        assert!(!handled);
+        assert!(matches!(state.mode, UiMode::Chat));
+        assert_eq!(state.status, ui_text_focus_hint(FocusPanel::Threads));
+
+        state.mode = UiMode::Skills;
+        state.thread_selected = 1;
+        let handled = handle_pending_ai_threads_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+        )
+        .expect("pending ai threads key should not fail");
+        assert!(!handled);
+        assert!(matches!(state.mode, UiMode::Skills));
+        assert_eq!(
+            state.status,
+            ui_text_status_ai_pending_session_switch_blocked()
+        );
     }
 
     #[test]
@@ -11736,6 +13480,53 @@ model = "test-model"
     }
 
     #[test]
+    fn streamed_thinking_message_can_be_marked_persisted_by_role_batch() {
+        let mut state = new_state();
+        state.push_stream_chunk(UiRole::Thinking, "step-1", None);
+        state.push_stream_chunk(UiRole::Assistant, "done", None);
+
+        let marked = state.mark_all_unpersisted_messages_by_role(UiRole::Thinking);
+        assert_eq!(marked, 1);
+        assert!(state.is_message_persisted(0));
+        assert!(!state.is_message_persisted(1));
+    }
+
+    #[test]
+    fn mark_all_unpersisted_messages_by_role_only_marks_target_role() {
+        let mut state = new_state();
+        state.push(UiRole::Thinking, "t-1");
+        state.push(UiRole::Assistant, "a-1");
+        state.push(UiRole::Thinking, "t-2");
+        state.push_persisted(UiRole::Thinking, "t-3");
+        assert!(!state.is_message_persisted(0));
+        assert!(!state.is_message_persisted(1));
+        assert!(!state.is_message_persisted(2));
+        assert!(state.is_message_persisted(3));
+
+        let marked = state.mark_all_unpersisted_messages_by_role(UiRole::Thinking);
+        assert_eq!(marked, 2);
+        assert!(state.is_message_persisted(0));
+        assert!(!state.is_message_persisted(1));
+        assert!(state.is_message_persisted(2));
+        assert!(state.is_message_persisted(3));
+    }
+
+    #[test]
+    fn report_tool_session_persist_failure_pushes_system_notice() {
+        let mut state = new_state();
+        report_tool_session_persist_failure(
+            &mut state,
+            &AppError::Runtime("disk full".to_string()),
+            "run_shell_command",
+        );
+        assert_eq!(state.status, ui_text_tool_persist_failed());
+        let notice = state.messages.back().expect("system notice should exist");
+        assert_eq!(notice.role, UiRole::System);
+        assert!(notice.text.contains(ui_text_tool_persist_failed()));
+        assert!(notice.text.contains("disk full"));
+    }
+
+    #[test]
     fn session_cache_restores_transient_thinking_messages() {
         let mut state = new_state();
         state.set_active_session("session-a".to_string());
@@ -11752,6 +13543,7 @@ model = "test-model"
             vec![UiMessage {
                 role: UiRole::User,
                 text: "fallback".to_string(),
+                tool_meta: None,
             }],
         );
         assert_eq!(restored.len(), 2);
@@ -11762,10 +13554,26 @@ model = "test-model"
     }
 
     #[test]
+    fn recent_messages_to_ui_messages_restores_thinking_role() {
+        let mapped = recent_messages_to_ui_messages(&[SessionMessage {
+            role: "thinking".to_string(),
+            content: "reasoning".to_string(),
+            kind: MessageKind::Assistant,
+            group_id: None,
+            created_at_epoch_ms: 1,
+            tool_meta: None,
+        }]);
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].role, UiRole::Thinking);
+        assert_eq!(mapped[0].text, "reasoning");
+    }
+
+    #[test]
     fn persisted_tool_message_is_rendered_with_multiline_fields() {
         let item = UiMessage {
             role: UiRole::Tool,
             text: r#"tool_call_id=call_1 function=run_shell_command args={"command":"pwd"} result={"ok":true,"stdout":"line1\nline2"}"#.to_string(),
+            tool_meta: None,
         };
         let rendered = conversation_render_source_text(&item).into_owned();
         assert!(rendered.contains("tool_call_id=call_1\nfunction=run_shell_command"));
@@ -11778,10 +13586,70 @@ model = "test-model"
         let item = UiMessage {
             role: UiRole::Tool,
             text: r#"tool_call_id=call_9 function=run_shell_command args={"command":"echo \" result=marker\""} result={"ok":true,"stdout":"done"}"#.to_string(),
+            tool_meta: None,
         };
         let rendered = conversation_render_source_text(&item).into_owned();
         assert!(rendered.contains("\"command\": \"echo \\\" result=marker\\\"\""));
         assert!(rendered.contains("\"stdout\": \"done\""));
+    }
+
+    #[test]
+    fn tool_message_render_preserves_structured_line_breaks_after_reload_path() {
+        let item = UiMessage {
+            role: UiRole::Tool,
+            text: r#"tool_call_id=call_2 function=run_shell_command args={"command":"echo hi"} result={"ok":true}"#.to_string(),
+            tool_meta: None,
+        };
+        let rendered = render_conversation_item_text(&item, false);
+        assert!(rendered.contains("tool_call_id=call_2"));
+        assert!(rendered.contains("\nfunction=run_shell_command"));
+        assert!(rendered.contains("\nargs="));
+        assert!(rendered.contains("\nresult="));
+    }
+
+    #[test]
+    fn tool_message_with_meta_and_raw_trace_renders_status_summary() {
+        let item = UiMessage {
+            role: UiRole::Tool,
+            text: r#"tool_call_id=call_2 function=run_shell_command args={"command":"echo hi"} result={"ok":true,"exit_code":0}"#.to_string(),
+            tool_meta: Some(ToolExecutionMeta {
+                tool_call_id: "call_2".to_string(),
+                function_name: "run_shell_command".to_string(),
+                command: "echo hi".to_string(),
+                arguments: "{\"command\":\"echo hi\"}".to_string(),
+                result_payload: "{\"ok\":true,\"exit_code\":0}".to_string(),
+                executed_at_epoch_ms: 1,
+                account: String::new(),
+                environment: String::new(),
+                os_name: String::new(),
+                cwd: String::new(),
+                mode: "read".to_string(),
+                label: "chat_tool".to_string(),
+                exit_code: Some(0),
+                duration_ms: 10,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            }),
+        };
+        let rendered = conversation_render_source_text(&item).into_owned();
+        assert!(!rendered.contains("tool_call_id="));
+        assert!(rendered.contains("ok=true"));
+        assert!(rendered.contains("exit=Some(0)"));
+    }
+
+    #[test]
+    fn legacy_tool_message_without_result_is_formatted_for_display() {
+        let item = UiMessage {
+            role: UiRole::Tool,
+            text: r#"tool_call_id=call_cache function=run_shell_command args={"command":"ls"} cache_hit=true"#.to_string(),
+            tool_meta: None,
+        };
+        let rendered = conversation_render_source_text(&item).into_owned();
+        assert!(rendered.contains("tool_call_id=call_cache"));
+        assert!(rendered.contains("\nfunction=run_shell_command"));
+        assert!(rendered.contains("\nargs="));
+        assert!(rendered.contains("\ncache_hit=true"));
     }
 
     #[test]
@@ -11863,11 +13731,20 @@ model = "test-model"
     }
 
     #[test]
-    fn streaming_inflight_complete_inline_link_still_uses_markdown_renderer() {
+    fn streaming_inflight_complete_inline_link_keeps_raw_until_finalized() {
         let raw = "visit [OpenAI](https://platform.openai.com/docs)";
         let inflight = render_conversation_markdown(raw, true);
+        let finalized = render_conversation_markdown(raw, false);
         assert!(inflight.contains("OpenAI"));
-        assert!(!inflight.contains("[OpenAI]("));
+        assert!(inflight.contains("[OpenAI]("));
+        assert!(!finalized.contains("[OpenAI]("));
+    }
+
+    #[test]
+    fn streaming_inflight_plain_url_keeps_raw_text_for_stability() {
+        let raw = "details: https://platform.openai.com/docs/guides";
+        let inflight = render_conversation_markdown(raw, true);
+        assert!(inflight.contains("https://platform.openai.com/docs/guides"));
     }
 
     #[test]
@@ -11920,6 +13797,156 @@ model = "test-model"
         let modal = state.skill_doc_modal.as_ref().expect("modal exists");
         assert!(modal.scroll < u16::MAX);
         assert_eq!(modal.scroll, skill_doc_modal_scroll_max(modal, layout));
+    }
+
+    #[test]
+    fn tool_result_modal_scroll_max_counts_empty_separator_lines() {
+        let layout = compute_layout(Rect::new(0, 0, 120, 18));
+        let modal = ToolResultModalState {
+            message_index: 0,
+            lines: std::iter::repeat_n(String::new(), 24).collect::<Vec<_>>(),
+            scroll: 0,
+        };
+        let max_scroll = tool_result_modal_scroll_max(&modal, layout);
+        assert!(max_scroll > 0);
+    }
+
+    #[test]
+    fn tool_result_modal_includes_output_section_from_tool_meta() {
+        let mut state = new_state();
+        state.messages.push_back(UiMessage {
+            role: UiRole::Tool,
+            text: "Bash执行完成: ok=true exit=Some(0) timeout=false blocked=false".to_string(),
+            tool_meta: Some(ToolExecutionMeta {
+                tool_call_id: "call-output".to_string(),
+                function_name: "run_shell_command".to_string(),
+                command: "date".to_string(),
+                arguments: "{\"command\":\"date\"}".to_string(),
+                result_payload: "{\"ok\":true,\"stdout\":\"Sun Mar 15 12:00:00\"}".to_string(),
+                executed_at_epoch_ms: 1,
+                account: "tester".to_string(),
+                environment: "prod".to_string(),
+                os_name: "macos".to_string(),
+                cwd: "/tmp".to_string(),
+                mode: "read".to_string(),
+                label: "获取当前时间".to_string(),
+                exit_code: Some(0),
+                duration_ms: 19,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            }),
+        });
+        state.message_persisted.push_back(false);
+        open_tool_result_modal(&mut state, 0);
+        let modal = state
+            .pending_tool_result_modal
+            .as_ref()
+            .expect("tool result modal should be opened");
+        let content = modal.lines.join("\n");
+        assert!(content.contains(ui_text_message_tool_result_meta_output()));
+        assert!(content.contains("Sun Mar 15 12:00:00"));
+    }
+
+    #[test]
+    fn attach_tool_meta_to_recent_running_message_keeps_result_modal_consistent() {
+        let mut state = new_state();
+        state.push(
+            UiRole::Tool,
+            format!(
+                "{}: demo [{}]\n{}",
+                ui_text_tool_running(),
+                ui_text_mode_read(),
+                "pwd"
+            ),
+        );
+        state.push(
+            UiRole::Tool,
+            format!(
+                "{}: ok=true exit=Some(0) timeout=false blocked=false",
+                ui_text_tool_finished()
+            ),
+        );
+        let meta = ToolExecutionMeta {
+            tool_call_id: "call-consistent".to_string(),
+            function_name: "run_shell_command".to_string(),
+            command: "pwd".to_string(),
+            arguments: "{\"command\":\"pwd\"}".to_string(),
+            result_payload: "{\"ok\":true,\"stdout\":\"/tmp\"}".to_string(),
+            executed_at_epoch_ms: 1,
+            account: "tester".to_string(),
+            environment: "dev".to_string(),
+            os_name: "macos".to_string(),
+            cwd: "/tmp".to_string(),
+            mode: "read".to_string(),
+            label: "chat_tool".to_string(),
+            exit_code: Some(0),
+            duration_ms: 10,
+            timed_out: false,
+            interrupted: false,
+            blocked: false,
+        };
+
+        attach_tool_meta_to_last_tool_message(&mut state, &meta);
+        attach_tool_meta_to_recent_running_tool_message(&mut state, &meta);
+
+        assert!(state.messages[0].tool_meta.is_some());
+        assert!(state.messages[1].tool_meta.is_some());
+        let running_detail = tool_result_detail_from_message(&state.messages[0])
+            .expect("running message should have tool detail");
+        let finished_detail = tool_result_detail_from_message(&state.messages[1])
+            .expect("finished message should have tool detail");
+        assert_eq!(running_detail.tool_call_id, finished_detail.tool_call_id);
+        assert_eq!(running_detail.result_payload, finished_detail.result_payload);
+    }
+
+    #[test]
+    fn extract_http_status_code_parses_mcp_error_text() {
+        assert_eq!(
+            extract_http_status_code(
+                "MCP http request failed: status=429 Too Many Requests, body=oops"
+            ),
+            Some(429)
+        );
+        assert_eq!(
+            extract_http_status_code("MCP sse post failed: status=504 Gateway Timeout"),
+            Some(504)
+        );
+        assert_eq!(extract_http_status_code("network error"), None);
+    }
+
+    #[test]
+    fn mcp_exit_code_from_error_falls_back_to_500() {
+        let with_status = AppError::Runtime(
+            "MCP http request failed: status=404 Not Found, body={}".to_string(),
+        );
+        assert_eq!(mcp_exit_code_from_error(&with_status), 404);
+        let without_status = AppError::Runtime("MCP request timeout".to_string());
+        assert_eq!(mcp_exit_code_from_error(&without_status), 500);
+    }
+
+    #[test]
+    fn tool_result_detail_from_persisted_mcp_message_uses_function_as_command() {
+        let message = UiMessage {
+            role: UiRole::Tool,
+            text: "tool_call_id=call-mcp function=mcp__news_headlines__get_news_list args={} result={\"ok\":true,\"tool\":\"mcp__news_headlines__get_news_list\"}".to_string(),
+            tool_meta: None,
+        };
+        let detail = tool_result_detail_from_message(&message).expect("detail should exist");
+        assert_eq!(detail.command, "mcp__news_headlines__get_news_list");
+    }
+
+    #[test]
+    fn tool_result_modal_output_keeps_large_mcp_payload() {
+        let payload = json!({
+            "ok": true,
+            "tool": "mcp__news_headlines__get_news_list",
+            "content": "x".repeat(20_000)
+        })
+        .to_string();
+        let rendered = tool_result_output_for_modal(&payload);
+        assert!(rendered.chars().count() > 12_000);
+        assert!(!rendered.ends_with("..."));
     }
 
     #[test]

@@ -38,6 +38,46 @@ pub struct SessionMessage {
     pub group_id: Option<String>,
     #[serde(default)]
     pub created_at_epoch_ms: u128,
+    #[serde(default)]
+    pub tool_meta: Option<ToolExecutionMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ToolExecutionMeta {
+    #[serde(default)]
+    pub tool_call_id: String,
+    #[serde(default)]
+    pub function_name: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub arguments: String,
+    #[serde(default)]
+    pub result_payload: String,
+    #[serde(default)]
+    pub executed_at_epoch_ms: u128,
+    #[serde(default)]
+    pub account: String,
+    #[serde(default)]
+    pub environment: String,
+    #[serde(default)]
+    pub os_name: String,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub duration_ms: u128,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub interrupted: bool,
+    #[serde(default)]
+    pub blocked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -168,19 +208,47 @@ impl SessionStore {
     }
 
     pub fn add_user_message(&mut self, content: String, group_id: Option<String>) {
-        self.add_message("user", MessageKind::User, content, group_id);
+        self.add_message("user", MessageKind::User, content, group_id, None);
     }
 
     pub fn add_assistant_message(&mut self, content: String, group_id: Option<String>) {
-        self.add_message("assistant", MessageKind::Assistant, content, group_id);
+        self.add_message("assistant", MessageKind::Assistant, content, group_id, None);
+    }
+
+    pub fn add_thinking_message(&mut self, content: String, group_id: Option<String>) {
+        self.add_message("thinking", MessageKind::Assistant, content, group_id, None);
+    }
+
+    pub fn append_or_add_thinking_chunk(&mut self, chunk: &str, group_id: Option<&str>) {
+        if chunk.is_empty() {
+            return;
+        }
+        if let Some(last) = self.state.messages.last_mut()
+            && last.role == "thinking"
+            && last.group_id.as_deref() == group_id
+        {
+            last.content.push_str(chunk);
+            self.state.compass.last_updated_epoch_ms = now_epoch_ms();
+            return;
+        }
+        self.add_thinking_message(chunk.to_string(), group_id.map(|item| item.to_string()));
     }
 
     pub fn add_tool_message(&mut self, content: String, group_id: Option<String>) {
-        self.add_message("tool", MessageKind::Tool, content, group_id);
+        self.add_tool_message_with_meta(content, group_id, None);
+    }
+
+    pub fn add_tool_message_with_meta(
+        &mut self,
+        content: String,
+        group_id: Option<String>,
+        tool_meta: Option<ToolExecutionMeta>,
+    ) {
+        self.add_message("tool", MessageKind::Tool, content, group_id, tool_meta);
     }
 
     pub fn add_system_message(&mut self, content: String, group_id: Option<String>) {
-        self.add_message("system", MessageKind::System, content, group_id);
+        self.add_message("system", MessageKind::System, content, group_id, None);
     }
 
     pub fn build_chat_history(&self) -> Vec<ChatMessage> {
@@ -210,10 +278,23 @@ impl SessionStore {
         }
 
         for message in &self.state.messages[start..] {
-            let role = match message.role.as_str() {
-                "assistant" => "assistant",
-                "system" => "system",
-                _ => "user",
+            if message.role == "thinking" {
+                continue;
+            }
+            if message.role == "tool"
+                && message.tool_meta.is_none()
+                && !is_persisted_tool_trace_message(&message.content)
+            {
+                continue;
+            }
+            let Some(role) = (match message.role.as_str() {
+                "assistant" => Some("assistant"),
+                "system" => Some("system"),
+                "user" => Some("user"),
+                "tool" => Some("user"),
+                _ => None,
+            }) else {
+                continue;
             };
             let content = if message.role == "tool" {
                 format!("[tool] {}", message.content)
@@ -765,6 +846,7 @@ impl SessionStore {
                 kind: MessageKind::System,
                 group_id: None,
                 created_at_epoch_ms: now_epoch_ms(),
+                tool_meta: None,
             },
         );
         self.state.compass.truncated_messages += removed;
@@ -787,6 +869,7 @@ impl SessionStore {
         kind: MessageKind,
         content: String,
         group_id: Option<String>,
+        tool_meta: Option<ToolExecutionMeta>,
     ) {
         self.update_compass_on_append(role, &content);
         self.state.messages.push(SessionMessage {
@@ -795,6 +878,7 @@ impl SessionStore {
             kind,
             group_id,
             created_at_epoch_ms: now_epoch_ms(),
+            tool_meta,
         });
         self.enforce_max_limit();
     }
@@ -1055,6 +1139,14 @@ fn is_visible_display_message(item: &SessionMessage) -> bool {
     true
 }
 
+fn is_persisted_tool_trace_message(content: &str) -> bool {
+    let trimmed = content.trim();
+    trimmed.starts_with("tool_call_id=")
+        && trimmed.contains(" function=")
+        && trimmed.contains(" args=")
+        && trimmed.contains(" result=")
+}
+
 fn compute_keep_recent_messages(max_history_messages: usize) -> usize {
     let compress_recent = max_history_messages / 2;
     max_history_messages.saturating_sub(compress_recent).max(1)
@@ -1190,7 +1282,7 @@ fn parse_session_message_lenient(value: &serde_json::Value) -> Option<SessionMes
     let normalized_role = raw_role.trim().to_ascii_lowercase();
     let role = if matches!(
         normalized_role.as_str(),
-        "user" | "assistant" | "tool" | "system"
+        "user" | "assistant" | "tool" | "system" | "thinking"
     ) {
         normalized_role
     } else {
@@ -1209,13 +1301,49 @@ fn parse_session_message_lenient(value: &serde_json::Value) -> Option<SessionMes
         }
     });
     let created_at_epoch_ms = value_to_u128(object.get("created_at_epoch_ms")).unwrap_or_default();
+    let tool_meta = parse_tool_execution_meta_lenient(object.get("tool_meta"));
     Some(SessionMessage {
         role,
         content,
         kind,
         group_id,
         created_at_epoch_ms,
+        tool_meta,
     })
+}
+
+fn parse_tool_execution_meta_lenient(value: Option<&serde_json::Value>) -> Option<ToolExecutionMeta> {
+    let object = value?.as_object()?;
+    let meta = ToolExecutionMeta {
+        tool_call_id: value_to_string(object.get("tool_call_id")).unwrap_or_default(),
+        function_name: value_to_string(object.get("function_name")).unwrap_or_default(),
+        command: value_to_string(object.get("command")).unwrap_or_default(),
+        arguments: value_to_string(object.get("arguments")).unwrap_or_default(),
+        result_payload: value_to_string(object.get("result_payload")).unwrap_or_default(),
+        executed_at_epoch_ms: value_to_u128(object.get("executed_at_epoch_ms")).unwrap_or_default(),
+        account: value_to_string(object.get("account")).unwrap_or_default(),
+        environment: value_to_string(object.get("environment")).unwrap_or_default(),
+        os_name: value_to_string(object.get("os_name")).unwrap_or_default(),
+        cwd: value_to_string(object.get("cwd")).unwrap_or_default(),
+        mode: value_to_string(object.get("mode")).unwrap_or_default(),
+        label: value_to_string(object.get("label")).unwrap_or_default(),
+        exit_code: value_to_i32(object.get("exit_code")),
+        duration_ms: value_to_u128(object.get("duration_ms")).unwrap_or_default(),
+        timed_out: value_to_bool(object.get("timed_out")).unwrap_or(false),
+        interrupted: value_to_bool(object.get("interrupted")).unwrap_or(false),
+        blocked: value_to_bool(object.get("blocked")).unwrap_or(false),
+    };
+    let has_payload = !meta.tool_call_id.trim().is_empty()
+        || !meta.function_name.trim().is_empty()
+        || !meta.command.trim().is_empty()
+        || !meta.arguments.trim().is_empty()
+        || !meta.result_payload.trim().is_empty()
+        || meta.executed_at_epoch_ms > 0;
+    if has_payload {
+        Some(meta)
+    } else {
+        None
+    }
 }
 
 fn parse_session_compass_lenient(value: Option<&serde_json::Value>) -> SessionCompass {
@@ -1256,6 +1384,7 @@ fn parse_message_kind_lenient(value: Option<&serde_json::Value>, role: &str) -> 
             "assistant" => MessageKind::Assistant,
             "tool" => MessageKind::Tool,
             "system" => MessageKind::System,
+            "thinking" => MessageKind::Assistant,
             _ => MessageKind::User,
         },
     }
@@ -1293,6 +1422,36 @@ fn value_to_u128(value: Option<&serde_json::Value>) -> Option<u128> {
 
 fn value_to_usize(value: Option<&serde_json::Value>) -> Option<usize> {
     value_to_u128(value).map(|item| item.min(usize::MAX as u128) as usize)
+}
+
+fn value_to_i32(value: Option<&serde_json::Value>) -> Option<i32> {
+    match value? {
+        serde_json::Value::Number(item) => item
+            .as_i64()
+            .and_then(|v| i32::try_from(v).ok())
+            .or_else(|| item.as_u64().and_then(|v| i32::try_from(v).ok())),
+        serde_json::Value::String(item) => item.trim().parse::<i32>().ok(),
+        _ => None,
+    }
+}
+
+fn value_to_bool(value: Option<&serde_json::Value>) -> Option<bool> {
+    match value? {
+        serde_json::Value::Bool(item) => Some(*item),
+        serde_json::Value::Number(item) => item
+            .as_i64()
+            .map(|v| v != 0)
+            .or_else(|| item.as_u64().map(|v| v != 0)),
+        serde_json::Value::String(item) => {
+            let normalized = item.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "true" | "1" | "yes" | "y" => Some(true),
+                "false" | "0" | "no" | "n" => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn is_session_state_file_name(file_name: &str) -> bool {
@@ -1663,7 +1822,7 @@ fn write_string_atomically(path: &Path, content: &str) -> Result<(), AppError> {
 mod tests {
     use super::{
         AI_COMPRESSION_MARKER, CHAT_PROFILE_MARKER, MessageKind, SessionRoleCounts, SessionState,
-        SessionStore, new_compass,
+        SessionStore, ToolExecutionMeta, new_compass,
     };
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
@@ -1682,6 +1841,7 @@ mod tests {
                         kind: MessageKind::User,
                         group_id: None,
                         created_at_epoch_ms: 1,
+                        tool_meta: None,
                     },
                     super::SessionMessage {
                         role: "assistant".to_string(),
@@ -1689,6 +1849,7 @@ mod tests {
                         kind: MessageKind::Assistant,
                         group_id: None,
                         created_at_epoch_ms: 2,
+                        tool_meta: None,
                     },
                     super::SessionMessage {
                         role: "tool".to_string(),
@@ -1696,6 +1857,7 @@ mod tests {
                         kind: MessageKind::Tool,
                         group_id: None,
                         created_at_epoch_ms: 3,
+                        tool_meta: None,
                     },
                 ],
                 compass: new_compass(),
@@ -1768,6 +1930,62 @@ mod tests {
     }
 
     #[test]
+    fn build_chat_history_skips_thinking_and_tool_progress_messages() {
+        let mut store = build_store("");
+        store.add_thinking_message("step-1".to_string(), Some("g1".to_string()));
+        store.add_tool_message("Bash执行中: demo [读]\ndate".to_string(), Some("g1".to_string()));
+        store.add_tool_message_with_meta(
+            r#"tool_call_id=call_1 function=run_shell_command args={"command":"date"} result={"ok":true,"stdout":"Sun"}"#.to_string(),
+            Some("g1".to_string()),
+            Some(ToolExecutionMeta {
+                tool_call_id: "call_1".to_string(),
+                function_name: "run_shell_command".to_string(),
+                command: "date".to_string(),
+                arguments: "{\"command\":\"date\"}".to_string(),
+                result_payload: "{\"ok\":true,\"stdout\":\"Sun\"}".to_string(),
+                executed_at_epoch_ms: 1,
+                account: "tester".to_string(),
+                environment: "prod".to_string(),
+                os_name: "macos".to_string(),
+                cwd: "/tmp".to_string(),
+                mode: "read".to_string(),
+                label: "date".to_string(),
+                exit_code: Some(0),
+                duration_ms: 1,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            }),
+        );
+
+        let history = store.build_chat_history();
+        let joined = history
+            .iter()
+            .map(|item| format!("{}|{}", item.role, item.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("step-1"));
+        assert!(!joined.contains("Bash执行中"));
+        assert!(joined.contains("[tool] tool_call_id=call_1"));
+    }
+
+    #[test]
+    fn append_or_add_thinking_chunk_merges_last_thinking_message_in_same_group() {
+        let mut store = build_store("");
+        store.add_thinking_message("step-1".to_string(), Some("g1".to_string()));
+        let before = store.message_count();
+        store.append_or_add_thinking_chunk(" + step-2", Some("g1"));
+        assert_eq!(store.message_count(), before);
+        let last = store
+            .recent_messages_for_display(50)
+            .into_iter()
+            .rev()
+            .find(|item| item.role == "thinking")
+            .expect("thinking message should exist");
+        assert_eq!(last.content, "step-1 + step-2");
+    }
+
+    #[test]
     fn remove_recent_display_message_by_signature_removes_target_occurrence() {
         let mut store = build_store("");
         store.add_user_message("dup".to_string(), None);
@@ -1823,6 +2041,7 @@ mod tests {
                 kind: MessageKind::User,
                 group_id: None,
                 created_at_epoch_ms: 123,
+                tool_meta: None,
             }],
             compass: new_compass(),
         };
@@ -1856,6 +2075,58 @@ mod tests {
             .expect("lenient parser should recover session shape");
         assert!(!store.session_id().trim().is_empty());
         assert_eq!(store.message_count(), 2);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn tool_meta_roundtrip_preserves_full_result_payload() {
+        let temp_dir = std::env::temp_dir().join(format!("machineclaw-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let session_path = temp_dir.join("session.json");
+        let mut store = SessionStore::load_or_new(session_path.clone(), 40, 80, 40, 80_000)
+            .expect("new session store should be created");
+        let full_payload = "x".repeat(25_000);
+        store.add_tool_message_with_meta(
+            "tool_call_id=call_long function=run_shell_command args={\"command\":\"cat\"} result={\"ok\":true}".to_string(),
+            Some("group-1".to_string()),
+            Some(ToolExecutionMeta {
+                tool_call_id: "call_long".to_string(),
+                function_name: "run_shell_command".to_string(),
+                command: "cat /tmp/huge.log".to_string(),
+                arguments: "{\"command\":\"cat /tmp/huge.log\"}".to_string(),
+                result_payload: full_payload.clone(),
+                executed_at_epoch_ms: 123,
+                account: "tester".to_string(),
+                environment: "prod".to_string(),
+                os_name: "macos".to_string(),
+                cwd: "/tmp".to_string(),
+                mode: "read".to_string(),
+                label: "cat".to_string(),
+                exit_code: Some(0),
+                duration_ms: 12,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            }),
+        );
+        store.persist().expect("session should persist");
+        let persisted_path = store.file_path().to_path_buf();
+        let raw = fs::read_to_string(&persisted_path).expect("session file should be readable");
+        let persisted: SessionState =
+            serde_json::from_str(&raw).expect("session file should parse");
+        let tool = persisted
+            .messages
+            .iter()
+            .rev()
+            .find(|item| item.role == "tool")
+            .expect("tool message should exist");
+        let meta = tool
+            .tool_meta
+            .as_ref()
+            .expect("tool meta should be present");
+        assert_eq!(meta.result_payload.len(), full_payload.len());
+        assert_eq!(meta.result_payload, full_payload);
 
         let _ = fs::remove_dir_all(temp_dir);
     }
