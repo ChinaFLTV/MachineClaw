@@ -66,6 +66,9 @@ const INSPECT_DETAIL_REFRESH_INTERVAL_MS: u128 = 12_000;
 const INSPECT_HISTORY_MAX: usize = 80;
 const NAV_ITEMS_COUNT: usize = 5;
 const CONVERSATION_TAIL_PADDING_LINES: usize = 1;
+const THREAD_DOUBLE_CLICK_WINDOW_MS: u128 = 320;
+const STARTUP_SPLASH_MIN_DURATION_MS: u64 = 280;
+const STARTUP_SPLASH_FRAME_INTERVAL_MS: u64 = 56;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiRole {
@@ -118,8 +121,7 @@ enum PendingAiEvent {
 
 struct PendingAiWaitOutcome {
     response: Result<ChatToolResponse, String>,
-    printed_round_thinking: bool,
-    last_round_thinking: String,
+    thinking_rendered_in_ui: bool,
     last_round_content: String,
     saw_stream_events: bool,
 }
@@ -147,6 +149,38 @@ struct ConversationHoverButtons {
 struct DeleteMessageConfirmState {
     message_index: usize,
     selected: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThreadClickState {
+    thread_index: usize,
+    clicked_at_epoch_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThreadActionMenuState {
+    thread_index: usize,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadRenameModalState {
+    thread_index: usize,
+    input: InputBuffer,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThreadDeleteConfirmState {
+    thread_index: usize,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadMetadataModalState {
+    session_id: String,
+    session_name: String,
+    rows: Vec<(String, String)>,
+    scroll: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -501,6 +535,11 @@ struct ChatUiState {
     follow_tail: bool,
     hovered_message_idx: Option<usize>,
     pending_delete_confirm: Option<DeleteMessageConfirmState>,
+    pending_thread_action_menu: Option<ThreadActionMenuState>,
+    pending_thread_rename: Option<ThreadRenameModalState>,
+    pending_thread_delete_confirm: Option<ThreadDeleteConfirmState>,
+    pending_thread_metadata_modal: Option<ThreadMetadataModalState>,
+    last_thread_click: Option<ThreadClickState>,
     ai_live: Option<AiLiveState>,
     config_ui: ConfigUiState,
     mcp_ui: McpUiState,
@@ -550,6 +589,11 @@ impl ChatUiState {
             follow_tail: true,
             hovered_message_idx: None,
             pending_delete_confirm: None,
+            pending_thread_action_menu: None,
+            pending_thread_rename: None,
+            pending_thread_delete_confirm: None,
+            pending_thread_metadata_modal: None,
+            last_thread_click: None,
             ai_live: None,
             config_ui: build_config_ui_state(cfg, config_path),
             mcp_ui: build_mcp_ui_state(cfg, config_path),
@@ -591,6 +635,7 @@ impl ChatUiState {
         self.follow_tail = true;
         self.hovered_message_idx = None;
         self.pending_delete_confirm = None;
+        self.pending_thread_delete_confirm = None;
     }
 
     fn push_stream_chunk(&mut self, role: UiRole, chunk: &str, prefix: Option<&str>) {
@@ -628,6 +673,7 @@ impl ChatUiState {
         self.follow_tail = true;
         self.hovered_message_idx = None;
         self.pending_delete_confirm = None;
+        self.pending_thread_delete_confirm = None;
     }
 
     fn token_usage_target(&self) -> u64 {
@@ -675,6 +721,7 @@ impl ChatUiState {
         self.follow_tail = true;
         self.hovered_message_idx = None;
         self.pending_delete_confirm = None;
+        self.pending_thread_delete_confirm = None;
     }
 
     fn is_message_persisted(&self, index: usize) -> bool {
@@ -782,6 +829,9 @@ impl ChatUiState {
         let last_message_idx = self.messages.len().saturating_sub(1);
         let mut lines = Vec::<ConversationLine>::new();
         for (idx, item) in self.messages.iter().enumerate() {
+            let header_label = role_tag(item.role).to_string();
+            let header_label = trim_ui_text(header_label.as_str(), conversation_width.max(1));
+            let header_width = text_display_width(header_label.as_str());
             let rendered = render_conversation_markdown(
                 item.text.trim(),
                 live_streaming
@@ -809,14 +859,16 @@ impl ChatUiState {
                 .max()
                 .unwrap_or(1)
                 .max(1);
-            let bubble_outer_width = inner_width.saturating_add(4);
-            let header_label = format!("{} {}", role_avatar(item.role), role_tag(item.role));
+            let bubble_outer_width = inner_width.saturating_add(4).max(header_width);
             let header_text = if item.role == UiRole::User {
-                let header_width = text_display_width(&header_label);
                 let left_pad = bubble_outer_width.saturating_sub(header_width);
                 format!("{}{}", " ".repeat(left_pad), header_label)
             } else {
-                header_label
+                format!(
+                    "{}{}",
+                    header_label,
+                    " ".repeat(conversation_width.saturating_sub(header_width))
+                )
             };
             let bubble_left_pad = if item.role == UiRole::User {
                 conversation_width.saturating_sub(bubble_outer_width)
@@ -977,6 +1029,7 @@ enum BuiltinCommand {
     Exit,
     Help,
     Stats,
+    Meta,
     Skills,
     Mcps,
     New,
@@ -1030,6 +1083,10 @@ pub fn run_chat_tui(services: &mut ActionServices<'_>) -> Result<ActionOutcome, 
     );
 
     let mut terminal = init_terminal()?;
+    if let Err(err) = draw_startup_splash(&mut terminal, theme_idx) {
+        let _ = restore_terminal(&mut terminal);
+        return Err(err);
+    }
     let mut chat_turns = 0usize;
     let mut last_assistant_reply = String::new();
     let mut inspect_worker = spawn_inspect_worker(services.os_type);
@@ -1303,6 +1360,97 @@ fn draw_once(
     Ok(())
 }
 
+fn draw_startup_splash(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    theme_idx: usize,
+) -> Result<(), AppError> {
+    let started = Instant::now();
+    let palette = palette_by_index(theme_idx);
+    let mut frame_tick = 0usize;
+    while started.elapsed().as_millis() < STARTUP_SPLASH_MIN_DURATION_MS as u128 {
+        terminal
+            .draw(|frame| draw_startup_splash_frame(frame, palette, frame_tick))
+            .map_err(|err| AppError::Command(format!("failed to draw startup splash: {err}")))?;
+        frame_tick = frame_tick.saturating_add(1);
+        thread::sleep(Duration::from_millis(STARTUP_SPLASH_FRAME_INTERVAL_MS));
+    }
+    Ok(())
+}
+
+fn draw_startup_splash_frame(frame: &mut Frame<'_>, palette: ThemePalette, tick: usize) {
+    let area = frame.area();
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.app_bg)),
+        area,
+    );
+    let splash = centered_rect(area, 72, 13);
+    let pulse = tick % 2 == 0;
+    let border_color = if pulse {
+        palette.border_focus
+    } else {
+        palette.accent
+    };
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(zh_or_en("启动中", "Launching"))
+            .style(Style::default().bg(palette.panel_bg))
+            .border_style(Style::default().fg(border_color)),
+        splash,
+    );
+    let inner = splash.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let spinner = spinner_frame(Instant::now() - Duration::from_millis((tick as u64) * 120));
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                ui_text_app_name(),
+                Style::default()
+                    .fg(palette.text)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "{spinner} {}",
+                    zh_or_en("正在加载 TUI 组件...", "Loading TUI components...")
+                ),
+                Style::default().fg(palette.muted),
+            )),
+        ]),
+        rows[0],
+    );
+    frame.render_widget(
+        Gauge::default()
+            .gauge_style(
+                Style::default()
+                    .fg(if pulse {
+                        palette.accent
+                    } else {
+                        palette.border_focus
+                    })
+                    .bg(palette.panel_bg),
+            )
+            .ratio(((tick % 10) as f64 + 1.0) / 10.0)
+            .label(zh_or_en("准备中", "Preparing")),
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new(ui_text_startup_splash_hint()).style(Style::default().fg(palette.muted)),
+        rows[3],
+    );
+}
+
 fn autoresize_tui_terminal(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<(), AppError> {
@@ -1419,6 +1567,18 @@ fn handle_key_event(
     }
     if state.pending_delete_confirm.is_some() {
         return handle_delete_message_confirm_key(key, services, state);
+    }
+    if state.pending_thread_delete_confirm.is_some() {
+        return handle_thread_delete_confirm_key(key, services, state);
+    }
+    if state.pending_thread_metadata_modal.is_some() {
+        return handle_thread_metadata_modal_key(key, state);
+    }
+    if state.pending_thread_rename.is_some() {
+        return handle_thread_rename_modal_key(key, services, state);
+    }
+    if state.pending_thread_action_menu.is_some() {
+        return handle_thread_action_menu_key(key, services, state);
     }
     if state.inspect_menu_open {
         return handle_inspect_menu_key(key, state);
@@ -2097,6 +2257,22 @@ fn handle_mouse_event(
         handle_delete_message_confirm_mouse(mouse, services, state, layout)?;
         return Ok(());
     }
+    if state.pending_thread_delete_confirm.is_some() {
+        handle_thread_delete_confirm_mouse(mouse, services, state, layout)?;
+        return Ok(());
+    }
+    if state.pending_thread_metadata_modal.is_some() {
+        handle_thread_metadata_modal_mouse(mouse, state, layout)?;
+        return Ok(());
+    }
+    if state.pending_thread_rename.is_some() {
+        handle_thread_rename_modal_mouse(mouse, services, state, layout)?;
+        return Ok(());
+    }
+    if state.pending_thread_action_menu.is_some() {
+        handle_thread_action_menu_mouse(mouse, services, state, layout)?;
+        return Ok(());
+    }
     if state.mode == UiMode::Skills && state.skill_doc_modal.is_some() {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -2291,6 +2467,24 @@ fn handle_mouse_event(
                 let idx = row as usize;
                 if idx < state.threads.len() {
                     state.thread_selected = idx;
+                    let now = now_epoch_ms();
+                    let is_double_click = state.last_thread_click.is_some_and(|item| {
+                        item.thread_index == idx
+                            && now.saturating_sub(item.clicked_at_epoch_ms)
+                                <= THREAD_DOUBLE_CLICK_WINDOW_MS
+                    });
+                    state.last_thread_click = Some(ThreadClickState {
+                        thread_index: idx,
+                        clicked_at_epoch_ms: now,
+                    });
+                    if is_double_click {
+                        state.pending_thread_action_menu = Some(ThreadActionMenuState {
+                            thread_index: idx,
+                            selected: 0,
+                        });
+                        state.status = ui_text_thread_action_menu_hint().to_string();
+                        return Ok(());
+                    }
                     state.mode = UiMode::Chat;
                     switch_selected_thread(services, state)?;
                 }
@@ -2331,6 +2525,113 @@ fn handle_delete_message_confirm_mouse(
         state.pending_delete_confirm = None;
         state.status = ui_text_message_delete_cancelled().to_string();
         return Ok(());
+    }
+    Ok(())
+}
+
+fn handle_thread_delete_confirm_mouse(
+    mouse: MouseEvent,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+    layout: UiLayout,
+) -> Result<(), AppError> {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return Ok(());
+    }
+    let modal_rect = thread_delete_modal_rect(layout);
+    if !rect_contains(modal_rect, mouse.column, mouse.row) {
+        state.pending_thread_delete_confirm = None;
+        state.status = ui_text_thread_delete_cancelled().to_string();
+        return Ok(());
+    }
+    let (confirm_rect, cancel_rect) = thread_delete_modal_button_rects(modal_rect);
+    if rect_contains(confirm_rect, mouse.column, mouse.row) {
+        let idx = state
+            .pending_thread_delete_confirm
+            .as_ref()
+            .map(|item| item.thread_index)
+            .unwrap_or(usize::MAX);
+        state.pending_thread_delete_confirm = None;
+        delete_thread_session_by_index(services, state, idx)?;
+        return Ok(());
+    }
+    if rect_contains(cancel_rect, mouse.column, mouse.row) {
+        state.pending_thread_delete_confirm = None;
+        state.status = ui_text_thread_delete_cancelled().to_string();
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn handle_thread_metadata_modal_mouse(
+    mouse: MouseEvent,
+    state: &mut ChatUiState,
+    layout: UiLayout,
+) -> Result<(), AppError> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if let Some(modal) = state.pending_thread_metadata_modal.as_mut() {
+                modal.scroll = modal.scroll.saturating_sub(1);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some(modal) = state.pending_thread_metadata_modal.as_mut() {
+                let max_scroll = modal.rows.len().saturating_sub(1);
+                modal.scroll = (modal.scroll + 1).min(max_scroll);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !rect_contains(thread_metadata_modal_rect(layout), mouse.column, mouse.row) {
+                state.pending_thread_metadata_modal = None;
+                state.status = ui_text_thread_metadata_closed().to_string();
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_thread_action_menu_mouse(
+    mouse: MouseEvent,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+    layout: UiLayout,
+) -> Result<(), AppError> {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return Ok(());
+    }
+    let rect = thread_action_menu_rect(layout);
+    if !rect_contains(rect, mouse.column, mouse.row) {
+        state.pending_thread_action_menu = None;
+        state.status = ui_text_ready().to_string();
+        return Ok(());
+    }
+    let inner = rect.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 2,
+    });
+    let idx = mouse.row.saturating_sub(inner.y) as usize;
+    if idx < thread_action_menu_options().len() {
+        if let Some(menu) = state.pending_thread_action_menu.as_mut() {
+            menu.selected = idx;
+        }
+        apply_thread_action_menu_selection(services, state)?;
+    }
+    Ok(())
+}
+
+fn handle_thread_rename_modal_mouse(
+    mouse: MouseEvent,
+    _services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+    layout: UiLayout,
+) -> Result<(), AppError> {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return Ok(());
+    }
+    if !rect_contains(thread_rename_modal_rect(layout), mouse.column, mouse.row) {
+        state.pending_thread_rename = None;
+        state.status = ui_text_thread_rename_cancelled().to_string();
     }
     Ok(())
 }
@@ -2420,6 +2721,10 @@ fn switch_selected_thread(
     }
     let target = state.threads[state.thread_selected].session_id.clone();
     let switched = services.session.switch_session_by_query(&target)?;
+    state.pending_thread_action_menu = None;
+    state.pending_thread_rename = None;
+    state.pending_thread_delete_confirm = None;
+    state.pending_thread_metadata_modal = None;
     state.clear_conversation_viewport_only();
     state.push(
         UiRole::System,
@@ -2504,12 +2809,296 @@ fn handle_delete_message_confirm_key(
     Ok(false)
 }
 
+fn handle_thread_delete_confirm_key(
+    key: KeyEvent,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+) -> Result<bool, AppError> {
+    let Some(modal) = state.pending_thread_delete_confirm.as_mut() else {
+        return Ok(false);
+    };
+    match key.code {
+        KeyCode::Esc => {
+            state.pending_thread_delete_confirm = None;
+            state.status = ui_text_thread_delete_cancelled().to_string();
+        }
+        KeyCode::Left | KeyCode::Up => {
+            modal.selected = modal.selected.saturating_sub(1);
+        }
+        KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+            modal.selected = (modal.selected + 1).min(1);
+        }
+        KeyCode::Enter => {
+            let index = modal.thread_index;
+            let confirm_delete = modal.selected == 0;
+            state.pending_thread_delete_confirm = None;
+            if confirm_delete {
+                delete_thread_session_by_index(services, state, index)?;
+            } else {
+                state.status = ui_text_thread_delete_cancelled().to_string();
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_thread_metadata_modal_key(
+    key: KeyEvent,
+    state: &mut ChatUiState,
+) -> Result<bool, AppError> {
+    let Some(modal) = state.pending_thread_metadata_modal.as_mut() else {
+        return Ok(false);
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => {
+            state.pending_thread_metadata_modal = None;
+            state.status = ui_text_thread_metadata_closed().to_string();
+        }
+        KeyCode::Up => {
+            modal.scroll = modal.scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            let max_scroll = modal.rows.len().saturating_sub(1);
+            modal.scroll = (modal.scroll + 1).min(max_scroll);
+        }
+        KeyCode::PageUp => {
+            modal.scroll = modal.scroll.saturating_sub(6);
+        }
+        KeyCode::PageDown => {
+            let max_scroll = modal.rows.len().saturating_sub(1);
+            modal.scroll = (modal.scroll + 6).min(max_scroll);
+        }
+        KeyCode::Home => {
+            modal.scroll = 0;
+        }
+        KeyCode::End => {
+            modal.scroll = modal.rows.len().saturating_sub(1);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_thread_action_menu_key(
+    key: KeyEvent,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+) -> Result<bool, AppError> {
+    let Some(menu) = state.pending_thread_action_menu.as_mut() else {
+        return Ok(false);
+    };
+    match key.code {
+        KeyCode::Esc => {
+            state.pending_thread_action_menu = None;
+            state.status = ui_text_ready().to_string();
+        }
+        KeyCode::Up => {
+            menu.selected = menu.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            menu.selected = (menu.selected + 1).min(thread_action_menu_options().len() - 1);
+        }
+        KeyCode::Enter => {
+            apply_thread_action_menu_selection(services, state)?;
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_thread_rename_modal_key(
+    key: KeyEvent,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+) -> Result<bool, AppError> {
+    let Some(modal) = state.pending_thread_rename.as_mut() else {
+        return Ok(false);
+    };
+    match key.code {
+        KeyCode::Esc => {
+            state.pending_thread_rename = None;
+            state.status = ui_text_thread_rename_cancelled().to_string();
+        }
+        KeyCode::Left => modal.input.move_left(),
+        KeyCode::Right => modal.input.move_right(),
+        KeyCode::Home => modal.input.move_home(),
+        KeyCode::End => modal.input.move_end(),
+        KeyCode::Backspace => modal.input.backspace(),
+        KeyCode::Delete => modal.input.delete(),
+        KeyCode::Char(ch) => {
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                modal.input.insert_char(ch);
+            }
+        }
+        KeyCode::Enter => {
+            apply_thread_rename_modal(services, state)?;
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn apply_thread_action_menu_selection(
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+) -> Result<(), AppError> {
+    let Some(menu) = state.pending_thread_action_menu.take() else {
+        return Ok(());
+    };
+    let idx = menu.thread_index;
+    match menu.selected {
+        0 => open_thread_delete_confirm(state, idx)?,
+        1 => open_thread_rename_modal(state, idx)?,
+        _ => open_thread_metadata_modal(services, state, idx)?,
+    }
+    Ok(())
+}
+
+fn open_thread_delete_confirm(
+    state: &mut ChatUiState,
+    thread_index: usize,
+) -> Result<(), AppError> {
+    if state.threads.get(thread_index).is_none() {
+        state.status = ui_text_thread_not_found().to_string();
+        return Ok(());
+    }
+    state.pending_thread_metadata_modal = None;
+    state.pending_thread_delete_confirm = Some(ThreadDeleteConfirmState {
+        thread_index,
+        selected: 1,
+    });
+    state.status = ui_text_thread_delete_confirm_prompt().to_string();
+    Ok(())
+}
+
+fn open_thread_rename_modal(state: &mut ChatUiState, thread_index: usize) -> Result<(), AppError> {
+    let Some(target) = state.threads.get(thread_index) else {
+        state.status = ui_text_thread_not_found().to_string();
+        return Ok(());
+    };
+    state.pending_thread_metadata_modal = None;
+    let mut input = InputBuffer::new();
+    input.text = target.session_name.clone();
+    input.cursor_char = input.char_count();
+    input.view_char_offset = 0;
+    state.pending_thread_rename = Some(ThreadRenameModalState {
+        thread_index,
+        input,
+    });
+    state.status = ui_text_thread_rename_prompt().to_string();
+    Ok(())
+}
+
+fn apply_thread_rename_modal(
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+) -> Result<(), AppError> {
+    let Some(modal) = state.pending_thread_rename.as_ref() else {
+        return Ok(());
+    };
+    let Some(target) = state.threads.get(modal.thread_index).cloned() else {
+        state.pending_thread_rename = None;
+        state.status = ui_text_thread_not_found().to_string();
+        return Ok(());
+    };
+    let new_name = modal.input.text.trim().to_string();
+    if new_name.is_empty() {
+        state.status = ui_text_thread_rename_empty().to_string();
+        return Ok(());
+    }
+    let was_active = target.session_id == services.session.session_id();
+    let updated = services
+        .session
+        .rename_session_by_id(&target.session_id, &new_name)?;
+    state.pending_thread_rename = None;
+    state.set_threads(services.session.list_sessions().unwrap_or_default());
+    if was_active {
+        state.push(
+            UiRole::System,
+            i18n::chat_session_renamed(
+                services.session.session_name(),
+                services.session.session_id(),
+            ),
+        );
+    }
+    state.status = format!("{}: {}", ui_text_thread_renamed(), updated.session_name);
+    Ok(())
+}
+
+fn delete_thread_session_by_index(
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+    thread_index: usize,
+) -> Result<(), AppError> {
+    let Some(target) = state.threads.get(thread_index).cloned() else {
+        state.status = ui_text_thread_not_found().to_string();
+        return Ok(());
+    };
+    let previous_active_id = services.session.session_id().to_string();
+    let active_after = services.session.delete_session_by_id(&target.session_id)?;
+    state.pending_thread_rename = None;
+    state.pending_thread_action_menu = None;
+    state.pending_thread_delete_confirm = None;
+    state.pending_thread_metadata_modal = None;
+    state.set_threads(services.session.list_sessions().unwrap_or_default());
+    if previous_active_id != services.session.session_id() {
+        state.clear_conversation_viewport_only();
+        state.push(
+            UiRole::System,
+            i18n::chat_session_changed(
+                active_after.session_name.as_str(),
+                active_after.session_id.as_str(),
+                active_after.file_path.as_path(),
+            ),
+        );
+        let current = services
+            .session
+            .recent_messages_for_display(CHAT_RENDER_LIMIT);
+        for item in recent_messages_to_ui_messages(&current) {
+            state.push_persisted(item.role, item.text);
+        }
+    }
+    state.status = format!("{}: {}", ui_text_thread_deleted(), target.session_name);
+    Ok(())
+}
+
+fn open_thread_metadata_modal(
+    services: &ActionServices<'_>,
+    state: &mut ChatUiState,
+    thread_index: usize,
+) -> Result<(), AppError> {
+    let Some(target) = state.threads.get(thread_index).cloned() else {
+        state.status = ui_text_thread_not_found().to_string();
+        return Ok(());
+    };
+    let detail = if target.session_id == services.session.session_id() {
+        build_session_metadata_report(services, state)
+    } else {
+        build_thread_metadata_report(services, &target)
+    };
+    state.pending_thread_delete_confirm = None;
+    state.pending_thread_rename = None;
+    state.pending_thread_metadata_modal = Some(ThreadMetadataModalState {
+        session_id: target.session_id.clone(),
+        session_name: target.session_name.clone(),
+        rows: metadata_report_to_rows(detail.as_str()),
+        scroll: 0,
+    });
+    state.status = ui_text_thread_metadata_opened().to_string();
+    Ok(())
+}
+
 fn activate_nav_item(
     services: &mut ActionServices<'_>,
     state: &mut ChatUiState,
 ) -> Result<(), AppError> {
     state.hovered_message_idx = None;
     state.pending_delete_confirm = None;
+    state.pending_thread_action_menu = None;
+    state.pending_thread_rename = None;
+    state.pending_thread_delete_confirm = None;
+    state.pending_thread_metadata_modal = None;
     match state.nav_selected {
         0 => {
             state.mode = UiMode::Chat;
@@ -2771,9 +3360,7 @@ fn submit_chat_message(
     match response {
         Ok(chat_result) => {
             if let Some(thinking) = chat_result.thinking.as_deref()
-                && !thinking.trim().is_empty()
-                && (!wait_outcome.printed_round_thinking
-                    || thinking.trim() != wait_outcome.last_round_thinking.trim())
+                && should_append_final_thinking(thinking, wait_outcome.thinking_rendered_in_ui)
             {
                 state.push(UiRole::Thinking, thinking.trim());
             }
@@ -2894,8 +3481,7 @@ fn wait_chat_worker_result(
     cancel_requested: &AtomicBool,
 ) -> Result<PendingAiWaitOutcome, AppError> {
     let mut finished: Option<Result<ChatToolResponse, String>> = None;
-    let mut printed_round_thinking = false;
-    let mut last_round_thinking = String::new();
+    let mut thinking_rendered_in_ui = false;
     let mut last_round_content = String::new();
     let mut saw_stream_events = false;
     while finished.is_none() {
@@ -2905,10 +3491,9 @@ fn wait_chat_worker_result(
                     if let Some(thinking) = event.thinking.as_deref()
                         && !thinking.trim().is_empty()
                     {
-                        printed_round_thinking = true;
-                        last_round_thinking = thinking.trim().to_string();
                         if !event.streamed_thinking {
                             state.push(UiRole::Thinking, thinking.trim());
+                            thinking_rendered_in_ui = true;
                             state.add_live_token_estimate(estimate_tokens_from_text_delta(
                                 thinking.trim(),
                             ));
@@ -2939,6 +3524,9 @@ fn wait_chat_worker_result(
                     }
                     ChatStreamEventKind::Thinking => {
                         saw_stream_events = true;
+                        if !event.text.is_empty() {
+                            thinking_rendered_in_ui = true;
+                        }
                         state.add_live_token_estimate(estimate_tokens_from_text_delta(&event.text));
                         render_stream_event_typewriter(
                             terminal,
@@ -2996,11 +3584,14 @@ fn wait_chat_worker_result(
     }
     Ok(PendingAiWaitOutcome {
         response: finished.unwrap_or_else(|| Err(ui_text_ai_channel_closed().to_string())),
-        printed_round_thinking,
-        last_round_thinking,
+        thinking_rendered_in_ui,
         last_round_content,
         saw_stream_events,
     })
+}
+
+fn should_append_final_thinking(final_thinking: &str, thinking_rendered_in_ui: bool) -> bool {
+    !final_thinking.trim().is_empty() && !thinking_rendered_in_ui
 }
 
 fn render_stream_event_typewriter(
@@ -3062,6 +3653,12 @@ fn handle_pending_ai_key_event(
 ) -> Result<bool, AppError> {
     if state.pending_delete_confirm.is_some() {
         return handle_delete_message_confirm_key(key, services, state);
+    }
+    if state.pending_thread_delete_confirm.is_some() {
+        return handle_thread_delete_confirm_key(key, services, state);
+    }
+    if state.pending_thread_metadata_modal.is_some() {
+        return handle_thread_metadata_modal_key(key, state);
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         cancel_requested.store(true, Ordering::SeqCst);
@@ -3140,6 +3737,14 @@ fn handle_pending_ai_mouse_event(
     refresh_conversation_cache_for_layout(state, layout);
     if state.pending_delete_confirm.is_some() {
         handle_delete_message_confirm_mouse(mouse, services, state, layout)?;
+        return Ok(());
+    }
+    if state.pending_thread_delete_confirm.is_some() {
+        handle_thread_delete_confirm_mouse(mouse, services, state, layout)?;
+        return Ok(());
+    }
+    if state.pending_thread_metadata_modal.is_some() {
+        handle_thread_metadata_modal_mouse(mouse, state, layout)?;
         return Ok(());
     }
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -3316,6 +3921,12 @@ fn execute_builtin_command(
                     effective.tool,
                     effective.system,
                 ),
+            );
+        }
+        BuiltinCommand::Meta => {
+            state.push(
+                UiRole::System,
+                build_session_metadata_report(services, state),
             );
         }
         BuiltinCommand::Skills => {
@@ -3911,6 +4522,327 @@ fn draw_delete_message_confirm_modal(
     );
 }
 
+fn draw_thread_delete_confirm_modal(
+    frame: &mut Frame<'_>,
+    state: &ChatUiState,
+    layout: UiLayout,
+    palette: ThemePalette,
+) {
+    let Some(modal_state) = state.pending_thread_delete_confirm.as_ref() else {
+        return;
+    };
+    let Some(target) = state.threads.get(modal_state.thread_index) else {
+        return;
+    };
+    draw_modal_overlay(frame, palette);
+    let modal = thread_delete_modal_rect(layout);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(ui_text_thread_delete_modal_title())
+        .style(Style::default().bg(palette.panel_bg))
+        .border_style(Style::default().fg(Color::Rgb(255, 118, 118)));
+    frame.render_widget(outer, modal);
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(4),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .margin(1)
+        .split(modal);
+    frame.render_widget(
+        Paragraph::new(ui_text_thread_delete_modal_question())
+            .style(Style::default().fg(palette.text)),
+        body[0],
+    );
+    frame.render_widget(
+        Paragraph::new(trim_ui_text(
+            format!(
+                "{} ({})",
+                target.session_name,
+                short_session_id(target.session_id.as_str())
+            )
+            .as_str(),
+            220,
+        ))
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(palette.text))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(ui_text_thread_delete_preview_title())
+                .border_style(Style::default().fg(palette.border)),
+        ),
+        body[1],
+    );
+    let (confirm_rect, cancel_rect) = thread_delete_modal_button_rects(modal);
+    let confirm_style = if modal_state.selected == 0 {
+        Style::default()
+            .fg(Color::Rgb(255, 238, 238))
+            .bg(Color::Rgb(168, 56, 56))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(255, 148, 148))
+    };
+    let cancel_style = if modal_state.selected == 1 {
+        Style::default()
+            .fg(palette.panel_bg)
+            .bg(palette.border_focus)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.text)
+    };
+    frame.render_widget(
+        Paragraph::new(ui_text_thread_delete_yes()).style(confirm_style),
+        confirm_rect,
+    );
+    frame.render_widget(
+        Paragraph::new(ui_text_thread_delete_no()).style(cancel_style),
+        cancel_rect,
+    );
+    frame.render_widget(
+        Paragraph::new(ui_text_thread_delete_modal_hint())
+            .style(Style::default().fg(palette.muted)),
+        body[3],
+    );
+}
+
+fn draw_thread_metadata_modal(
+    frame: &mut Frame<'_>,
+    state: &ChatUiState,
+    layout: UiLayout,
+    palette: ThemePalette,
+) {
+    let Some(modal_state) = state.pending_thread_metadata_modal.as_ref() else {
+        return;
+    };
+    draw_modal_overlay(frame, palette);
+    let modal = thread_metadata_modal_rect(layout);
+    frame.render_widget(Clear, modal);
+    let pulse = status_pulse_on();
+    let border = if pulse {
+        palette.accent
+    } else {
+        palette.border_focus
+    };
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(ui_text_thread_metadata_modal_title())
+            .style(Style::default().bg(palette.panel_bg))
+            .border_style(Style::default().fg(border)),
+        modal,
+    );
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ])
+        .margin(1)
+        .split(modal);
+    let head_line = format!(
+        "{} · {}",
+        trim_ui_text(
+            modal_state.session_name.as_str(),
+            body[0].width.max(1) as usize
+        ),
+        short_session_id(modal_state.session_id.as_str())
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                head_line,
+                Style::default()
+                    .fg(palette.text)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                ui_text_thread_metadata_modal_subtitle(),
+                Style::default().fg(palette.muted),
+            )),
+        ]),
+        body[0],
+    );
+    let table_visible = body[1].height.saturating_sub(3).max(1) as usize;
+    let max_scroll = modal_state.rows.len().saturating_sub(table_visible);
+    let scroll = modal_state.scroll.min(max_scroll);
+    let rows = if modal_state.rows.is_empty() {
+        vec![Row::new(vec![
+            Cell::from(ui_text_na()),
+            Cell::from(ui_text_na()),
+        ])]
+    } else {
+        modal_state
+            .rows
+            .iter()
+            .skip(scroll)
+            .take(table_visible)
+            .enumerate()
+            .map(|(idx, (k, v))| {
+                let row_style = if idx % 2 == 0 {
+                    Style::default().fg(palette.text)
+                } else {
+                    Style::default().fg(Color::Rgb(196, 218, 255))
+                };
+                Row::new(vec![
+                    Cell::from(trim_ui_text(k, 24))
+                        .style(Style::default().fg(border).add_modifier(Modifier::BOLD)),
+                    Cell::from(trim_ui_text(v, 220)).style(row_style),
+                ])
+            })
+            .collect::<Vec<_>>()
+    };
+    let table = Table::new(rows, [Constraint::Length(24), Constraint::Min(20)])
+        .header(
+            Row::new(vec![
+                Cell::from(ui_text_thread_metadata_field()),
+                Cell::from(ui_text_thread_metadata_value()),
+            ])
+            .style(
+                Style::default()
+                    .fg(palette.text)
+                    .bg(Color::Rgb(34, 52, 84))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .column_spacing(1)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(palette.border)),
+        );
+    frame.render_widget(table, body[1]);
+    let footer = if max_scroll == 0 {
+        ui_text_thread_metadata_modal_hint().to_string()
+    } else {
+        format!(
+            "{} · {}/{}",
+            ui_text_thread_metadata_modal_hint(),
+            scroll + 1,
+            max_scroll + 1
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(trim_ui_text(footer.as_str(), body[2].width.max(1) as usize))
+            .style(Style::default().fg(palette.muted)),
+        body[2],
+    );
+}
+
+fn draw_thread_action_menu_modal(
+    frame: &mut Frame<'_>,
+    state: &ChatUiState,
+    layout: UiLayout,
+    palette: ThemePalette,
+) {
+    let Some(menu_state) = state.pending_thread_action_menu.as_ref() else {
+        return;
+    };
+    draw_modal_overlay(frame, palette);
+    let modal = thread_action_menu_rect(layout);
+    frame.render_widget(Clear, modal);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(ui_text_thread_action_menu_title())
+        .style(Style::default().bg(palette.panel_bg))
+        .border_style(Style::default().fg(palette.accent));
+    frame.render_widget(outer, modal);
+    let inner = modal.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 2,
+    });
+    let options = thread_action_menu_options();
+    for (idx, label) in options.iter().enumerate() {
+        let row = Rect {
+            x: inner.x,
+            y: inner.y.saturating_add(idx as u16),
+            width: inner.width.max(1),
+            height: 1,
+        };
+        let selected = menu_state.selected == idx;
+        let style = if selected {
+            Style::default()
+                .fg(palette.text)
+                .bg(palette.app_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.text)
+        };
+        frame.render_widget(
+            Paragraph::new(format!("{}. {}", idx + 1, label)).style(style),
+            row,
+        );
+    }
+    let hint = Rect {
+        x: modal.x.saturating_add(2),
+        y: modal.y.saturating_add(modal.height.saturating_sub(2)),
+        width: modal.width.saturating_sub(4).max(1),
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(ui_text_thread_action_menu_hint()).style(Style::default().fg(palette.muted)),
+        hint,
+    );
+}
+
+fn draw_thread_rename_modal(
+    frame: &mut Frame<'_>,
+    state: &ChatUiState,
+    layout: UiLayout,
+    palette: ThemePalette,
+) {
+    let Some(modal_state) = state.pending_thread_rename.as_ref() else {
+        return;
+    };
+    draw_modal_overlay(frame, palette);
+    let modal = thread_rename_modal_rect(layout);
+    frame.render_widget(Clear, modal);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(ui_text_thread_rename_modal_title())
+        .style(Style::default().bg(palette.panel_bg))
+        .border_style(Style::default().fg(palette.accent));
+    frame.render_widget(outer, modal);
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .margin(1)
+        .split(modal);
+    frame.render_widget(
+        Paragraph::new(ui_text_thread_rename_prompt()).style(Style::default().fg(palette.muted)),
+        body[0],
+    );
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.border_focus));
+    frame.render_widget(input_block, body[1]);
+    let input_inner = body[1].inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let (visible, cursor_col) = project_input_view(&modal_state.input, input_inner.width as usize);
+    frame.render_widget(
+        Paragraph::new(visible).style(Style::default().fg(palette.text)),
+        input_inner,
+    );
+    if input_inner.width > 0 && input_inner.height > 0 {
+        frame.set_cursor_position((input_inner.x + cursor_col as u16, input_inner.y));
+    }
+    frame.render_widget(
+        Paragraph::new(ui_text_thread_rename_modal_hint())
+            .style(Style::default().fg(palette.muted)),
+        body[2],
+    );
+}
+
 fn execute_mcp_tool_call_tui(
     services: &mut ActionServices<'_>,
     group_id: &str,
@@ -3961,6 +4893,7 @@ fn parse_builtin_command(input: &str) -> Option<BuiltinCommand> {
         "exit" | "quit" => Some(BuiltinCommand::Exit),
         "help" => Some(BuiltinCommand::Help),
         "stats" => Some(BuiltinCommand::Stats),
+        "meta" | "session" => Some(BuiltinCommand::Meta),
         "skills" => Some(BuiltinCommand::Skills),
         "mcps" => Some(BuiltinCommand::Mcps),
         "new" => Some(BuiltinCommand::New),
@@ -4433,6 +5366,18 @@ fn draw_ui(frame: &mut Frame<'_>, services: &ActionServices<'_>, state: &mut Cha
     }
     if state.pending_delete_confirm.is_some() {
         draw_delete_message_confirm_modal(frame, state, palette);
+    }
+    if state.pending_thread_delete_confirm.is_some() {
+        draw_thread_delete_confirm_modal(frame, state, layout, palette);
+    }
+    if state.pending_thread_action_menu.is_some() {
+        draw_thread_action_menu_modal(frame, state, layout, palette);
+    }
+    if state.pending_thread_rename.is_some() {
+        draw_thread_rename_modal(frame, state, layout, palette);
+    }
+    if state.pending_thread_metadata_modal.is_some() {
+        draw_thread_metadata_modal(frame, state, layout, palette);
     }
 }
 
@@ -8165,6 +9110,26 @@ fn delete_message_modal_rect(layout: UiLayout) -> Rect {
     centered_rect(layout.conversation, 74, 11)
 }
 
+fn thread_action_menu_rect(layout: UiLayout) -> Rect {
+    centered_rect(layout.threads, 86, 8)
+}
+
+fn thread_delete_modal_rect(layout: UiLayout) -> Rect {
+    centered_rect(layout.conversation, 66, 11)
+}
+
+fn thread_metadata_modal_rect(layout: UiLayout) -> Rect {
+    centered_rect(layout.conversation, 84, 18)
+}
+
+fn thread_rename_modal_rect(layout: UiLayout) -> Rect {
+    centered_rect(layout.conversation, 62, 9)
+}
+
+fn thread_delete_modal_button_rects(modal: Rect) -> (Rect, Rect) {
+    delete_message_modal_button_rects(modal)
+}
+
 fn delete_message_modal_button_rects(modal: Rect) -> (Rect, Rect) {
     let body = modal.inner(ratatui::layout::Margin {
         horizontal: 2,
@@ -8216,16 +9181,6 @@ fn role_tag(role: UiRole) -> &'static str {
         UiRole::Thinking => ui_text_tag_thinking(),
         UiRole::System => ui_text_tag_sys(),
         UiRole::Tool => ui_text_tag_tool(),
-    }
-}
-
-fn role_avatar(role: UiRole) -> &'static str {
-    match role {
-        UiRole::User => "🙂",
-        UiRole::Assistant => "🤖",
-        UiRole::Thinking => "🧠",
-        UiRole::System => "🛠",
-        UiRole::Tool => "⚙",
     }
 }
 
@@ -8284,6 +9239,183 @@ fn format_u64_compact(value: u64) -> String {
         out.push(ch);
     }
     out.chars().rev().collect()
+}
+
+fn thread_action_menu_options() -> [&'static str; 3] {
+    [
+        ui_text_thread_action_delete(),
+        ui_text_thread_action_rename(),
+        ui_text_thread_action_metadata(),
+    ]
+}
+
+fn metadata_report_to_rows(report: &str) -> Vec<(String, String)> {
+    let mut rows = Vec::<(String, String)>::new();
+    for line in report.lines() {
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = text.split_once(':').or_else(|| text.split_once('：')) {
+            let key_text = key.trim();
+            let value_text = value.trim();
+            if !key_text.is_empty() && !value_text.is_empty() {
+                rows.push((key_text.to_string(), value_text.to_string()));
+            }
+        }
+    }
+    if rows.is_empty() {
+        rows.push((ui_text_na().to_string(), trim_ui_text(report, 180)));
+    }
+    rows
+}
+
+fn build_session_metadata_report(services: &ActionServices<'_>, state: &ChatUiState) -> String {
+    let active = current_thread_overview(state, services)
+        .cloned()
+        .or_else(|| {
+            services.session.list_sessions().ok().and_then(|items| {
+                items
+                    .into_iter()
+                    .find(|item| item.session_id == services.session.session_id())
+            })
+        });
+    let archived = services.session.archived_role_counts();
+    let effective = services.session.effective_context_role_counts(true);
+    let compass = services.session.compass();
+    let created_at = active
+        .as_ref()
+        .map(|item| item.created_at_epoch_ms)
+        .unwrap_or(compass.created_at_epoch_ms);
+    let updated_at = active
+        .as_ref()
+        .map(|item| item.last_updated_epoch_ms)
+        .unwrap_or(compass.last_updated_epoch_ms);
+    let message_count = active
+        .as_ref()
+        .map(|item| item.message_count)
+        .unwrap_or_else(|| services.session.message_count());
+    let summary_len = active
+        .as_ref()
+        .map(|item| item.summary_len)
+        .unwrap_or_else(|| services.session.summary_len());
+    let context_max = services.cfg.session.max_messages.max(1);
+    let context_usage = archived
+        .total
+        .saturating_mul(100)
+        .saturating_div(context_max)
+        .min(100);
+    let total_chars = services.session.total_message_chars();
+    if lang_is_zh() {
+        format!(
+            "会话元数据\nID: {}\n名称: {}\n文件: {}\n创建时间: {}\n最近更新: {}\n消息总数: {} (用户 {} / 助手 {} / 工具 {} / 系统 {})\n有效上下文: {} (用户 {} / 助手 {} / 工具 {} / 系统 {})\n摘要长度: {} 字符\n消息总字符数: {}\n上下文占用: {}% (recent={}, max={})\n压缩统计: rounds={}, truncated={}, dropped_groups={}\n运行期 Token: committed={}, live_estimate={}, display={}",
+            services.session.session_id(),
+            services.session.session_name(),
+            services.session.file_path().display(),
+            format_epoch_ms(created_at),
+            format_epoch_ms(updated_at),
+            message_count,
+            archived.user,
+            archived.assistant,
+            archived.tool,
+            archived.system,
+            effective.total,
+            effective.user,
+            effective.assistant,
+            effective.tool,
+            effective.system,
+            summary_len,
+            total_chars,
+            context_usage,
+            services.cfg.session.recent_messages,
+            services.cfg.session.max_messages,
+            compass.compression_rounds,
+            compass.truncated_messages,
+            compass.dropped_groups,
+            format_u64_compact(state.token_usage_committed),
+            format_u64_compact(state.token_live_estimate),
+            format_u64_compact(state.token_display_value),
+        )
+    } else {
+        format!(
+            "Session metadata\nID: {}\nName: {}\nFile: {}\nCreated: {}\nUpdated: {}\nMessages: {} (user {} / assistant {} / tool {} / system {})\nEffective context: {} (user {} / assistant {} / tool {} / system {})\nSummary chars: {}\nMessage chars total: {}\nContext usage: {}% (recent={}, max={})\nCompression: rounds={}, truncated={}, dropped_groups={}\nRuntime token: committed={}, live_estimate={}, display={}",
+            services.session.session_id(),
+            services.session.session_name(),
+            services.session.file_path().display(),
+            format_epoch_ms(created_at),
+            format_epoch_ms(updated_at),
+            message_count,
+            archived.user,
+            archived.assistant,
+            archived.tool,
+            archived.system,
+            effective.total,
+            effective.user,
+            effective.assistant,
+            effective.tool,
+            effective.system,
+            summary_len,
+            total_chars,
+            context_usage,
+            services.cfg.session.recent_messages,
+            services.cfg.session.max_messages,
+            compass.compression_rounds,
+            compass.truncated_messages,
+            compass.dropped_groups,
+            format_u64_compact(state.token_usage_committed),
+            format_u64_compact(state.token_live_estimate),
+            format_u64_compact(state.token_display_value),
+        )
+    }
+}
+
+fn build_thread_metadata_report(
+    services: &ActionServices<'_>,
+    session: &SessionOverview,
+) -> String {
+    let context_max = services.cfg.session.max_messages.max(1);
+    let context_usage = session
+        .message_count
+        .saturating_mul(100)
+        .saturating_div(context_max)
+        .min(100);
+    if lang_is_zh() {
+        format!(
+            "会话元数据\nID: {}\n名称: {}\n文件: {}\n创建时间: {}\n最近更新: {}\n消息总数: {} (用户 {} / 助手 {} / 工具 {} / 系统 {})\n摘要长度: {} 字符\n上下文占用: {}% (recent={}, max={})\n活跃会话: 否\n说明: 该会话未激活，运行期 Token 与压缩运行态指标需切换后查看",
+            session.session_id,
+            session.session_name,
+            session.file_path.display(),
+            format_epoch_ms(session.created_at_epoch_ms),
+            format_epoch_ms(session.last_updated_epoch_ms),
+            session.message_count,
+            session.user_count,
+            session.assistant_count,
+            session.tool_count,
+            session.system_count,
+            session.summary_len,
+            context_usage,
+            services.cfg.session.recent_messages,
+            services.cfg.session.max_messages,
+        )
+    } else {
+        format!(
+            "Session metadata\nID: {}\nName: {}\nFile: {}\nCreated: {}\nUpdated: {}\nMessages: {} (user {} / assistant {} / tool {} / system {})\nSummary chars: {}\nContext usage: {}% (recent={}, max={})\nActive session: no\nNote: this session is inactive; runtime token and compression-live metrics are available after switching to it",
+            session.session_id,
+            session.session_name,
+            session.file_path.display(),
+            format_epoch_ms(session.created_at_epoch_ms),
+            format_epoch_ms(session.last_updated_epoch_ms),
+            session.message_count,
+            session.user_count,
+            session.assistant_count,
+            session.tool_count,
+            session.system_count,
+            session.summary_len,
+            context_usage,
+            services.cfg.session.recent_messages,
+            services.cfg.session.max_messages,
+        )
+    }
 }
 
 fn current_thread_overview<'a>(
@@ -8980,6 +10112,78 @@ fn ui_text_skills_doc_unchanged() -> &'static str {
 fn ui_text_panel_threads() -> &'static str {
     zh_or_en("线程", "Threads")
 }
+fn ui_text_thread_action_menu_title() -> &'static str {
+    zh_or_en("线程操作", "Thread Actions")
+}
+fn ui_text_thread_action_delete() -> &'static str {
+    zh_or_en("删除", "Delete")
+}
+fn ui_text_thread_action_rename() -> &'static str {
+    zh_or_en("重命名", "Rename")
+}
+fn ui_text_thread_action_metadata() -> &'static str {
+    zh_or_en("元数据", "Metadata")
+}
+fn ui_text_thread_metadata_modal_title() -> &'static str {
+    zh_or_en("线程元数据", "Thread Metadata")
+}
+fn ui_text_thread_metadata_modal_subtitle() -> &'static str {
+    zh_or_en("只读视图 · 结构化统计", "Read-only view · structured stats")
+}
+fn ui_text_thread_metadata_field() -> &'static str {
+    zh_or_en("字段", "Field")
+}
+fn ui_text_thread_metadata_value() -> &'static str {
+    zh_or_en("值", "Value")
+}
+fn ui_text_thread_metadata_modal_hint() -> &'static str {
+    zh_or_en(
+        "Esc/Enter关闭 · ↑↓/PgUp/PgDn滚动 · 鼠标滚轮支持",
+        "Esc/Enter close · ↑↓/PgUp/PgDn scroll · mouse wheel supported",
+    )
+}
+fn ui_text_thread_action_menu_hint() -> &'static str {
+    zh_or_en(
+        "双击线程已弹出菜单，↑↓切换，Enter确认，Esc关闭",
+        "Thread menu opened, use ↑↓ to select, Enter to apply, Esc to close",
+    )
+}
+fn ui_text_thread_rename_modal_title() -> &'static str {
+    zh_or_en("重命名线程", "Rename Thread")
+}
+fn ui_text_thread_rename_modal_hint() -> &'static str {
+    zh_or_en(
+        "输入新名称，Enter保存，Esc取消",
+        "Type new name, Enter to save, Esc to cancel",
+    )
+}
+fn ui_text_thread_delete_confirm_prompt() -> &'static str {
+    zh_or_en("请确认是否删除该线程", "Confirm thread deletion")
+}
+fn ui_text_thread_delete_modal_title() -> &'static str {
+    zh_or_en("删除线程确认", "Delete Thread")
+}
+fn ui_text_thread_delete_modal_question() -> &'static str {
+    zh_or_en(
+        "删除后将同步移除会话文件，是否继续？",
+        "Delete this thread and remove its session file?",
+    )
+}
+fn ui_text_thread_delete_preview_title() -> &'static str {
+    zh_or_en("线程预览", "Thread Preview")
+}
+fn ui_text_thread_delete_modal_hint() -> &'static str {
+    zh_or_en(
+        "方向键/Tab切换，Enter确认，Esc取消",
+        "Use arrows/Tab to switch, Enter to confirm, Esc to cancel",
+    )
+}
+fn ui_text_thread_delete_yes() -> &'static str {
+    zh_or_en("确认删除", "Delete")
+}
+fn ui_text_thread_delete_no() -> &'static str {
+    zh_or_en("取消", "Cancel")
+}
 fn ui_text_panel_conversation() -> &'static str {
     zh_or_en("会话", "Conversation")
 }
@@ -9016,6 +10220,9 @@ fn ui_text_ready() -> &'static str {
 fn ui_text_tui_ready() -> &'static str {
     zh_or_en("TUI已就绪", "TUI ready")
 }
+fn ui_text_startup_splash_hint() -> &'static str {
+    zh_or_en("初始化中，请稍候…", "Initializing, please wait...")
+}
 fn ui_text_thinking() -> &'static str {
     zh_or_en("AI思考中...", "AI thinking...")
 }
@@ -9051,8 +10258,8 @@ fn ui_text_footer_help() -> &'static str {
 }
 fn ui_text_help_commands() -> &'static str {
     zh_or_en(
-        "命令: /help /stats /skills /mcps /new /list /change <id|name> /name <new-name> /history [n] /clear /exit",
-        "Commands: /help /stats /skills /mcps /new /list /change <id|name> /name <new-name> /history [n] /clear /exit",
+        "命令: /help /stats /meta /skills /mcps /new /list /change <id|name> /name <new-name> /history [n] /clear /exit",
+        "Commands: /help /stats /meta /skills /mcps /new /list /change <id|name> /name <new-name> /history [n] /clear /exit",
     )
 }
 fn ui_text_focus_hint(focus: FocusPanel) -> &'static str {
@@ -9290,6 +10497,33 @@ fn ui_text_message_delete_not_supported() -> &'static str {
         "该消息类型暂不支持删除",
         "This message type cannot be deleted",
     )
+}
+fn ui_text_thread_not_found() -> &'static str {
+    zh_or_en("未找到目标线程", "Target thread not found")
+}
+fn ui_text_thread_rename_prompt() -> &'static str {
+    zh_or_en("请输入新的线程名称", "Please input a new thread name")
+}
+fn ui_text_thread_rename_empty() -> &'static str {
+    zh_or_en("线程名称不能为空", "Thread name cannot be empty")
+}
+fn ui_text_thread_rename_cancelled() -> &'static str {
+    zh_or_en("已取消线程重命名", "Thread rename cancelled")
+}
+fn ui_text_thread_renamed() -> &'static str {
+    zh_or_en("线程已重命名", "Thread renamed")
+}
+fn ui_text_thread_deleted() -> &'static str {
+    zh_or_en("线程已删除", "Thread deleted")
+}
+fn ui_text_thread_delete_cancelled() -> &'static str {
+    zh_or_en("已取消删除线程", "Thread deletion cancelled")
+}
+fn ui_text_thread_metadata_opened() -> &'static str {
+    zh_or_en("已打开线程元数据弹窗", "Thread metadata modal opened")
+}
+fn ui_text_thread_metadata_closed() -> &'static str {
+    zh_or_en("已关闭线程元数据弹窗", "Thread metadata modal closed")
 }
 fn ui_text_tool_running() -> &'static str {
     zh_or_en("执行中", "Running")
@@ -9695,6 +10929,38 @@ model = "test-model"
     }
 
     #[test]
+    fn conversation_non_user_header_lines_fill_viewport_width_after_padding() {
+        let mut state = new_state();
+        let layout = compute_layout(Rect::new(0, 0, 120, 40));
+        state.set_conversation_wrap_width(layout.conversation_body.width.max(1));
+        state.messages.push_back(UiMessage {
+            role: UiRole::System,
+            text: "session switched".to_string(),
+        });
+        state.messages.push_back(UiMessage {
+            role: UiRole::Thinking,
+            text: "reasoning text".to_string(),
+        });
+        state.messages.push_back(UiMessage {
+            role: UiRole::Assistant,
+            text: "reply".to_string(),
+        });
+        state.conversation_dirty = true;
+        state.ensure_conversation_cache();
+
+        for line in state
+            .conversation_lines
+            .iter()
+            .filter(|line| line.kind == ConversationLineKind::Header)
+        {
+            assert_eq!(
+                text_display_width(&line.text),
+                layout.conversation_body.width as usize
+            );
+        }
+    }
+
+    #[test]
     fn conversation_copy_button_aligns_to_hovered_user_message() {
         let mut state = new_state();
         state.push(UiRole::User, "hello");
@@ -10052,5 +11318,24 @@ model = "test-model"
             state.tick_token_display_animation();
         }
         assert_eq!(state.token_display_value, state.token_usage_target());
+    }
+
+    #[test]
+    fn should_append_final_thinking_only_when_not_rendered_before() {
+        assert!(should_append_final_thinking("step-1 -> step-2", false));
+        assert!(!should_append_final_thinking("step-1 -> step-2", true));
+        assert!(!should_append_final_thinking("   ", false));
+    }
+
+    #[test]
+    fn parse_builtin_command_supports_session_meta_aliases() {
+        assert!(matches!(
+            parse_builtin_command("/meta"),
+            Some(BuiltinCommand::Meta)
+        ));
+        assert!(matches!(
+            parse_builtin_command("/session"),
+            Some(BuiltinCommand::Meta)
+        ));
     }
 }

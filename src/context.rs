@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -290,6 +291,10 @@ impl SessionStore {
         self.state.messages.len()
     }
 
+    pub fn compass(&self) -> &SessionCompass {
+        &self.state.compass
+    }
+
     pub fn recent_messages_for_display(&self, limit: usize) -> Vec<SessionMessage> {
         let mut items = Vec::<SessionMessage>::new();
         for idx in self.recent_display_state_indices(limit) {
@@ -447,6 +452,91 @@ impl SessionStore {
         self.state.session_name = normalized;
         self.state.compass.last_updated_epoch_ms = now_epoch_ms();
         self.persist()
+    }
+
+    pub fn rename_session_by_id(
+        &mut self,
+        session_id: &str,
+        new_name: &str,
+    ) -> Result<SessionOverview, AppError> {
+        let normalized_id = session_id.trim();
+        if normalized_id.is_empty() {
+            return Err(AppError::Runtime("session id cannot be empty".to_string()));
+        }
+        if self.state.session_id == normalized_id {
+            self.rename_current_session(new_name)?;
+            return Ok(build_session_overview(
+                &self.state,
+                self.path.clone(),
+                &self.path,
+            ));
+        }
+        let sessions = self.list_sessions()?;
+        let Some(target) = sessions
+            .into_iter()
+            .find(|item| item.session_id == normalized_id)
+        else {
+            return Err(AppError::Runtime(format!(
+                "session not found: {}",
+                normalized_id
+            )));
+        };
+        let raw = fs::read_to_string(&target.file_path).map_err(|err| {
+            AppError::Runtime(format!(
+                "failed to read session file {}: {err}",
+                target.file_path.display()
+            ))
+        })?;
+        let mut state = serde_json::from_str::<SessionState>(&raw).map_err(|err| {
+            AppError::Runtime(format!(
+                "failed to parse session file {}: {err}",
+                target.file_path.display()
+            ))
+        })?;
+        state.session_name = normalize_session_name(&state.session_id, Some(new_name));
+        state.compass.last_updated_epoch_ms = now_epoch_ms();
+        let encoded = serde_json::to_string_pretty(&state).map_err(|err| {
+            AppError::Runtime(format!("failed to serialize session state: {err}"))
+        })?;
+        write_string_atomically(&target.file_path, &encoded)?;
+        Ok(build_session_overview(&state, target.file_path, &self.path))
+    }
+
+    pub fn delete_session_by_id(&mut self, session_id: &str) -> Result<SessionOverview, AppError> {
+        let normalized_id = session_id.trim();
+        if normalized_id.is_empty() {
+            return Err(AppError::Runtime("session id cannot be empty".to_string()));
+        }
+        let sessions = self.list_sessions()?;
+        let Some(target) = sessions
+            .iter()
+            .find(|item| item.session_id == normalized_id)
+            .cloned()
+        else {
+            return Err(AppError::Runtime(format!(
+                "session not found: {}",
+                normalized_id
+            )));
+        };
+        let deleting_active =
+            target.file_path == self.path || target.session_id == self.state.session_id;
+        if deleting_active {
+            let fallback = sessions
+                .iter()
+                .find(|item| item.session_id != target.session_id)
+                .cloned();
+            if let Some(next) = fallback {
+                let _ = self.switch_session_by_query(&next.session_id)?;
+            } else {
+                self.start_new_session_with_new_file()?;
+            }
+        }
+        remove_session_files(&target.file_path)?;
+        Ok(build_session_overview(
+            &self.state,
+            self.path.clone(),
+            &self.path,
+        ))
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionOverview>, AppError> {
@@ -1042,6 +1132,31 @@ fn autosave_file_path_for(path: &Path) -> PathBuf {
     let mut value = OsString::from(path.as_os_str());
     value.push(".autosave");
     PathBuf::from(value)
+}
+
+fn remove_session_files(path: &Path) -> Result<(), AppError> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(AppError::Runtime(format!(
+                "failed to remove session file {}: {err}",
+                path.display()
+            )));
+        }
+    }
+    let autosave_path = autosave_file_path_for(path);
+    match fs::remove_file(&autosave_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(AppError::Runtime(format!(
+                "failed to remove session autosave file {}: {err}",
+                autosave_path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_session_state_lenient(raw: &str) -> Option<SessionState> {
