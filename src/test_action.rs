@@ -4,7 +4,7 @@ use toml_edit::{DocumentMut, Item};
 
 use crate::{
     cli::TestTarget,
-    config::{self, AppConfig},
+    config::{self},
     config_action::{default_config_value_literal, is_known_config_key, known_config_keys},
     error::{AppError, ExitCode},
     i18n::{self, Language},
@@ -164,7 +164,7 @@ fn analyze_toml_structure(raw: &str, report: &mut ConfigTestReport) -> bool {
 }
 
 fn analyze_semantic(raw: &str, config_path: &Path, report: &mut ConfigTestReport) {
-    let parsed = match toml::from_str::<AppConfig>(raw) {
+    let parsed = match config::parse_config_text(raw, &config_path.display().to_string()) {
         Ok(cfg) => cfg,
         Err(err) => {
             report
@@ -176,7 +176,7 @@ fn analyze_semantic(raw: &str, config_path: &Path, report: &mut ConfigTestReport
     if let Err(err) = config::validate_config(&parsed) {
         report.semantic_errors.push(localized_app_error(err));
     }
-    if let Err(err) = validate_mcp_config(&parsed.mcp, config_path) {
+    if let Err(err) = validate_mcp_config(&parsed.ai.tools.mcp, config_path) {
         report.semantic_errors.push(localized_app_error(err));
     }
 }

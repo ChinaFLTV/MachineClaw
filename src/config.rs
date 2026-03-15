@@ -61,12 +61,6 @@ pub struct AppConfig {
     pub app: AppSection,
     pub ai: AiConfig,
     #[serde(default)]
-    pub cmd: CmdConfig,
-    #[serde(default)]
-    pub skills: SkillsConfig,
-    #[serde(default)]
-    pub mcp: McpConfig,
-    #[serde(default)]
     pub console: ConsoleConfig,
     #[serde(default)]
     pub log: LogConfig,
@@ -110,6 +104,8 @@ pub struct AiConfig {
     pub retry: RetryConfig,
     #[serde(default)]
     pub chat: AiChatConfig,
+    #[serde(default)]
+    pub tools: AiToolsConfig,
     #[serde(
         rename = "input-price-per-million",
         default = "default_ai_input_price_per_million"
@@ -120,6 +116,16 @@ pub struct AiConfig {
         default = "default_ai_output_price_per_million"
     )]
     pub output_price_per_million: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct AiToolsConfig {
+    #[serde(default)]
+    pub bash: CmdConfig,
+    #[serde(default)]
+    pub skills: SkillsConfig,
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -469,11 +475,17 @@ pub fn load_config(path: &Path) -> Result<AppConfig, AppError> {
     let raw = fs::read_to_string(path).map_err(|err| {
         AppError::Config(format!("failed to read config {}: {err}", path.display()))
     })?;
-    let cfg: AppConfig = toml::from_str(&raw).map_err(|err| {
-        AppError::Config(format!("failed to parse config {}: {err}", path.display()))
-    })?;
+    let cfg = parse_config_text(&raw, &path.display().to_string())?;
     validate_config(&cfg)?;
     Ok(cfg)
+}
+
+pub fn parse_config_text(raw: &str, source: &str) -> Result<AppConfig, AppError> {
+    let parsed = toml::from_str::<toml::Value>(raw)
+        .map_err(|err| AppError::Config(format!("failed to parse config {source}: {err}")))?;
+    reject_legacy_root_tables(&parsed)?;
+    AppConfig::deserialize(parsed)
+        .map_err(|err| AppError::Config(format!("failed to parse config {source}: {err}")))
 }
 
 pub fn read_language_hint(path: &Path) -> Option<String> {
@@ -559,7 +571,9 @@ max-total-tool-calls = 40 # optional, default 40
 max-history-messages = 40 # optional, default 40
 max-chars-count = 80000 # optional, default 80000
 
-[cmd]
+[ai.tools]
+
+[ai.tools.bash]
 write-cmd-run-confirm = true # optional, default true
 write-cmd-confirm-mode = "allow-once" # optional: deny, edit, allow-once, allow-session
 allow-cmd-list = [] # optional, regex list; non-empty means allow-list mode
@@ -570,16 +584,16 @@ command-timeout-seconds = 30 # optional, default 30
 command-timeout-kill-after-seconds = 5 # optional, default 5
 command-output-max-bytes = 262144 # optional, default 262144
 
-[skills]
+[ai.tools.skills]
 enabled = false # optional, default false
 dir = "~/.skills" # optional
 
-[mcp]
+[ai.tools.mcp]
 enabled = false # optional
 mcp-availability-check-mode = "rsync" # optional, default "rsync"; "async" runs MCP availability check in background so chat can start sooner
 dir = "~/.machineclaw/mcp" # optional, MCP JSON directory (or a single json file path)
 # MCP servers are no longer configured in this TOML.
-# Place MCP definitions in `${mcp.dir}/servers.json`, for example:
+# Place MCP definitions in `${ai.tools.mcp.dir}/servers.json`, for example:
 # {
 #   "mcpServers": {
 #     "amap-maps": {
@@ -634,51 +648,51 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
                 .to_string(),
         ));
     }
-    if cfg.cmd.command_timeout_seconds == 0 {
+    let bash_cfg = &cfg.ai.tools.bash;
+    if bash_cfg.command_timeout_seconds == 0 {
         return Err(AppError::Config(
-            "cmd.command-timeout-seconds must be greater than 0".to_string(),
+            "ai.tools.bash.command-timeout-seconds must be greater than 0".to_string(),
         ));
     }
-    if cfg.cmd.command_timeout_kill_after_seconds == 0 {
+    if bash_cfg.command_timeout_kill_after_seconds == 0 {
         return Err(AppError::Config(
-            "cmd.command-timeout-kill-after-seconds must be greater than 0".to_string(),
+            "ai.tools.bash.command-timeout-kill-after-seconds must be greater than 0".to_string(),
         ));
     }
-    if cfg.cmd.command_output_max_bytes < 1024 {
+    if bash_cfg.command_output_max_bytes < 1024 {
         return Err(AppError::Config(
-            "cmd.command-output-max-bytes must be >= 1024".to_string(),
+            "ai.tools.bash.command-output-max-bytes must be >= 1024".to_string(),
         ));
     }
-    for item in &cfg.cmd.allow_cmd_list {
+    for item in &bash_cfg.allow_cmd_list {
         let pattern = item.trim();
         if pattern.is_empty() {
             continue;
         }
         Regex::new(pattern).map_err(|err| {
             AppError::Config(format!(
-                "cmd.allow-cmd-list has invalid regex '{pattern}': {err}"
+                "ai.tools.bash.allow-cmd-list has invalid regex '{pattern}': {err}"
             ))
         })?;
     }
-    for item in &cfg.cmd.deny_cmd_list {
+    for item in &bash_cfg.deny_cmd_list {
         let pattern = item.trim();
         if pattern.is_empty() {
             continue;
         }
         Regex::new(pattern).map_err(|err| {
             AppError::Config(format!(
-                "cmd.deny-cmd-list has invalid regex '{pattern}': {err}"
+                "ai.tools.bash.deny-cmd-list has invalid regex '{pattern}': {err}"
             ))
         })?;
     }
-    let confirm_mode = cfg.cmd.write_cmd_confirm_mode.trim().to_ascii_lowercase();
+    let confirm_mode = bash_cfg.write_cmd_confirm_mode.trim().to_ascii_lowercase();
     if !matches!(
         confirm_mode.as_str(),
         "deny" | "edit" | "allow-once" | "allow-session"
     ) {
         return Err(AppError::Config(
-            "cmd.write-cmd-confirm-mode must be one of: deny, edit, allow-once, allow-session"
-                .to_string(),
+            "ai.tools.bash.write-cmd-confirm-mode must be one of: deny, edit, allow-once, allow-session".to_string(),
         ));
     }
     if cfg.ai.input_price_per_million < 0.0 || cfg.ai.output_price_per_million < 0.0 {
@@ -707,15 +721,18 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
             "ai.chat.model-price-check-mode must be one of: sync, async".to_string(),
         ));
     }
+    let mcp_cfg = &cfg.ai.tools.mcp;
     let mcp_availability_check_mode =
-        normalize_mcp_availability_check_mode(cfg.mcp.mcp_availability_check_mode.as_str());
+        normalize_mcp_availability_check_mode(mcp_cfg.mcp_availability_check_mode.as_str());
     if !matches!(mcp_availability_check_mode, "rsync" | "async") {
         return Err(AppError::Config(
-            "mcp.mcp-availability-check-mode must be one of: rsync, async".to_string(),
+            "ai.tools.mcp.mcp-availability-check-mode must be one of: rsync, async".to_string(),
         ));
     }
-    if cfg.mcp.dir.trim().is_empty() {
-        return Err(AppError::Config("mcp.dir must not be empty".to_string()));
+    if mcp_cfg.dir.trim().is_empty() {
+        return Err(AppError::Config(
+            "ai.tools.mcp.dir must not be empty".to_string(),
+        ));
     }
     if cfg.ai.chat.cmd_run_timout == 0 {
         return Err(AppError::Config(
@@ -855,6 +872,28 @@ fn resolve_docs_alias(path: &Path) -> Option<PathBuf> {
         return Some(alias);
     }
     None
+}
+
+fn reject_legacy_root_tables(parsed: &toml::Value) -> Result<(), AppError> {
+    let Some(table) = parsed.as_table() else {
+        return Ok(());
+    };
+    if table.contains_key("cmd") {
+        return Err(AppError::Config(
+            "legacy [cmd] is not supported; use [ai.tools.bash]".to_string(),
+        ));
+    }
+    if table.contains_key("skills") {
+        return Err(AppError::Config(
+            "legacy [skills] is not supported; use [ai.tools.skills]".to_string(),
+        ));
+    }
+    if table.contains_key("mcp") {
+        return Err(AppError::Config(
+            "legacy [mcp] is not supported; use [ai.tools.mcp]".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn expand_tilde(raw: &str) -> PathBuf {
@@ -1095,7 +1134,7 @@ fn has_file_extension(file_name: &str) -> bool {
 mod tests {
     use super::{
         McpServerConfig, normalize_ai_provider_type, normalize_chat_model_price_check_mode,
-        normalize_mcp_availability_check_mode, resolve_config_path,
+        normalize_mcp_availability_check_mode, parse_config_text, resolve_config_path,
     };
 
     #[test]
@@ -1156,5 +1195,59 @@ url = "https://example.com/sse"
             server.server_url.as_deref(),
             Some("https://example.com/sse")
         );
+    }
+
+    #[test]
+    fn parse_config_text_reads_ai_tools_bash_section() {
+        let cfg = parse_config_text(
+            r#"
+[ai]
+base-url = "https://example.com/v1"
+token = "sk-test"
+model = "test-model"
+
+[ai.tools.bash]
+command-timeout-seconds = 12
+"#,
+            "inline",
+        )
+        .expect("config should parse");
+        assert_eq!(cfg.ai.tools.bash.command_timeout_seconds, 12);
+    }
+
+    #[test]
+    fn parse_config_text_rejects_legacy_skills_root_table() {
+        let err = parse_config_text(
+            r#"
+[ai]
+base-url = "https://example.com/v1"
+token = "sk-test"
+model = "test-model"
+
+[skills]
+enabled = true
+"#,
+            "inline",
+        )
+        .expect_err("legacy [skills] must be rejected");
+        assert!(err.to_string().contains("legacy [skills] is not supported"));
+    }
+
+    #[test]
+    fn parse_config_text_rejects_legacy_mcp_root_table() {
+        let err = parse_config_text(
+            r#"
+[ai]
+base-url = "https://example.com/v1"
+token = "sk-test"
+model = "test-model"
+
+[mcp]
+enabled = true
+"#,
+            "inline",
+        )
+        .expect_err("legacy [mcp] must be rejected");
+        assert!(err.to_string().contains("legacy [mcp] is not supported"));
     }
 }

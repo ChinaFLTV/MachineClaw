@@ -656,45 +656,45 @@ pub fn chat_tag_warn() -> &'static str {
 
 pub fn chat_tag_tool() -> &'static str {
     match current_language() {
-        Language::ZhCn => "[工具]",
-        Language::ZhTw => "[工具]",
-        Language::Fr => "[outil]",
-        Language::De => "[tool]",
-        Language::Ja => "[ツール]",
-        Language::En => "[tool]",
+        Language::ZhCn => "[Bash工具]",
+        Language::ZhTw => "[Bash工具]",
+        Language::Fr => "[bash-tool]",
+        Language::De => "[bash-tool]",
+        Language::Ja => "[Bashツール]",
+        Language::En => "[bash-tool]",
     }
 }
 
 pub fn chat_tag_tool_ok() -> &'static str {
     match current_language() {
-        Language::ZhCn => "[工具-成功]",
-        Language::ZhTw => "[工具-成功]",
-        Language::Fr => "[outil-ok]",
-        Language::De => "[tool-ok]",
-        Language::Ja => "[ツール-成功]",
-        Language::En => "[tool-ok]",
+        Language::ZhCn => "[Bash工具-成功]",
+        Language::ZhTw => "[Bash工具-成功]",
+        Language::Fr => "[bash-tool-ok]",
+        Language::De => "[bash-tool-ok]",
+        Language::Ja => "[Bashツール-成功]",
+        Language::En => "[bash-tool-ok]",
     }
 }
 
 pub fn chat_tag_tool_err() -> &'static str {
     match current_language() {
-        Language::ZhCn => "[工具-失败]",
-        Language::ZhTw => "[工具-失敗]",
-        Language::Fr => "[outil-err]",
-        Language::De => "[tool-err]",
-        Language::Ja => "[ツール-失敗]",
-        Language::En => "[tool-err]",
+        Language::ZhCn => "[Bash工具-失败]",
+        Language::ZhTw => "[Bash工具-失敗]",
+        Language::Fr => "[bash-tool-err]",
+        Language::De => "[bash-tool-err]",
+        Language::Ja => "[Bashツール-失敗]",
+        Language::En => "[bash-tool-err]",
     }
 }
 
 pub fn chat_tag_tool_timeout() -> &'static str {
     match current_language() {
-        Language::ZhCn => "[工具-超时]",
-        Language::ZhTw => "[工具-超時]",
-        Language::Fr => "[outil-timeout]",
-        Language::De => "[tool-timeout]",
-        Language::Ja => "[ツール-タイムアウト]",
-        Language::En => "[tool-timeout]",
+        Language::ZhCn => "[Bash工具-超时]",
+        Language::ZhTw => "[Bash工具-超時]",
+        Language::Fr => "[bash-tool-timeout]",
+        Language::De => "[bash-tool-timeout]",
+        Language::Ja => "[Bashツール-タイムアウト]",
+        Language::En => "[bash-tool-timeout]",
     }
 }
 
@@ -1654,34 +1654,34 @@ pub fn chat_tool_output_preview(preview: &str) -> String {
 
 pub fn chat_tool_type_shell_command() -> &'static str {
     match current_language() {
-        Language::ZhCn => "执行shell命令",
-        Language::ZhTw => "執行shell命令",
-        Language::Fr => "run_shell_command",
-        Language::De => "run_shell_command",
-        Language::Ja => "run_shell_command",
-        Language::En => "run_shell_command",
+        Language::ZhCn => "执行Bash工具命令",
+        Language::ZhTw => "執行Bash工具命令",
+        Language::Fr => "bash_tool.run_shell_command",
+        Language::De => "bash_tool.run_shell_command",
+        Language::Ja => "bash_tool.run_shell_command",
+        Language::En => "bash_tool.run_shell_command",
     }
 }
 
 pub fn chat_tool_type_shell_result() -> &'static str {
     match current_language() {
-        Language::ZhCn => "命令执行结果",
-        Language::ZhTw => "命令執行結果",
-        Language::Fr => "shell_result",
-        Language::De => "shell_result",
-        Language::Ja => "shell_result",
-        Language::En => "shell_result",
+        Language::ZhCn => "Bash命令执行结果",
+        Language::ZhTw => "Bash命令執行結果",
+        Language::Fr => "bash_tool.result",
+        Language::De => "bash_tool.result",
+        Language::Ja => "bash_tool.result",
+        Language::En => "bash_tool.result",
     }
 }
 
 pub fn chat_tool_type_output_preview() -> &'static str {
     match current_language() {
-        Language::ZhCn => "命令输出预览",
-        Language::ZhTw => "命令輸出預覽",
-        Language::Fr => "output_preview",
-        Language::De => "output_preview",
-        Language::Ja => "output_preview",
-        Language::En => "output_preview",
+        Language::ZhCn => "Bash命令输出预览",
+        Language::ZhTw => "Bash命令輸出預覽",
+        Language::Fr => "bash_tool.output_preview",
+        Language::De => "bash_tool.output_preview",
+        Language::Ja => "bash_tool.output_preview",
+        Language::En => "bash_tool.output_preview",
     }
 }
 
@@ -2315,16 +2315,16 @@ fn chat_tool_guard_reason_text(reason_code: &str) -> &'static str {
 
 pub fn chat_tool_running(label: &str, mode: &str, command: &str) -> String {
     match current_language() {
-        Language::ZhCn => format!("执行命令: label={label}, mode={mode}, command={command}"),
-        Language::ZhTw => format!("執行命令: label={label}, mode={mode}, command={command}"),
+        Language::ZhCn => format!("Bash工具执行: label={label}, mode={mode}, command={command}"),
+        Language::ZhTw => format!("Bash工具執行: label={label}, mode={mode}, command={command}"),
         Language::Fr => {
-            format!("Exécution de commande: label={label}, mode={mode}, command={command}")
+            format!("Bash tool running: label={label}, mode={mode}, command={command}")
         }
-        Language::De => {
-            format!("Befehl wird ausgeführt: label={label}, mode={mode}, command={command}")
+        Language::De => format!("Bash-Tool läuft: label={label}, mode={mode}, command={command}"),
+        Language::Ja => format!("Bashツール実行: label={label}, mode={mode}, command={command}"),
+        Language::En => {
+            format!("Bash tool running: label={label}, mode={mode}, command={command}")
         }
-        Language::Ja => format!("コマンド実行: label={label}, mode={mode}, command={command}"),
-        Language::En => format!("Running command: label={label}, mode={mode}, command={command}"),
     }
 }
 
@@ -2332,18 +2332,20 @@ pub fn chat_tool_cache_hit(label: &str, age_ms: u128) -> String {
     let age = human_duration_ms(age_ms);
     let age_ms_fmt = human_count_u128(age_ms);
     match current_language() {
-        Language::ZhCn => format!("命中命令缓存: label={label}, age={age} ({age_ms_fmt} ms)"),
-        Language::ZhTw => format!("命中命令快取: label={label}, age={age} ({age_ms_fmt} ms)"),
+        Language::ZhCn => format!("命中Bash命令缓存: label={label}, age={age} ({age_ms_fmt} ms)"),
+        Language::ZhTw => format!("命中Bash命令快取: label={label}, age={age} ({age_ms_fmt} ms)"),
         Language::Fr => {
-            format!("Cache de commande utilisé: label={label}, age={age} ({age_ms_fmt} ms)")
+            format!("Bash command cache hit: label={label}, age={age} ({age_ms_fmt} ms)")
         }
         Language::De => {
-            format!("Befehls-Cache-Treffer: label={label}, age={age} ({age_ms_fmt} ms)")
+            format!("Bash-Command-Cache-Treffer: label={label}, age={age} ({age_ms_fmt} ms)")
         }
         Language::Ja => {
-            format!("コマンドキャッシュを使用: label={label}, age={age} ({age_ms_fmt} ms)")
+            format!("Bashコマンドキャッシュを使用: label={label}, age={age} ({age_ms_fmt} ms)")
         }
-        Language::En => format!("Command cache hit: label={label}, age={age} ({age_ms_fmt} ms)"),
+        Language::En => {
+            format!("Bash command cache hit: label={label}, age={age} ({age_ms_fmt} ms)")
+        }
     }
 }
 
@@ -2468,22 +2470,22 @@ pub fn chat_tool_finished(
     let duration_ms_fmt = human_count_u128(duration_ms);
     match current_language() {
         Language::ZhCn => format!(
-            "命令完成: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
+            "Bash命令完成: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
         ),
         Language::ZhTw => format!(
-            "命令完成: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
+            "Bash命令完成: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
         ),
         Language::Fr => format!(
-            "Commande terminée: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
+            "Bash command finished: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
         ),
         Language::De => format!(
-            "Befehl abgeschlossen: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
+            "Bash-Befehl abgeschlossen: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
         ),
         Language::Ja => format!(
-            "コマンド完了: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
+            "Bashコマンド完了: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
         ),
         Language::En => format!(
-            "Command finished: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
+            "Bash command finished: label={label}, status={status}, exit={exit_code:?}, duration={duration} ({duration_ms_fmt} ms), timeout={timed_out}, interrupted={interrupted}, blocked={blocked}"
         ),
     }
 }
@@ -2671,46 +2673,70 @@ fn localize_detail(detail: &str) -> String {
             Language::Ja => "app.env-mode は prod / test / dev のいずれかである必要があります".to_string(),
             Language::En => detail.to_string(),
         },
-        "cmd.command-timeout-seconds must be greater than 0" => match current_language() {
-            Language::ZhCn => "cmd.command-timeout-seconds 必须大于 0".to_string(),
-            Language::ZhTw => "cmd.command-timeout-seconds 必須大於 0".to_string(),
-            Language::Fr => "cmd.command-timeout-seconds doit être supérieur à 0".to_string(),
-            Language::De => "cmd.command-timeout-seconds muss größer als 0 sein".to_string(),
-            Language::Ja => "cmd.command-timeout-seconds は 0 より大きい必要があります".to_string(),
-            Language::En => detail.to_string(),
-        },
-        "cmd.command-timeout-kill-after-seconds must be greater than 0" => {
+        "ai.tools.bash.command-timeout-seconds must be greater than 0" => {
             match current_language() {
-                Language::ZhCn => "cmd.command-timeout-kill-after-seconds 必须大于 0".to_string(),
-                Language::ZhTw => "cmd.command-timeout-kill-after-seconds 必須大於 0".to_string(),
+                Language::ZhCn => "ai.tools.bash.command-timeout-seconds 必须大于 0".to_string(),
+                Language::ZhTw => "ai.tools.bash.command-timeout-seconds 必須大於 0".to_string(),
                 Language::Fr => {
-                    "cmd.command-timeout-kill-after-seconds doit être supérieur à 0".to_string()
+                    "ai.tools.bash.command-timeout-seconds doit être supérieur à 0".to_string()
                 }
                 Language::De => {
-                    "cmd.command-timeout-kill-after-seconds muss größer als 0 sein".to_string()
+                    "ai.tools.bash.command-timeout-seconds muss größer als 0 sein".to_string()
                 }
                 Language::Ja => {
-                    "cmd.command-timeout-kill-after-seconds は 0 より大きい必要があります"
+                    "ai.tools.bash.command-timeout-seconds は 0 より大きい必要があります"
                         .to_string()
                 }
                 Language::En => detail.to_string(),
             }
         }
-        "cmd.command-output-max-bytes must be >= 1024" => match current_language() {
-            Language::ZhCn => "cmd.command-output-max-bytes 必须大于等于 1024".to_string(),
-            Language::ZhTw => "cmd.command-output-max-bytes 必須大於等於 1024".to_string(),
-            Language::Fr => "cmd.command-output-max-bytes doit être >= 1024".to_string(),
-            Language::De => "cmd.command-output-max-bytes muss >= 1024 sein".to_string(),
-            Language::Ja => "cmd.command-output-max-bytes は 1024 以上である必要があります".to_string(),
-            Language::En => detail.to_string(),
-        },
-        "cmd.write-cmd-confirm-mode must be one of: deny, edit, allow-once, allow-session" => {
+        "ai.tools.bash.command-timeout-kill-after-seconds must be greater than 0" => {
             match current_language() {
-                Language::ZhCn => "cmd.write-cmd-confirm-mode 取值必须是 deny、edit、allow-once、allow-session".to_string(),
-                Language::ZhTw => "cmd.write-cmd-confirm-mode 取值必須是 deny、edit、allow-once、allow-session".to_string(),
-                Language::Fr => "cmd.write-cmd-confirm-mode doit être deny, edit, allow-once ou allow-session".to_string(),
-                Language::De => "cmd.write-cmd-confirm-mode muss deny, edit, allow-once oder allow-session sein".to_string(),
-                Language::Ja => "cmd.write-cmd-confirm-mode は deny / edit / allow-once / allow-session のいずれかである必要があります".to_string(),
+                Language::ZhCn => {
+                    "ai.tools.bash.command-timeout-kill-after-seconds 必须大于 0".to_string()
+                }
+                Language::ZhTw => {
+                    "ai.tools.bash.command-timeout-kill-after-seconds 必須大於 0".to_string()
+                }
+                Language::Fr => {
+                    "ai.tools.bash.command-timeout-kill-after-seconds doit être supérieur à 0"
+                        .to_string()
+                }
+                Language::De => {
+                    "ai.tools.bash.command-timeout-kill-after-seconds muss größer als 0 sein"
+                        .to_string()
+                }
+                Language::Ja => {
+                    "ai.tools.bash.command-timeout-kill-after-seconds は 0 より大きい必要があります"
+                        .to_string()
+                }
+                Language::En => detail.to_string(),
+            }
+        }
+        "ai.tools.bash.command-output-max-bytes must be >= 1024" => {
+            match current_language() {
+                Language::ZhCn => "ai.tools.bash.command-output-max-bytes 必须大于等于 1024".to_string(),
+                Language::ZhTw => "ai.tools.bash.command-output-max-bytes 必須大於等於 1024".to_string(),
+                Language::Fr => {
+                    "ai.tools.bash.command-output-max-bytes doit être >= 1024".to_string()
+                }
+                Language::De => {
+                    "ai.tools.bash.command-output-max-bytes muss >= 1024 sein".to_string()
+                }
+                Language::Ja => {
+                    "ai.tools.bash.command-output-max-bytes は 1024 以上である必要があります"
+                        .to_string()
+                }
+                Language::En => detail.to_string(),
+            }
+        }
+        "ai.tools.bash.write-cmd-confirm-mode must be one of: deny, edit, allow-once, allow-session" => {
+            match current_language() {
+                Language::ZhCn => "ai.tools.bash.write-cmd-confirm-mode 取值必须是 deny、edit、allow-once、allow-session".to_string(),
+                Language::ZhTw => "ai.tools.bash.write-cmd-confirm-mode 取值必須是 deny、edit、allow-once、allow-session".to_string(),
+                Language::Fr => "ai.tools.bash.write-cmd-confirm-mode doit être deny, edit, allow-once ou allow-session".to_string(),
+                Language::De => "ai.tools.bash.write-cmd-confirm-mode muss deny, edit, allow-once oder allow-session sein".to_string(),
+                Language::Ja => "ai.tools.bash.write-cmd-confirm-mode は deny / edit / allow-once / allow-session のいずれかである必要があります".to_string(),
                 Language::En => detail.to_string(),
             }
         }
@@ -2883,59 +2909,101 @@ fn localize_detail(detail: &str) -> String {
             Language::Ja => "log.max-save-time は 0 より大きい必要があります".to_string(),
             Language::En => detail.to_string(),
         },
-        "mcp.enabled=true requires at least one configured server" => match current_language() {
-            Language::ZhCn => "mcp.enabled=true 时至少需要配置一个 MCP 服务".to_string(),
-            Language::ZhTw => "mcp.enabled=true 時至少需要設定一個 MCP 服務".to_string(),
-            Language::Fr => {
-                "Quand mcp.enabled=true, au moins un serveur MCP doit être configuré".to_string()
-            }
-            Language::De => {
-                "Bei mcp.enabled=true muss mindestens ein MCP-Server konfiguriert sein".to_string()
-            }
-            Language::Ja => {
-                "mcp.enabled=true の場合、少なくとも 1 つの MCP サーバー設定が必要です"
-                    .to_string()
-            }
-            Language::En => detail.to_string(),
-        },
-        "mcp.mcp-availability-check-mode must be one of: rsync, async" => {
+        "ai.tools.mcp.enabled=true requires at least one configured server" => {
             match current_language() {
-                Language::ZhCn => {
-                    "mcp.mcp-availability-check-mode 仅支持 rsync 或 async".to_string()
-                }
-                Language::ZhTw => {
-                    "mcp.mcp-availability-check-mode 僅支援 rsync 或 async".to_string()
-                }
+                Language::ZhCn => "ai.tools.mcp.enabled=true 时至少需要配置一个 MCP 服务".to_string(),
+                Language::ZhTw => "ai.tools.mcp.enabled=true 時至少需要設定一個 MCP 服務".to_string(),
                 Language::Fr => {
-                    "mcp.mcp-availability-check-mode doit être rsync ou async".to_string()
+                    "Quand ai.tools.mcp.enabled=true, au moins un serveur MCP doit être configuré"
+                        .to_string()
                 }
                 Language::De => {
-                    "mcp.mcp-availability-check-mode muss rsync oder async sein".to_string()
+                    "Bei ai.tools.mcp.enabled=true muss mindestens ein MCP-Server konfiguriert sein"
+                        .to_string()
                 }
                 Language::Ja => {
-                    "mcp.mcp-availability-check-mode は rsync または async を指定してください"
+                    "ai.tools.mcp.enabled=true の場合、少なくとも 1 つの MCP サーバー設定が必要です"
                         .to_string()
                 }
                 Language::En => detail.to_string(),
             }
         }
-        _ if detail.starts_with("cmd.allow-cmd-list has invalid regex '") => {
+        "ai.tools.mcp.mcp-availability-check-mode must be one of: rsync, async" => {
             match current_language() {
-                Language::ZhCn => format!("cmd.allow-cmd-list 包含非法正则: {detail}"),
-                Language::ZhTw => format!("cmd.allow-cmd-list 包含非法正則: {detail}"),
-                Language::Fr => format!("cmd.allow-cmd-list contient une regex invalide: {detail}"),
-                Language::De => format!("cmd.allow-cmd-list enthält einen ungültigen Regex: {detail}"),
-                Language::Ja => format!("cmd.allow-cmd-list に不正な正規表現があります: {detail}"),
+                Language::ZhCn => {
+                    "ai.tools.mcp.mcp-availability-check-mode 仅支持 rsync 或 async".to_string()
+                }
+                Language::ZhTw => {
+                    "ai.tools.mcp.mcp-availability-check-mode 僅支援 rsync 或 async".to_string()
+                }
+                Language::Fr => {
+                    "ai.tools.mcp.mcp-availability-check-mode doit être rsync ou async"
+                        .to_string()
+                }
+                Language::De => {
+                    "ai.tools.mcp.mcp-availability-check-mode muss rsync oder async sein"
+                        .to_string()
+                }
+                Language::Ja => {
+                    "ai.tools.mcp.mcp-availability-check-mode は rsync または async を指定してください"
+                        .to_string()
+                }
                 Language::En => detail.to_string(),
             }
         }
-        _ if detail.starts_with("cmd.deny-cmd-list has invalid regex '") => {
+        "ai.tools.mcp.dir must not be empty" => match current_language() {
+            Language::ZhCn => "ai.tools.mcp.dir 不能为空".to_string(),
+            Language::ZhTw => "ai.tools.mcp.dir 不能為空".to_string(),
+            Language::Fr => {
+                "ai.tools.mcp.dir ne peut pas être vide".to_string()
+            }
+            Language::De => {
+                "ai.tools.mcp.dir darf nicht leer sein".to_string()
+            }
+            Language::Ja => "ai.tools.mcp.dir は空にできません".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "legacy [cmd] is not supported; use [ai.tools.bash]" => match current_language() {
+            Language::ZhCn => "旧版 [cmd] 配置已废弃，请改用 [ai.tools.bash]".to_string(),
+            Language::ZhTw => "舊版 [cmd] 設定已廢棄，請改用 [ai.tools.bash]".to_string(),
+            Language::Fr => "[cmd] hérité n'est plus pris en charge, utilisez [ai.tools.bash]".to_string(),
+            Language::De => "Der alte Abschnitt [cmd] wird nicht mehr unterstützt, verwenden Sie [ai.tools.bash]".to_string(),
+            Language::Ja => "旧式の [cmd] はサポートされません。[ai.tools.bash] を使用してください".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "legacy [skills] is not supported; use [ai.tools.skills]" => match current_language() {
+            Language::ZhCn => "旧版 [skills] 配置已废弃，请改用 [ai.tools.skills]".to_string(),
+            Language::ZhTw => "舊版 [skills] 設定已廢棄，請改用 [ai.tools.skills]".to_string(),
+            Language::Fr => "[skills] hérité n'est plus pris en charge, utilisez [ai.tools.skills]".to_string(),
+            Language::De => "Der alte Abschnitt [skills] wird nicht mehr unterstützt, verwenden Sie [ai.tools.skills]".to_string(),
+            Language::Ja => "旧式の [skills] はサポートされません。[ai.tools.skills] を使用してください".to_string(),
+            Language::En => detail.to_string(),
+        },
+        "legacy [mcp] is not supported; use [ai.tools.mcp]" => match current_language() {
+            Language::ZhCn => "旧版 [mcp] 配置已废弃，请改用 [ai.tools.mcp]".to_string(),
+            Language::ZhTw => "舊版 [mcp] 設定已廢棄，請改用 [ai.tools.mcp]".to_string(),
+            Language::Fr => "[mcp] hérité n'est plus pris en charge, utilisez [ai.tools.mcp]".to_string(),
+            Language::De => "Der alte Abschnitt [mcp] wird nicht mehr unterstützt, verwenden Sie [ai.tools.mcp]".to_string(),
+            Language::Ja => "旧式の [mcp] はサポートされません。[ai.tools.mcp] を使用してください".to_string(),
+            Language::En => detail.to_string(),
+        },
+        _ if detail.starts_with("ai.tools.bash.allow-cmd-list has invalid regex '") => {
             match current_language() {
-                Language::ZhCn => format!("cmd.deny-cmd-list 包含非法正则: {detail}"),
-                Language::ZhTw => format!("cmd.deny-cmd-list 包含非法正則: {detail}"),
-                Language::Fr => format!("cmd.deny-cmd-list contient une regex invalide: {detail}"),
-                Language::De => format!("cmd.deny-cmd-list enthält einen ungültigen Regex: {detail}"),
-                Language::Ja => format!("cmd.deny-cmd-list に不正な正規表現があります: {detail}"),
+                Language::ZhCn => format!("ai.tools.bash.allow-cmd-list 包含非法正则: {detail}"),
+                Language::ZhTw => format!("ai.tools.bash.allow-cmd-list 包含非法正則: {detail}"),
+                Language::Fr => format!("ai.tools.bash.allow-cmd-list contient une regex invalide: {detail}"),
+                Language::De => format!("ai.tools.bash.allow-cmd-list enthält einen ungültigen Regex: {detail}"),
+                Language::Ja => format!("ai.tools.bash.allow-cmd-list に不正な正規表現があります: {detail}"),
+                Language::En => detail.to_string(),
+            }
+        }
+        _ if detail.starts_with("ai.tools.bash.deny-cmd-list has invalid regex '") => {
+            match current_language() {
+                Language::ZhCn => format!("ai.tools.bash.deny-cmd-list 包含非法正则: {detail}"),
+                Language::ZhTw => format!("ai.tools.bash.deny-cmd-list 包含非法正則: {detail}"),
+                Language::Fr => format!("ai.tools.bash.deny-cmd-list contient une regex invalide: {detail}"),
+                Language::De => format!("ai.tools.bash.deny-cmd-list enthält einen ungültigen Regex: {detail}"),
+                Language::Ja => format!("ai.tools.bash.deny-cmd-list に不正な正規表現があります: {detail}"),
                 Language::En => detail.to_string(),
             }
         }

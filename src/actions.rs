@@ -423,9 +423,9 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
                     );
                 }
                 "skills" if command.arg.is_empty() => {
-                    let skills_dir = expand_tilde(&services.cfg.skills.dir);
+                    let skills_dir = expand_tilde(&services.cfg.ai.tools.skills.dir);
                     let markdown = format_chat_skills_markdown(
-                        services.cfg.skills.enabled,
+                        services.cfg.ai.tools.skills.enabled,
                         &skills_dir,
                         services.skills,
                         services.cfg.console.colorful,
@@ -440,7 +440,7 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
                 }
                 "mcps" if command.arg.is_empty() => {
                     let markdown = format_chat_mcps_markdown(
-                        services.cfg.mcp.enabled,
+                        services.cfg.ai.tools.mcp.enabled,
                         services.mcp,
                         services.cfg.console.colorful,
                     );
@@ -609,7 +609,7 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
         maybe_run_ai_context_compression(services, &system_prompt)?;
         services.session.persist()?;
         autosave_worker.submit_from_session(services.session);
-        if services.cfg.skills.enabled && !services.skills.is_empty() {
+        if services.cfg.ai.tools.skills.enabled && !services.skills.is_empty() {
             println!(
                 "{}",
                 render::render_chat_custom_tag_event(
@@ -619,7 +619,7 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
                 )
             );
         }
-        if services.cfg.mcp.enabled {
+        if services.cfg.ai.tools.mcp.enabled {
             let mcp_tool_count = services.mcp.external_tool_definitions().len();
             println!(
                 "{}",
@@ -1085,9 +1085,9 @@ fn execute_tool_call(
         command,
         mode,
     };
-    if services.cfg.skills.enabled
+    if services.cfg.ai.tools.skills.enabled
         && let Some(skill_name) =
-            detect_skill_name_from_command(&spec.command, services.cfg.skills.dir.as_str())
+            detect_skill_name_from_command(&spec.command, services.cfg.ai.tools.skills.dir.as_str())
     {
         println!(
             "{}",
@@ -2926,9 +2926,15 @@ fn maybe_prepare_chat_mcp_availability(
     services: &mut ActionServices<'_>,
     chat_input_waiting: Arc<AtomicBool>,
 ) -> Option<Receiver<Result<McpManager, String>>> {
-    if !services.cfg.mcp.enabled
+    if !services.cfg.ai.tools.mcp.enabled
         || normalize_mcp_availability_check_mode(
-            services.cfg.mcp.mcp_availability_check_mode.as_str(),
+            services
+                .cfg
+                .ai
+                .tools
+                .mcp
+                .mcp_availability_check_mode
+                .as_str(),
         ) != "async"
     {
         return None;
@@ -2940,7 +2946,7 @@ fn maybe_prepare_chat_mcp_availability(
         colorful,
         chat_input_waiting.as_ref(),
     );
-    let mcp_cfg = services.cfg.mcp.clone();
+    let mcp_cfg = services.cfg.ai.tools.mcp.clone();
     let mcp_config_path = services.config_path.to_path_buf();
     let (sender, receiver) = mpsc::channel::<Result<McpManager, String>>();
     let chat_input_waiting_cloned = chat_input_waiting.clone();
@@ -3161,7 +3167,7 @@ fn render_chat_window_header(services: &ActionServices<'_>, after_clear: bool) {
             );
         }
     }
-    if services.cfg.skills.enabled {
+    if services.cfg.ai.tools.skills.enabled {
         println!(
             "{}",
             render::render_chat_custom_tag_event(
@@ -3171,7 +3177,7 @@ fn render_chat_window_header(services: &ActionServices<'_>, after_clear: bool) {
             )
         );
     }
-    if services.cfg.mcp.enabled {
+    if services.cfg.ai.tools.mcp.enabled {
         let mcp_tool_count = services.mcp.external_tool_definitions().len();
         println!(
             "{}",
@@ -3223,13 +3229,13 @@ fn build_chat_system_prompt(services: &ActionServices<'_>, base: &str) -> String
     } else {
         mcp_tools.join(", ")
     };
-    let skills_enabled = services.cfg.skills.enabled;
-    let skills_dir = services.cfg.skills.dir.trim();
-    prompt.push_str("\n\n[Capability Selection]\n- Shell execution, Skills, and MCP are peer capabilities. Choose the smallest sufficient one; do not systematically bias toward any single category.\n- Prefer Shell for deterministic local inspection, code edits, build/test, log/file/process analysis, and other machine-local operations.\n- Prefer Skills when a detected skill clearly matches the task and provides a reusable workflow or domain guardrails.\n- Prefer MCP when the task needs an integrated external service or dedicated remote capability that Shell/Skill cannot provide cleanly.\n- For MCP HTTP troubleshooting, check endpoint/auth/header config first; `/mcp` is preferred over legacy `/sse` paths.\n- Avoid both extremes: do not stay text-only when evidence is missing, and do not chain tools endlessly when the evidence is already sufficient.\n- After each tool result, reassess whether you should answer in text now or call another tool.\n- If the model returns user-visible text in any round, preserve it and surface it; do not drop, overwrite, or silently ignore earlier assistant text.\n");
-    prompt.push_str("\n[Tool Argument Rules]\n- Every tool call argument MUST be a strict JSON object. Do not emit pseudo-JSON, markdown, comments, or partially written strings.\n- Use double quotes for all JSON keys and string values.\n- For `run_shell_command`, always send at least `{\\\"command\\\":\\\"...\\\"}` and optionally `label` plus `mode=read|write`.\n- If a previous tool result says arguments are invalid, fix the JSON structure directly instead of retrying with another malformed variant.\n");
+    let skills_enabled = services.cfg.ai.tools.skills.enabled;
+    let skills_dir = services.cfg.ai.tools.skills.dir.trim();
+    prompt.push_str("\n\n[Capability Selection]\n- Bash Tool execution, Skills, and MCP are peer capabilities. Choose the smallest sufficient one; do not systematically bias toward any single category.\n- Prefer Bash Tool for deterministic local inspection, code edits, build/test, log/file/process analysis, and other machine-local operations.\n- Prefer Skills when a detected skill clearly matches the task and provides a reusable workflow or domain guardrails.\n- Prefer MCP when the task needs an integrated external service or dedicated remote capability that Bash Tool/Skill cannot provide cleanly.\n- For MCP HTTP troubleshooting, check endpoint/auth/header config first; `/mcp` is preferred over legacy `/sse` paths.\n- Avoid both extremes: do not stay text-only when evidence is missing, and do not chain tools endlessly when the evidence is already sufficient.\n- After each tool result, reassess whether you should answer in text now or call another tool.\n- If the model returns user-visible text in any round, preserve it and surface it; do not drop, overwrite, or silently ignore earlier assistant text.\n");
+    prompt.push_str("\n[Tool Argument Rules]\n- Every tool call argument MUST be a strict JSON object. Do not emit pseudo-JSON, markdown, comments, or partially written strings.\n- Use double quotes for all JSON keys and string values.\n- For Bash Tool `run_shell_command`, always send at least `{\\\"command\\\":\\\"...\\\"}` and optionally `label` plus `mode=read|write`.\n- If a previous tool result says arguments are invalid, fix the JSON structure directly instead of retrying with another malformed variant.\n");
     prompt.push_str("\n[Skill Workflow]\n- Before complex tasks, scan available skills first.\n- If a matching skill exists, follow its SKILL.md workflow.\n- In responses, explicitly mention which skill is used.\n");
     prompt.push_str(&format!(
-        "\n[Runtime Capability Context]\n- shell_tool=run_shell_command\n- skills_enabled={skills_enabled}\n- skills_dir={skills_dir}\n- detected_skills={skills_list}\n- detected_mcp_tools={mcp_tools_list}\n"
+        "\n[Runtime Capability Context]\n- bash_tool=run_shell_command\n- skills_enabled={skills_enabled}\n- skills_dir={skills_dir}\n- detected_skills={skills_list}\n- detected_mcp_tools={mcp_tools_list}\n"
     ));
     prompt
 }

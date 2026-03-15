@@ -314,27 +314,26 @@ pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
         "ai.chat.output-multilines" => Some("false"),
         "ai.chat.skip-env-profile" => Some("true"),
         "ai.chat.cmd-run-timout" => Some("30"),
-        "ai.chat.cmd-run-timeout" => Some("30"),
         "ai.chat.max-tool-rounds" => Some("16"),
         "ai.chat.max-total-tool-calls" => Some("40"),
         "ai.chat.compression.max-history-messages" => Some("40"),
         "ai.chat.compression.max-chars-count" => Some("80000"),
         "ai.input-price-per-million" => Some("0"),
         "ai.output-price-per-million" => Some("0"),
-        "cmd.write-cmd-run-confirm" => Some("true"),
-        "cmd.command-timeout-seconds" => Some("30"),
-        "cmd.command-timeout-kill-after-seconds" => Some("5"),
-        "cmd.write-cmd-confirm-mode" => Some("\"allow-once\""),
-        "cmd.allow-cmd-list" => Some("[]"),
-        "cmd.deny-cmd-list" => Some("[]"),
-        "cmd.write-cmd-allow-patterns" => Some("[]"),
-        "cmd.write-cmd-deny-patterns" => Some("[]"),
-        "cmd.command-output-max-bytes" => Some("262144"),
-        "skills.enabled" => Some("false"),
-        "skills.dir" => Some("\"~/.skills\""),
-        "mcp.enabled" => Some("false"),
-        "mcp.mcp-availability-check-mode" => Some("\"rsync\""),
-        "mcp.dir" => Some("\"~/.machineclaw/mcp\""),
+        "ai.tools.bash.write-cmd-run-confirm" => Some("true"),
+        "ai.tools.bash.command-timeout-seconds" => Some("30"),
+        "ai.tools.bash.command-timeout-kill-after-seconds" => Some("5"),
+        "ai.tools.bash.write-cmd-confirm-mode" => Some("\"allow-once\""),
+        "ai.tools.bash.allow-cmd-list" => Some("[]"),
+        "ai.tools.bash.deny-cmd-list" => Some("[]"),
+        "ai.tools.bash.write-cmd-allow-patterns" => Some("[]"),
+        "ai.tools.bash.write-cmd-deny-patterns" => Some("[]"),
+        "ai.tools.bash.command-output-max-bytes" => Some("262144"),
+        "ai.tools.skills.enabled" => Some("false"),
+        "ai.tools.skills.dir" => Some("\"~/.skills\""),
+        "ai.tools.mcp.enabled" => Some("false"),
+        "ai.tools.mcp.mcp-availability-check-mode" => Some("\"rsync\""),
+        "ai.tools.mcp.dir" => Some("\"~/.machineclaw/mcp\""),
         "console.colorful" => Some("true"),
         "log.dir" => Some("\"logs\""),
         "log.log-file-name" => Some("\"session-{session-id}.log\""),
@@ -374,27 +373,26 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
         "ai.chat.output-multilines",
         "ai.chat.skip-env-profile",
         "ai.chat.cmd-run-timout",
-        "ai.chat.cmd-run-timeout",
         "ai.chat.max-tool-rounds",
         "ai.chat.max-total-tool-calls",
         "ai.chat.compression.max-history-messages",
         "ai.chat.compression.max-chars-count",
         "ai.input-price-per-million",
         "ai.output-price-per-million",
-        "cmd.write-cmd-run-confirm",
-        "cmd.command-timeout-seconds",
-        "cmd.command-timeout-kill-after-seconds",
-        "cmd.write-cmd-confirm-mode",
-        "cmd.allow-cmd-list",
-        "cmd.deny-cmd-list",
-        "cmd.write-cmd-allow-patterns",
-        "cmd.write-cmd-deny-patterns",
-        "cmd.command-output-max-bytes",
-        "skills.enabled",
-        "skills.dir",
-        "mcp.enabled",
-        "mcp.mcp-availability-check-mode",
-        "mcp.dir",
+        "ai.tools.bash.write-cmd-run-confirm",
+        "ai.tools.bash.command-timeout-seconds",
+        "ai.tools.bash.command-timeout-kill-after-seconds",
+        "ai.tools.bash.write-cmd-confirm-mode",
+        "ai.tools.bash.allow-cmd-list",
+        "ai.tools.bash.deny-cmd-list",
+        "ai.tools.bash.write-cmd-allow-patterns",
+        "ai.tools.bash.write-cmd-deny-patterns",
+        "ai.tools.bash.command-output-max-bytes",
+        "ai.tools.skills.enabled",
+        "ai.tools.skills.dir",
+        "ai.tools.mcp.enabled",
+        "ai.tools.mcp.mcp-availability-check-mode",
+        "ai.tools.mcp.dir",
         "console.colorful",
         "log.dir",
         "log.log-file-name",
@@ -544,7 +542,7 @@ fn format_value_for_display(key: &str, value: &str) -> String {
             i18n::human_duration_ms(parsed.saturating_mul(1_000))
         );
     }
-    if key == "ai.chat.cmd-run-timout" || key == "ai.chat.cmd-run-timeout" {
+    if key == "ai.chat.cmd-run-timout" {
         return format!(
             "{grouped} ({} / {grouped} s)",
             i18n::human_duration_ms(parsed.saturating_mul(1_000))
@@ -561,15 +559,23 @@ mod tests {
     use super::is_known_config_key;
 
     #[test]
-    fn known_config_keys_include_mcp_root_fields() {
-        assert!(is_known_config_key("mcp.mcp-availability-check-mode"));
-        assert!(is_known_config_key("mcp.enabled"));
-        assert!(is_known_config_key("mcp.dir"));
+    fn known_config_keys_include_ai_tools_mcp_fields() {
+        assert!(is_known_config_key(
+            "ai.tools.mcp.mcp-availability-check-mode"
+        ));
+        assert!(is_known_config_key("ai.tools.mcp.enabled"));
+        assert!(is_known_config_key("ai.tools.mcp.dir"));
     }
 
     #[test]
-    fn dynamic_mcp_map_keys_are_not_supported_anymore() {
+    fn legacy_mcp_map_keys_are_not_supported_anymore() {
         assert!(!is_known_config_key("mcp.headers.Authorization"));
         assert!(!is_known_config_key("mcp.servers.local.server-url"));
+    }
+
+    #[test]
+    fn legacy_cmd_keys_are_not_supported_anymore() {
+        assert!(!is_known_config_key("cmd.command-timeout-seconds"));
+        assert!(!is_known_config_key("cmd.write-cmd-run-confirm"));
     }
 }

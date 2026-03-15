@@ -1790,7 +1790,7 @@ fn handle_skills_conversation_key(
     }
 
     let rows = build_skill_panel_rows(
-        expand_tilde(&services.cfg.skills.dir).as_path(),
+        expand_tilde(&services.cfg.ai.tools.skills.dir).as_path(),
         services.skills,
     );
     if rows.is_empty() {
@@ -1838,7 +1838,7 @@ fn open_selected_skill_doc_modal(
     services: &ActionServices<'_>,
     state: &mut ChatUiState,
 ) -> Result<(), AppError> {
-    let skills_dir = expand_tilde(&services.cfg.skills.dir);
+    let skills_dir = expand_tilde(&services.cfg.ai.tools.skills.dir);
     let rows = build_skill_panel_rows(skills_dir.as_path(), services.skills);
     if rows.is_empty() {
         state.status = ui_text_skills_empty().to_string();
@@ -3317,7 +3317,7 @@ fn submit_chat_message(
     });
     draw_once(terminal, services, state)?;
     let history = services.session.build_chat_history();
-    let external_mcp_tools = if services.cfg.mcp.enabled {
+    let external_mcp_tools = if services.cfg.ai.tools.mcp.enabled {
         services.mcp.external_tool_definitions()
     } else {
         Vec::new()
@@ -3541,7 +3541,7 @@ fn wait_chat_worker_result(
                 Ok(PendingAiEvent::ToolCall { request, reply_tx }) => {
                     if let Some(live) = state.ai_live.as_mut() {
                         live.tool_calls = live.tool_calls.saturating_add(1);
-                        live.last_tool_label = request.name.clone();
+                        live.last_tool_label = format_live_tool_label(&request.name);
                     }
                     let payload =
                         execute_tool_call_tui(terminal, services, group_id, &request, state);
@@ -4090,11 +4090,12 @@ fn execute_tool_call_tui(
         .trim()
         .to_string();
     let mut effective_command = command;
-    let needs_write_confirm = services.cfg.cmd.write_cmd_run_confirm
+    let needs_write_confirm = services.cfg.ai.tools.bash.write_cmd_run_confirm
         && (matches!(mode, CommandMode::Write)
             || looks_like_write_command_hint(&effective_command));
     if needs_write_confirm {
-        let confirm_mode = parse_confirm_mode(services.cfg.cmd.write_cmd_confirm_mode.as_str());
+        let confirm_mode =
+            parse_confirm_mode(services.cfg.ai.tools.bash.write_cmd_confirm_mode.as_str());
         match prompt_write_confirmation_in_tui(
             terminal,
             services,
@@ -4849,7 +4850,10 @@ fn execute_mcp_tool_call_tui(
     tool_call: &ToolCallRequest,
     state: &mut ChatUiState,
 ) -> String {
-    state.push(UiRole::Tool, format!("MCP: {}", tool_call.name));
+    state.push(
+        UiRole::Tool,
+        format!("{}: {}", ui_text_mcp_tool_call(), tool_call.name),
+    );
     let payload = match services
         .mcp
         .call_ai_tool(&tool_call.name, &tool_call.arguments)
@@ -4879,6 +4883,16 @@ fn execute_mcp_tool_call_tui(
     );
     let _ = services.session.persist();
     payload
+}
+
+fn format_live_tool_label(name: &str) -> String {
+    if name == "run_shell_command" {
+        return "bash.run_shell_command".to_string();
+    }
+    if name.starts_with("mcp__") {
+        return format!("mcp.{name}");
+    }
+    name.to_string()
 }
 
 fn parse_builtin_command(input: &str) -> Option<BuiltinCommand> {
@@ -6325,7 +6339,7 @@ fn draw_skills_panel(
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(8)])
         .split(inner);
-    let skills_dir = expand_tilde(&services.cfg.skills.dir);
+    let skills_dir = expand_tilde(&services.cfg.ai.tools.skills.dir);
     frame.render_widget(
         Paragraph::new(format!(
             "{}: {}   {}: {}",
@@ -6839,7 +6853,7 @@ fn skill_row_index_from_mouse(
     mouse: MouseEvent,
     services: &ActionServices<'_>,
 ) -> Option<usize> {
-    let skills_dir = expand_tilde(&services.cfg.skills.dir);
+    let skills_dir = expand_tilde(&services.cfg.ai.tools.skills.dir);
     let rows = build_skill_panel_rows(skills_dir.as_path(), services.skills);
     if rows.is_empty() {
         return None;
@@ -7253,14 +7267,12 @@ fn project_input_view(input: &InputBuffer, max_width: usize) -> (String, usize) 
         }
     }
     let mut out = String::new();
-    let mut width = 0usize;
     for (idx, ch) in input.text.chars().enumerate().skip(start) {
-        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
-        if width + ch_w > max_width {
+        out.push(ch);
+        if text_display_width(&out) > max_width {
+            out.pop();
             break;
         }
-        out.push(ch);
-        width += ch_w;
         if idx + 1 >= input.char_count() {
             break;
         }
@@ -7384,8 +7396,8 @@ fn mcp_field_defs() -> &'static [McpFieldDef] {
 }
 
 fn build_mcp_ui_state(cfg: &AppConfig, config_path: &Path) -> McpUiState {
-    let config_file_path = mcp::resolve_mcp_servers_file_path(&cfg.mcp, config_path);
-    let (servers, last_error) = match mcp::load_mcp_server_records(&cfg.mcp, config_path) {
+    let config_file_path = mcp::resolve_mcp_servers_file_path(&cfg.ai.tools.mcp, config_path);
+    let (servers, last_error) = match mcp::load_mcp_server_records(&cfg.ai.tools.mcp, config_path) {
         Ok(items) => (
             items
                 .into_iter()
@@ -7672,113 +7684,113 @@ fn config_seed_fields() -> Vec<ConfigFieldSeed> {
             options: &[],
         },
         ConfigFieldSeed {
-            key: "cmd.write-cmd-run-confirm",
+            key: "ai.tools.bash.write-cmd-run-confirm",
             label: "write-cmd-run-confirm",
-            category: "cmd",
+            category: "ai.tools.bash",
             kind: ConfigFieldKind::Bool,
             required: false,
             options: &["false", "true"],
         },
         ConfigFieldSeed {
-            key: "cmd.command-timeout-seconds",
+            key: "ai.tools.bash.command-timeout-seconds",
             label: "command-timeout-seconds",
-            category: "cmd",
+            category: "ai.tools.bash",
             kind: ConfigFieldKind::U64,
             required: false,
             options: &[],
         },
         ConfigFieldSeed {
-            key: "cmd.command-timeout-kill-after-seconds",
+            key: "ai.tools.bash.command-timeout-kill-after-seconds",
             label: "command-timeout-kill-after-seconds",
-            category: "cmd",
+            category: "ai.tools.bash",
             kind: ConfigFieldKind::U64,
             required: false,
             options: &[],
         },
         ConfigFieldSeed {
-            key: "cmd.write-cmd-confirm-mode",
+            key: "ai.tools.bash.write-cmd-confirm-mode",
             label: "write-cmd-confirm-mode",
-            category: "cmd",
+            category: "ai.tools.bash",
             kind: ConfigFieldKind::Enum,
             required: false,
             options: &["deny", "edit", "allow-once", "allow-session"],
         },
         ConfigFieldSeed {
-            key: "cmd.allow-cmd-list",
+            key: "ai.tools.bash.allow-cmd-list",
             label: "allow-cmd-list",
-            category: "cmd",
+            category: "ai.tools.bash",
             kind: ConfigFieldKind::StringList,
             required: false,
             options: &[],
         },
         ConfigFieldSeed {
-            key: "cmd.deny-cmd-list",
+            key: "ai.tools.bash.deny-cmd-list",
             label: "deny-cmd-list",
-            category: "cmd",
+            category: "ai.tools.bash",
             kind: ConfigFieldKind::StringList,
             required: false,
             options: &[],
         },
         ConfigFieldSeed {
-            key: "cmd.write-cmd-allow-patterns",
+            key: "ai.tools.bash.write-cmd-allow-patterns",
             label: "write-cmd-allow-patterns",
-            category: "cmd",
+            category: "ai.tools.bash",
             kind: ConfigFieldKind::StringList,
             required: false,
             options: &[],
         },
         ConfigFieldSeed {
-            key: "cmd.write-cmd-deny-patterns",
+            key: "ai.tools.bash.write-cmd-deny-patterns",
             label: "write-cmd-deny-patterns",
-            category: "cmd",
+            category: "ai.tools.bash",
             kind: ConfigFieldKind::StringList,
             required: false,
             options: &[],
         },
         ConfigFieldSeed {
-            key: "cmd.command-output-max-bytes",
+            key: "ai.tools.bash.command-output-max-bytes",
             label: "command-output-max-bytes",
-            category: "cmd",
+            category: "ai.tools.bash",
             kind: ConfigFieldKind::Usize,
             required: false,
             options: &[],
         },
         ConfigFieldSeed {
-            key: "skills.enabled",
+            key: "ai.tools.skills.enabled",
             label: "enabled",
-            category: "skills",
+            category: "ai.tools.skills",
             kind: ConfigFieldKind::Bool,
             required: false,
             options: &["false", "true"],
         },
         ConfigFieldSeed {
-            key: "skills.dir",
+            key: "ai.tools.skills.dir",
             label: "dir",
-            category: "skills",
+            category: "ai.tools.skills",
             kind: ConfigFieldKind::String,
             required: false,
             options: &[],
         },
         ConfigFieldSeed {
-            key: "mcp.enabled",
+            key: "ai.tools.mcp.enabled",
             label: "enabled",
-            category: "mcp",
+            category: "ai.tools.mcp",
             kind: ConfigFieldKind::Bool,
             required: false,
             options: &["false", "true"],
         },
         ConfigFieldSeed {
-            key: "mcp.mcp-availability-check-mode",
+            key: "ai.tools.mcp.mcp-availability-check-mode",
             label: "mcp-availability-check-mode",
-            category: "mcp",
+            category: "ai.tools.mcp",
             kind: ConfigFieldKind::Enum,
             required: false,
             options: &["rsync", "async"],
         },
         ConfigFieldSeed {
-            key: "mcp.dir",
+            key: "ai.tools.mcp.dir",
             label: "dir",
-            category: "mcp",
+            category: "ai.tools.mcp",
             kind: ConfigFieldKind::String,
             required: false,
             options: &[],
@@ -7880,22 +7892,37 @@ fn config_value_from_cfg(cfg: &AppConfig, key: &str) -> Option<String> {
         "ai.chat.compression.max-chars-count" => {
             cfg.ai.chat.compression.max_chars_count.to_string()
         }
-        "cmd.write-cmd-run-confirm" => bool_to_text(cfg.cmd.write_cmd_run_confirm),
-        "cmd.command-timeout-seconds" => cfg.cmd.command_timeout_seconds.to_string(),
-        "cmd.command-timeout-kill-after-seconds" => {
-            cfg.cmd.command_timeout_kill_after_seconds.to_string()
+        "ai.tools.bash.write-cmd-run-confirm" => {
+            bool_to_text(cfg.ai.tools.bash.write_cmd_run_confirm)
         }
-        "cmd.write-cmd-confirm-mode" => cfg.cmd.write_cmd_confirm_mode.clone(),
-        "cmd.allow-cmd-list" => to_toml_string_array(&cfg.cmd.allow_cmd_list),
-        "cmd.deny-cmd-list" => to_toml_string_array(&cfg.cmd.deny_cmd_list),
-        "cmd.write-cmd-allow-patterns" => to_toml_string_array(&cfg.cmd.write_cmd_allow_patterns),
-        "cmd.write-cmd-deny-patterns" => to_toml_string_array(&cfg.cmd.write_cmd_deny_patterns),
-        "cmd.command-output-max-bytes" => cfg.cmd.command_output_max_bytes.to_string(),
-        "skills.enabled" => bool_to_text(cfg.skills.enabled),
-        "skills.dir" => cfg.skills.dir.clone(),
-        "mcp.enabled" => bool_to_text(cfg.mcp.enabled),
-        "mcp.mcp-availability-check-mode" => cfg.mcp.mcp_availability_check_mode.clone(),
-        "mcp.dir" => cfg.mcp.dir.clone(),
+        "ai.tools.bash.command-timeout-seconds" => {
+            cfg.ai.tools.bash.command_timeout_seconds.to_string()
+        }
+        "ai.tools.bash.command-timeout-kill-after-seconds" => cfg
+            .ai
+            .tools
+            .bash
+            .command_timeout_kill_after_seconds
+            .to_string(),
+        "ai.tools.bash.write-cmd-confirm-mode" => cfg.ai.tools.bash.write_cmd_confirm_mode.clone(),
+        "ai.tools.bash.allow-cmd-list" => to_toml_string_array(&cfg.ai.tools.bash.allow_cmd_list),
+        "ai.tools.bash.deny-cmd-list" => to_toml_string_array(&cfg.ai.tools.bash.deny_cmd_list),
+        "ai.tools.bash.write-cmd-allow-patterns" => {
+            to_toml_string_array(&cfg.ai.tools.bash.write_cmd_allow_patterns)
+        }
+        "ai.tools.bash.write-cmd-deny-patterns" => {
+            to_toml_string_array(&cfg.ai.tools.bash.write_cmd_deny_patterns)
+        }
+        "ai.tools.bash.command-output-max-bytes" => {
+            cfg.ai.tools.bash.command_output_max_bytes.to_string()
+        }
+        "ai.tools.skills.enabled" => bool_to_text(cfg.ai.tools.skills.enabled),
+        "ai.tools.skills.dir" => cfg.ai.tools.skills.dir.clone(),
+        "ai.tools.mcp.enabled" => bool_to_text(cfg.ai.tools.mcp.enabled),
+        "ai.tools.mcp.mcp-availability-check-mode" => {
+            cfg.ai.tools.mcp.mcp_availability_check_mode.clone()
+        }
+        "ai.tools.mcp.dir" => cfg.ai.tools.mcp.dir.clone(),
         "console.colorful" => bool_to_text(cfg.console.colorful),
         "log.dir" => cfg.log.dir.clone(),
         "log.log-file-name" => cfg.log.log_file_name.clone(),
@@ -7948,9 +7975,9 @@ fn config_category_label(category: &str) -> String {
         "ai.retry" => ui_text_config_category_ai_retry().to_string(),
         "ai.chat" => ui_text_config_category_ai_chat().to_string(),
         "ai.chat.compression" => ui_text_config_category_ai_compression().to_string(),
-        "cmd" => ui_text_config_category_cmd().to_string(),
-        "skills" => ui_text_config_category_skills().to_string(),
-        "mcp" => ui_text_config_category_mcp().to_string(),
+        "ai.tools.bash" => ui_text_config_category_ai_tools_bash().to_string(),
+        "ai.tools.skills" => ui_text_config_category_skills().to_string(),
+        "ai.tools.mcp" => ui_text_config_category_mcp().to_string(),
         "console" => ui_text_config_category_console().to_string(),
         "log" => ui_text_config_category_log().to_string(),
         "session" => ui_text_config_category_session().to_string(),
@@ -8169,8 +8196,11 @@ fn save_config_ui(
             }
         }
         let raw = doc.to_string();
-        let parsed_cfg: AppConfig = toml::from_str(&raw)
-            .map_err(|err| AppError::Config(format!("failed to parse updated config: {err}")))?;
+        let parsed_cfg =
+            crate::config::parse_config_text(&raw, &services.config_path.display().to_string())
+                .map_err(|err| {
+                    AppError::Config(format!("failed to parse updated config: {err}"))
+                })?;
         crate::config::validate_config(&parsed_cfg)?;
         write_config_document(services.config_path, &raw)?;
         Ok(())
@@ -8785,7 +8815,7 @@ fn refresh_mcp_runtime_metadata_if_needed(
     state: &mut ChatUiState,
     report_result_to_chat: bool,
 ) {
-    if !services.cfg.mcp.enabled {
+    if !services.cfg.ai.tools.mcp.enabled {
         return;
     }
     let has_enabled_servers = state.mcp_ui.servers.iter().any(|item| item.config.enabled);
@@ -8807,7 +8837,7 @@ fn refresh_mcp_runtime_metadata_if_needed(
     if report_result_to_chat && summary_before.contains("availability=checking") {
         state.push(UiRole::System, i18n::chat_mcp_availability_check_started());
     }
-    match mcp::McpManager::connect(&services.cfg.mcp, services.config_path) {
+    match mcp::McpManager::connect(&services.cfg.ai.tools.mcp, services.config_path) {
         Ok(manager) => {
             *services.mcp = manager;
             services.mcp_summary = services.mcp.summary();
@@ -8947,10 +8977,14 @@ fn save_mcp_ui(services: &mut ActionServices<'_>, state: &mut ChatUiState) -> Re
                 config: server.config.clone(),
             });
         }
-        let saved_path =
-            mcp::save_mcp_server_records(&services.cfg.mcp, services.config_path, &records)?;
-        if services.cfg.mcp.enabled {
-            *services.mcp = mcp::McpManager::connect(&services.cfg.mcp, services.config_path)?;
+        let saved_path = mcp::save_mcp_server_records(
+            &services.cfg.ai.tools.mcp,
+            services.config_path,
+            &records,
+        )?;
+        if services.cfg.ai.tools.mcp.enabled {
+            *services.mcp =
+                mcp::McpManager::connect(&services.cfg.ai.tools.mcp, services.config_path)?;
             services.mcp_summary = services.mcp.summary();
         }
         Ok(saved_path)
@@ -9698,10 +9732,41 @@ fn text_display_width(text: &str) -> usize {
 }
 
 fn char_display_width(ch: char) -> usize {
-    if ch == '\n' || ch == '\r' {
+    if ch == '\n' || ch == '\r' || is_zero_width_char(ch) {
         return 0;
     }
-    UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
+    if is_emoji_char(ch) {
+        return 1;
+    }
+    UnicodeWidthChar::width(ch).unwrap_or(1)
+}
+
+fn is_zero_width_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x200C
+            | 0x200D
+            | 0x0300..=0x036F
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x20D0..=0x20FF
+            | 0xFE20..=0xFE2F
+            | 0xFE00..=0xFE0F
+            | 0x1F3FB..=0x1F3FF
+            | 0xE0100..=0xE01EF
+            | 0xE0020..=0xE007F
+    )
+}
+
+fn is_emoji_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x1F000..=0x1FAFF
+            | 0x2600..=0x26FF
+            | 0x2700..=0x27BF
+            | 0x2B50
+            | 0x2B55
+    )
 }
 
 fn normalize_conversation_line(text: &str) -> String {
@@ -9770,8 +9835,13 @@ fn strip_markdown_heading_prefix(line: &str) -> String {
 }
 
 fn conversation_bubble_max_inner_width(wrap_width: u16) -> usize {
-    let width = wrap_width.max(1) as usize;
-    width.saturating_sub(10).max(12)
+    if wrap_width <= 1 {
+        return 12;
+    }
+    let width = wrap_width as usize;
+    let hard_cap = width.saturating_sub(4).max(1);
+    let preferred = width.saturating_sub(10).max(1);
+    preferred.max(12).min(hard_cap)
 }
 
 fn wrap_text_by_display_width(text: &str, max_width: usize) -> Vec<String> {
@@ -9790,14 +9860,16 @@ fn wrap_text_by_display_width(text: &str, max_width: usize) -> Vec<String> {
             current.push(ch);
             continue;
         }
-        if current_width + ch_width > max_width && !current.is_empty() {
-            out.push(current);
-            current = String::new();
-            current_width = 0;
-        }
-        if ch_width > max_width {
-            out.push(ch.to_string());
-            continue;
+        if current_width + ch_width > max_width {
+            if !current.is_empty() {
+                out.push(current);
+                current = String::new();
+                current_width = 0;
+            }
+            if ch_width > max_width {
+                out.push(ch.to_string());
+                continue;
+            }
         }
         current.push(ch);
         current_width += ch_width;
@@ -9815,11 +9887,9 @@ fn display_width_between(text: &str, from_char: usize, to_char: usize) -> usize 
     if to_char <= from_char {
         return 0;
     }
-    text.chars()
-        .skip(from_char)
-        .take(to_char - from_char)
-        .map(char_display_width)
-        .sum::<usize>()
+    let from_byte = char_to_byte_idx(text, from_char);
+    let to_byte = char_to_byte_idx(text, to_char);
+    text_display_width(&text[from_byte..to_byte])
 }
 
 fn trim_ui_text(text: &str, max_len: usize) -> String {
@@ -10037,8 +10107,8 @@ fn ui_text_config_category_ai_chat() -> &'static str {
 fn ui_text_config_category_ai_compression() -> &'static str {
     zh_or_en("聊天压缩", "Chat Compression")
 }
-fn ui_text_config_category_cmd() -> &'static str {
-    zh_or_en("命令安全", "Command")
+fn ui_text_config_category_ai_tools_bash() -> &'static str {
+    zh_or_en("AI工具(Bash)", "AI Tools (Bash)")
 }
 fn ui_text_config_category_skills() -> &'static str {
     zh_or_en("技能", "Skills")
@@ -10236,7 +10306,7 @@ fn ui_text_status_ai_thinking() -> &'static str {
     zh_or_en("[AI] 深度思考中", "[AI] reasoning")
 }
 fn ui_text_status_ai_tooling() -> &'static str {
-    zh_or_en("[AI] 工具执行中", "[AI] running tools")
+    zh_or_en("[AI] 工具执行中(Bash/MCP)", "[AI] running tools (Bash/MCP)")
 }
 fn ui_text_status_ai_cancelling() -> &'static str {
     zh_or_en("[AI] 正在取消请求", "[AI] cancelling request")
@@ -10526,13 +10596,16 @@ fn ui_text_thread_metadata_closed() -> &'static str {
     zh_or_en("已关闭线程元数据弹窗", "Thread metadata modal closed")
 }
 fn ui_text_tool_running() -> &'static str {
-    zh_or_en("执行中", "Running")
+    zh_or_en("Bash执行中", "Bash running")
 }
 fn ui_text_tool_finished() -> &'static str {
-    zh_or_en("执行完成", "Finished")
+    zh_or_en("Bash执行完成", "Bash finished")
 }
 fn ui_text_tool_error() -> &'static str {
-    zh_or_en("执行错误", "Tool error")
+    zh_or_en("Bash执行错误", "Bash tool error")
+}
+fn ui_text_mcp_tool_call() -> &'static str {
+    zh_or_en("MCP工具调用", "MCP tool call")
 }
 fn ui_text_mode_read() -> &'static str {
     zh_or_en("读", "read")
@@ -10864,6 +10937,72 @@ model = "test-model"
         assert!(!widths.is_empty());
         let expected = widths[0];
         assert!(widths.iter().all(|item| *item == expected));
+    }
+
+    #[test]
+    fn display_width_treats_variation_selector_as_zero_width() {
+        assert_eq!(text_display_width("🔍"), text_display_width("🔍\u{fe0f}"));
+        assert_eq!(text_display_width("✈"), text_display_width("✈\u{fe0f}"));
+    }
+
+    #[test]
+    fn display_width_treats_single_emoji_as_one_cell() {
+        assert_eq!(text_display_width("😘"), 1);
+        assert_eq!(text_display_width("😊"), 1);
+    }
+
+    #[test]
+    fn conversation_bubble_right_border_stays_collinear_with_emoji_and_zwj() {
+        let mut state = new_state();
+        state.messages.push_back(UiMessage {
+            role: UiRole::Assistant,
+            text: "🔍️ 下一步建议\n👨‍👩‍👧‍👦 家庭表情也应保持边框对齐".to_string(),
+        });
+        state.conversation_wrap_width = 64;
+        state.conversation_dirty = true;
+        state.ensure_conversation_cache();
+
+        let widths = state
+            .conversation_lines
+            .iter()
+            .filter(|line| {
+                line.message_index == Some(0)
+                    && matches!(
+                        line.kind,
+                        ConversationLineKind::BubbleBorder | ConversationLineKind::Body
+                    )
+            })
+            .map(|line| text_display_width(&line.text))
+            .collect::<Vec<_>>();
+        assert!(!widths.is_empty());
+        assert!(widths.iter().all(|item| *item == widths[0]));
+    }
+
+    #[test]
+    fn conversation_bubble_width_is_capped_in_narrow_viewport() {
+        let mut state = new_state();
+        state.messages.push_back(UiMessage {
+            role: UiRole::Assistant,
+            text: "窄窗口也不应出现气泡宽度超出会话区".to_string(),
+        });
+        state.conversation_wrap_width = 8;
+        state.conversation_dirty = true;
+        state.ensure_conversation_cache();
+
+        let max_width = state
+            .conversation_lines
+            .iter()
+            .filter(|line| line.message_index == Some(0))
+            .map(|line| text_display_width(&line.text))
+            .max()
+            .unwrap_or(0);
+        assert!(max_width <= 8);
+    }
+
+    #[test]
+    fn wrap_text_by_display_width_no_leading_empty_line_when_first_char_exceeds_limit() {
+        let wrapped = wrap_text_by_display_width("🔍", 1);
+        assert_eq!(wrapped, vec!["🔍".to_string()]);
     }
 
     #[test]

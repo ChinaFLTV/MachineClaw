@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    config::{AppConfig, resolve_config_path, validate_config},
+    config::{AppConfig, parse_config_text, resolve_config_path, validate_config},
     error::AppError,
 };
 
@@ -80,9 +80,7 @@ pub fn load_effective_config(conf: Option<PathBuf>) -> Result<EffectiveConfig, A
     let exe = std::env::current_exe()
         .map_err(|err| AppError::Runtime(format!("cannot locate current executable: {err}")))?;
     if let Some(raw) = try_read_embedded_snapshot(&exe)? {
-        let cfg: AppConfig = toml::from_str(&raw).map_err(|err| {
-            AppError::Config(format!("failed to parse embedded config snapshot: {err}"))
-        })?;
+        let cfg = parse_config_text(&raw, "embedded config snapshot")?;
         validate_config(&cfg)?;
         return Ok(EffectiveConfig {
             cfg,

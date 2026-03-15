@@ -171,25 +171,28 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 - `[app]`：语言、环境模式（`prod/test/dev`）
 - `[ai]`：协议类型（`type`）、API 地址、Token、模型、重试
 - `[ai.chat]`：chat 行为、工具显示、压缩、超时、轮次上限
-- `[cmd]`：命令超时、写命令确认、allow/deny 命令规则
-- `[skills]`：skills 目录与开关
-- `[mcp]`：MCP 开关、可用性检查策略与 JSON 配置目录
+- `[ai.tools.bash]`：Bash 工具的命令超时、写命令确认、allow/deny 规则
+- `[ai.tools.skills]`：Skills 目录与开关
+- `[ai.tools.mcp]`：MCP 开关、可用性检查策略与 JSON 配置目录
 - `[console]`：是否彩色输出
 - `[log]`：日志目录、滚动策略、保留时长
 - `[session]`：上下文窗口相关配置
+
+> 重要：`[cmd]`、`[skills]`、`[mcp]` 旧根段已彻底废弃，不再兼容。  
+> 请统一使用 `ai.tools.bash`、`ai.tools.skills`、`ai.tools.mcp`。
 
 ### MCP 配置建议
 
 - TOML 仅保留 MCP 开关与目录配置：
 
 ```toml
-[mcp]
+[ai.tools.mcp]
 enabled = true
 mcp-availability-check-mode = "rsync"
 dir = "~/.machineclaw/mcp"
 ```
 
-- MCP 服务定义放在 `${mcp.dir}/servers.json`（或将 `mcp.dir` 直接指向某个 `.json` 文件）：
+- MCP 服务定义放在 `${ai.tools.mcp.dir}/servers.json`（或将 `ai.tools.mcp.dir` 直接指向某个 `.json` 文件）：
 - `type` 支持 `http` / `streamable_http` / `sse` / `stdio`；`streamable_http` 等价于 `http`。
 - `url`、`endpoint`、`command`、`args`、`env`、`headers`、`authType`、`authToken`、`timeoutSeconds` 均受支持。
 - 兼容字段别名：`transport/type`、`server-url/url`、`cmd/command`、`auth-type/authType`、`auth-token/authToken`、`timeout-seconds/timeoutSeconds`。
@@ -219,6 +222,12 @@ MachineClaw [OPTIONS] <COMMAND>
 - `-c, --conf <path>`：指定配置文件路径
 - `--show-config-template`：输出完整配置模板
 - `-h, --help`：查看帮助
+
+配置键示例（使用新路径）：
+
+- `MachineClaw config get ai.tools.bash.command-timeout-seconds`
+- `MachineClaw config get ai.tools.skills.dir`
+- `MachineClaw config set ai.tools.mcp.enabled true`
 
 子命令：
 

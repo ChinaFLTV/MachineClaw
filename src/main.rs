@@ -150,7 +150,7 @@ fn run() -> Result<ExitCode, AppError> {
     set_language(selected_language);
     cfg.console.colorful = render::resolve_colorful_enabled(cfg.console.colorful);
     validate_config(&cfg)?;
-    validate_mcp_config(&cfg.mcp, &config_path)?;
+    validate_mcp_config(&cfg.ai.tools.mcp, &config_path)?;
     let language_warning = cfg.app.language.as_deref().and_then(|raw| {
         if parse_language(raw).is_none() {
             Some(i18n::unsupported_language_notice(raw))
@@ -245,40 +245,41 @@ fn run() -> Result<ExitCode, AppError> {
         )?;
     }
 
-    let skills_dir = expand_tilde(&cfg.skills.dir);
-    let skill_list = if cfg.skills.enabled {
+    let skills_dir = expand_tilde(&cfg.ai.tools.skills.dir);
+    let skill_list = if cfg.ai.tools.skills.enabled {
         detect_skills(&skills_dir)?
     } else {
         Vec::new()
     };
     logging::info(&format!(
         "skills enabled={}, directory={}, skills_count={}",
-        cfg.skills.enabled,
+        cfg.ai.tools.skills.enabled,
         skills_dir.display(),
         skill_list.len()
     ));
 
-    let shell = ShellExecutor::new(&cfg.cmd);
+    let shell = ShellExecutor::new(&cfg.ai.tools.bash);
     let use_async_mcp_availability_check = matches!(&command, Commands::Chat)
-        && cfg.mcp.enabled
-        && normalize_mcp_availability_check_mode(cfg.mcp.mcp_availability_check_mode.as_str())
-            == "async";
+        && cfg.ai.tools.mcp.enabled
+        && normalize_mcp_availability_check_mode(
+            cfg.ai.tools.mcp.mcp_availability_check_mode.as_str(),
+        ) == "async";
     let mut mcp_manager = if use_async_mcp_availability_check {
         let pending_summary = format!(
             "{}, availability=checking(async)",
-            mcp_summary(&cfg.mcp, &config_path)
+            mcp_summary(&cfg.ai.tools.mcp, &config_path)
         );
-        mcp::McpManager::pending_with_config(&cfg.mcp, &config_path, pending_summary)
+        mcp::McpManager::pending_with_config(&cfg.ai.tools.mcp, &config_path, pending_summary)
     } else {
-        mcp::McpManager::connect(&cfg.mcp, &config_path)?
+        mcp::McpManager::connect(&cfg.ai.tools.mcp, &config_path)?
     };
 
     let os_type = current_os();
     let os_name = os_name();
-    let mcp_desc = if cfg.mcp.enabled {
+    let mcp_desc = if cfg.ai.tools.mcp.enabled {
         mcp_manager.summary()
     } else {
-        mcp_summary(&cfg.mcp, &config_path)
+        mcp_summary(&cfg.ai.tools.mcp, &config_path)
     };
 
     let mut services = ActionServices {
