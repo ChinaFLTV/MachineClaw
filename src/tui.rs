@@ -82,6 +82,7 @@ const STARTUP_SPLASH_EVENT_POLL_MS: u64 = 8;
 const STREAM_RENDER_BATCH_CHARS: usize = 24;
 const THINKING_STREAM_PERSIST_INTERVAL_MS: u64 = 500;
 const TOOL_RESULT_MODAL_MAX_RESULT_CHARS: usize = 120_000;
+const TOOL_RESULT_MODAL_PARSE_MAX_BYTES: usize = 512_000;
 const MCP_TOOL_RESULT_CONTENT_MAX_CHARS: usize = 120_000;
 const SESSION_AUTO_TITLE_MAX_UNITS: usize = 15;
 const SESSION_AUTO_TITLE_SOURCE_MAX_CHARS: usize = 1200;
@@ -252,10 +253,17 @@ struct ThreadMetadataModalState {
 }
 
 #[derive(Debug, Clone)]
+struct ToolResultModalWrapCache {
+    text_width: usize,
+    wrapped_lines: usize,
+}
+
+#[derive(Debug, Clone)]
 struct ToolResultModalState {
     message_index: usize,
-    lines: Vec<String>,
+    content: String,
     scroll: u16,
+    wrap_cache: Option<ToolResultModalWrapCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -3548,8 +3556,9 @@ fn open_tool_result_modal(state: &mut ChatUiState, message_index: usize) {
     });
     state.pending_tool_result_modal = Some(ToolResultModalState {
         message_index,
-        lines,
+        content: lines.join("\n"),
         scroll: 0,
+        wrap_cache: None,
     });
     state.status = ui_text_message_tool_result_modal_opened().to_string();
 }
@@ -6240,11 +6249,11 @@ fn draw_thread_metadata_modal(
 
 fn draw_tool_result_modal(
     frame: &mut Frame<'_>,
-    state: &ChatUiState,
+    state: &mut ChatUiState,
     layout: UiLayout,
     palette: ThemePalette,
 ) {
-    let Some(modal_state) = state.pending_tool_result_modal.as_ref() else {
+    let Some(modal_state) = state.pending_tool_result_modal.as_mut() else {
         return;
     };
     draw_modal_overlay(frame, palette);
@@ -6265,9 +6274,9 @@ fn draw_tool_result_modal(
         .split(modal);
     let max_scroll = tool_result_modal_scroll_max(modal_state, layout);
     let scroll = modal_state.scroll.min(max_scroll);
-    let content = modal_state.lines.join("\n");
+    modal_state.scroll = scroll;
     frame.render_widget(
-        Paragraph::new(content)
+        Paragraph::new(modal_state.content.as_str())
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0))
             .style(Style::default().fg(palette.text))
@@ -11640,7 +11649,7 @@ fn tool_result_modal_rect(layout: UiLayout) -> Rect {
     centered_rect(layout.conversation, 88, 24)
 }
 
-fn tool_result_modal_scroll_max(modal: &ToolResultModalState, layout: UiLayout) -> u16 {
+fn tool_result_modal_scroll_max(modal: &mut ToolResultModalState, layout: UiLayout) -> u16 {
     let rect = tool_result_modal_rect(layout);
     let inner = rect.inner(ratatui::layout::Margin {
         horizontal: 1,
@@ -11652,17 +11661,24 @@ fn tool_result_modal_scroll_max(modal: &ToolResultModalState, layout: UiLayout) 
         .split(inner);
     let text_width = rows[0].width.saturating_sub(2).max(1) as usize;
     let viewport_height = rows[0].height.saturating_sub(2).max(1) as usize;
-    let wrapped_lines = modal
-        .lines
-        .iter()
-        .map(|line| {
-            line.split('\n')
-                .map(|part| wrap_text_by_display_width(part, text_width).len().max(1))
-                .sum::<usize>()
-                .max(1)
-        })
-        .sum::<usize>()
-        .max(1);
+    let mut wrapped_lines = modal
+        .wrap_cache
+        .as_ref()
+        .filter(|item| item.text_width == text_width)
+        .map(|item| item.wrapped_lines)
+        .unwrap_or(0);
+    if wrapped_lines == 0 {
+        wrapped_lines = modal
+            .content
+            .split('\n')
+            .map(|line| wrapped_line_count_by_display_width(line, text_width))
+            .sum::<usize>()
+            .max(1);
+        modal.wrap_cache = Some(ToolResultModalWrapCache {
+            text_width,
+            wrapped_lines,
+        });
+    }
     wrapped_lines
         .saturating_sub(viewport_height)
         .min(u16::MAX as usize) as u16
@@ -12604,6 +12620,9 @@ fn tool_result_output_for_modal(raw_payload: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
+    if trimmed.len() > TOOL_RESULT_MODAL_PARSE_MAX_BYTES {
+        return trim_ui_text(trimmed, TOOL_RESULT_MODAL_MAX_RESULT_CHARS);
+    }
     let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
         return trim_ui_text(trimmed, TOOL_RESULT_MODAL_MAX_RESULT_CHARS);
     };
@@ -12947,14 +12966,16 @@ fn wrap_text_by_display_width(text: &str, max_width: usize) -> Vec<String> {
     }
     let mut out = Vec::<String>::new();
     let mut current = String::new();
+    let mut current_width = 0usize;
     for grapheme in text.graphemes(true) {
-        let mut candidate = current.clone();
-        candidate.push_str(grapheme);
-        if text_display_width(candidate.as_str()) > max_width && !current.is_empty() {
+        let grapheme_width = text_display_width(grapheme);
+        if current_width > 0 && current_width.saturating_add(grapheme_width) > max_width {
             out.push(current);
             current = String::new();
+            current_width = 0;
         }
         current.push_str(grapheme);
+        current_width = current_width.saturating_add(grapheme_width);
     }
     if !current.is_empty() {
         out.push(current);
@@ -12963,6 +12984,23 @@ fn wrap_text_by_display_width(text: &str, max_width: usize) -> Vec<String> {
         out.push(String::new());
     }
     out
+}
+
+fn wrapped_line_count_by_display_width(text: &str, max_width: usize) -> usize {
+    if max_width == 0 || text.is_empty() {
+        return 1;
+    }
+    let mut line_count = 1usize;
+    let mut current_width = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = text_display_width(grapheme);
+        if current_width > 0 && current_width.saturating_add(grapheme_width) > max_width {
+            line_count = line_count.saturating_add(1);
+            current_width = 0;
+        }
+        current_width = current_width.saturating_add(grapheme_width);
+    }
+    line_count.max(1)
 }
 
 fn display_width_between(text: &str, from_char: usize, to_char: usize) -> usize {
@@ -15366,12 +15404,15 @@ model = "test-model"
     #[test]
     fn tool_result_modal_scroll_max_counts_empty_separator_lines() {
         let layout = compute_layout(Rect::new(0, 0, 120, 18));
-        let modal = ToolResultModalState {
+        let mut modal = ToolResultModalState {
             message_index: 0,
-            lines: std::iter::repeat_n(String::new(), 24).collect::<Vec<_>>(),
+            content: std::iter::repeat_n(String::new(), 24)
+                .collect::<Vec<_>>()
+                .join("\n"),
             scroll: 0,
+            wrap_cache: None,
         };
-        let max_scroll = tool_result_modal_scroll_max(&modal, layout);
+        let max_scroll = tool_result_modal_scroll_max(&mut modal, layout);
         assert!(max_scroll > 0);
     }
 
@@ -15410,7 +15451,7 @@ model = "test-model"
             .pending_tool_result_modal
             .as_ref()
             .expect("tool result modal should be opened");
-        let content = modal.lines.join("\n");
+        let content = modal.content.clone();
         assert!(content.contains(ui_text_message_tool_result_meta_output()));
         assert!(content.contains("Sun Mar 15 12:00:00"));
     }
