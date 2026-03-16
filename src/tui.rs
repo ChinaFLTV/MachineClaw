@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashSet, VecDeque},
@@ -38,7 +40,8 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use toml_edit::{DocumentMut, Item, Table as TomlTable, Value};
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
@@ -75,6 +78,7 @@ const CONVERSATION_TAIL_PADDING_LINES: usize = 1;
 const THREAD_DOUBLE_CLICK_WINDOW_MS: u128 = 320;
 const STARTUP_SPLASH_MIN_DURATION_MS: u64 = 280;
 const STARTUP_SPLASH_FRAME_INTERVAL_MS: u64 = 56;
+const STARTUP_SPLASH_EVENT_POLL_MS: u64 = 8;
 const STREAM_RENDER_BATCH_CHARS: usize = 24;
 const THINKING_STREAM_PERSIST_INTERVAL_MS: u64 = 500;
 const TOOL_RESULT_MODAL_MAX_RESULT_CHARS: usize = 120_000;
@@ -82,6 +86,8 @@ const MCP_TOOL_RESULT_CONTENT_MAX_CHARS: usize = 120_000;
 const SESSION_AUTO_TITLE_MAX_UNITS: usize = 15;
 const SESSION_AUTO_TITLE_SOURCE_MAX_CHARS: usize = 1200;
 const TASK_BOARD_MAX_ITEMS: usize = 6;
+#[cfg(all(unix, not(target_os = "macos")))]
+const OSC52_MAX_COPY_BYTES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiRole {
@@ -190,6 +196,7 @@ struct ConversationHoverButtons {
 enum ChatInputActionKind {
     ModeToggle,
     TrackingToggle,
+    ClearInput,
     JumpToLatest,
 }
 
@@ -1532,8 +1539,8 @@ fn run_loop(
                 }
             }
             Event::Mouse(mouse) => handle_mouse_event(mouse, terminal, services, state)?,
-            Event::Resize(_, _) => {
-                handle_tui_resize_redraw(terminal, services, state)?;
+            Event::Resize(width, height) => {
+                handle_tui_resize_redraw(terminal, services, state, Some((width, height)))?;
             }
             _ => {}
         }
@@ -1655,6 +1662,7 @@ fn draw_once(
     services: &ActionServices<'_>,
     state: &mut ChatUiState,
 ) -> Result<(), AppError> {
+    autoresize_tui_terminal(terminal)?;
     terminal
         .draw(|frame| draw_ui(frame, services, state))
         .map_err(|err| AppError::Command(format!("failed to draw tui frame: {err}")))?;
@@ -1669,11 +1677,48 @@ fn draw_startup_splash(
     let palette = palette_by_index(theme_idx);
     let mut frame_tick = 0usize;
     while started.elapsed().as_millis() < STARTUP_SPLASH_MIN_DURATION_MS as u128 {
+        autoresize_tui_terminal(terminal)?;
         terminal
             .draw(|frame| draw_startup_splash_frame(frame, palette, frame_tick))
             .map_err(|err| AppError::Command(format!("failed to draw startup splash: {err}")))?;
         frame_tick = frame_tick.saturating_add(1);
-        thread::sleep(Duration::from_millis(STARTUP_SPLASH_FRAME_INTERVAL_MS));
+        pump_startup_splash_events(
+            terminal,
+            Duration::from_millis(STARTUP_SPLASH_FRAME_INTERVAL_MS),
+        )?;
+    }
+    Ok(())
+}
+
+fn pump_startup_splash_events(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    wait_budget: Duration,
+) -> Result<(), AppError> {
+    let started = Instant::now();
+    while started.elapsed() < wait_budget {
+        let remaining = wait_budget.saturating_sub(started.elapsed());
+        let step = remaining.min(Duration::from_millis(STARTUP_SPLASH_EVENT_POLL_MS));
+        if !event::poll(step).map_err(|err| {
+            AppError::Command(format!("failed to poll startup splash event: {err}"))
+        })? {
+            continue;
+        }
+        loop {
+            let event = event::read().map_err(|err| {
+                AppError::Command(format!("failed to read startup splash event: {err}"))
+            })?;
+            if let Event::Resize(width, height) = event {
+                let _ = resize_tui_terminal(terminal, width, height)?;
+                clear_tui_terminal(terminal)?;
+            }
+            if !event::poll(Duration::from_millis(0)).map_err(|err| {
+                AppError::Command(format!(
+                    "failed to poll startup splash pending event: {err}"
+                ))
+            })? {
+                break;
+            }
+        }
     }
     Ok(())
 }
@@ -1755,6 +1800,10 @@ fn draw_startup_splash_frame(frame: &mut Frame<'_>, palette: ThemePalette, tick:
 fn autoresize_tui_terminal(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<(), AppError> {
+    if let Some((width, height)) = preferred_terminal_size() {
+        let _ = resize_tui_terminal(terminal, width, height)?;
+        return Ok(());
+    }
     terminal
         .autoresize()
         .map_err(|err| AppError::Command(format!("failed to autoresize tui terminal: {err}")))
@@ -1770,17 +1819,102 @@ fn handle_tui_resize_redraw(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     services: &ActionServices<'_>,
     state: &mut ChatUiState,
+    resize_hint: Option<(u16, u16)>,
 ) -> Result<(), AppError> {
-    autoresize_tui_terminal(terminal)?;
+    if let Some((width, height)) = resize_hint {
+        let _ = resize_tui_terminal(terminal, width, height)?;
+    } else {
+        autoresize_tui_terminal(terminal)?;
+    }
     clear_tui_terminal(terminal)?;
     draw_once(terminal, services, state)
 }
 
 fn handle_tui_resize_only(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    resize_hint: Option<(u16, u16)>,
 ) -> Result<(), AppError> {
-    autoresize_tui_terminal(terminal)?;
+    if let Some((width, height)) = resize_hint {
+        let _ = resize_tui_terminal(terminal, width, height)?;
+    } else {
+        autoresize_tui_terminal(terminal)?;
+    }
     clear_tui_terminal(terminal)
+}
+
+fn resize_tui_terminal(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    width: u16,
+    height: u16,
+) -> Result<bool, AppError> {
+    let next_width = width.max(1);
+    let next_height = height.max(1);
+    let current = terminal.size().map_err(|err| {
+        AppError::Command(format!("failed to query current tui terminal size: {err}"))
+    })?;
+    if current.width == next_width && current.height == next_height {
+        return Ok(false);
+    }
+    terminal
+        .resize(Rect::new(0, 0, next_width, next_height))
+        .map_err(|err| {
+            AppError::Command(format!(
+                "failed to resize tui terminal to {}x{}: {err}",
+                next_width, next_height
+            ))
+        })?;
+    Ok(true)
+}
+
+fn preferred_terminal_size() -> Option<(u16, u16)> {
+    #[cfg(unix)]
+    {
+        if let Some(size) = preferred_terminal_size_unix() {
+            return Some(size);
+        }
+    }
+    crossterm::terminal::size()
+        .ok()
+        .and_then(|(width, height)| sanitize_terminal_size(width, height))
+}
+
+#[cfg(unix)]
+fn preferred_terminal_size_unix() -> Option<(u16, u16)> {
+    let stdio_candidates = [libc::STDOUT_FILENO, libc::STDERR_FILENO, libc::STDIN_FILENO];
+    for fd in stdio_candidates {
+        if let Some(size) = terminal_size_by_ioctl(fd) {
+            return Some(size);
+        }
+    }
+    if let Ok(tty) = fs::File::open("/dev/tty")
+        && let Some(size) = terminal_size_by_ioctl(tty.as_raw_fd())
+    {
+        return Some(size);
+    }
+    None
+}
+
+#[cfg(unix)]
+fn terminal_size_by_ioctl(fd: libc::c_int) -> Option<(u16, u16)> {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `size` is a valid writable winsize buffer and `fd` is passed through from OS handles.
+    let result = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ.into(), &mut size) };
+    if result != 0 {
+        return None;
+    }
+    sanitize_terminal_size(size.ws_col, size.ws_row)
+}
+
+fn sanitize_terminal_size(width: u16, height: u16) -> Option<(u16, u16)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((width, height))
 }
 
 fn spawn_ai_connectivity_check_worker(ai: crate::ai::AiClient) -> AiConnectivityCheckHandle {
@@ -3043,6 +3177,10 @@ fn handle_mouse_event(
                                     state.follow_tail = false;
                                     state.status = ui_text_message_tracking_disabled().to_string();
                                 }
+                            }
+                            ChatInputActionKind::ClearInput => {
+                                state.input.clear();
+                                state.status = ui_text_chat_input_cleared().to_string();
                             }
                             ChatInputActionKind::JumpToLatest => {
                                 state.jump_to_latest(layout.conversation_body.height.max(1), false);
@@ -4506,8 +4644,8 @@ fn wait_chat_worker_result(
                 redraw_after_input = true;
                 handle_pending_ai_mouse_event(mouse, terminal, services, state)?
             }
-            Event::Resize(_, _) => {
-                handle_tui_resize_redraw(terminal, services, state)?;
+            Event::Resize(width, height) => {
+                handle_tui_resize_redraw(terminal, services, state, Some((width, height)))?;
                 last_idle_draw = Instant::now();
             }
             _ => {}
@@ -4612,7 +4750,9 @@ fn pump_pending_ai_input_events(
                     handle_pending_ai_key_event(key, terminal, services, state, cancel_requested)?;
             }
             Event::Mouse(mouse) => handle_pending_ai_mouse_event(mouse, terminal, services, state)?,
-            Event::Resize(_, _) => handle_tui_resize_redraw(terminal, services, state)?,
+            Event::Resize(width, height) => {
+                handle_tui_resize_redraw(terminal, services, state, Some((width, height)))?
+            }
             _ => {}
         }
         if cancel_requested.load(Ordering::SeqCst) {
@@ -5076,22 +5216,25 @@ fn execute_tool_call_tui(
 ) -> String {
     if tool_call.name != "run_shell_command" {
         if builtin_tools::is_builtin_tool(&tool_call.name) {
+            let silent_tool = builtin_tools::is_silent_tool(&tool_call.name);
             let command_preview =
                 extract_tool_command_preview(tool_call.name.as_str(), tool_call.arguments.as_str());
-            state.push(
-                UiRole::Tool,
-                format!(
-                    "{}: {} [{}]\n{}",
-                    ui_text_tool_running(),
-                    tool_call.name,
-                    "builtin",
-                    if command_preview.is_empty() {
-                        trim_tool_text(tool_call.arguments.as_str(), 280)
-                    } else {
-                        command_preview.clone()
-                    }
-                ),
-            );
+            if !silent_tool {
+                state.push(
+                    UiRole::Tool,
+                    format!(
+                        "{}: {} [{}]\n{}",
+                        ui_text_tool_running(),
+                        tool_call.name,
+                        "builtin",
+                        if command_preview.is_empty() {
+                            trim_tool_text(tool_call.arguments.as_str(), 280)
+                        } else {
+                            command_preview.clone()
+                        }
+                    ),
+                );
+            }
             let started = Instant::now();
             let raw_payload = match builtin_tools::execute_tool(
                 &tool_call.name,
@@ -5099,15 +5242,17 @@ fn execute_tool_call_tui(
                 &services.cfg.ai.tools.builtin,
             ) {
                 Ok(text) => {
-                    state.push(
-                        UiRole::Tool,
-                        format!(
-                            "{}: {} [{}]",
-                            ui_text_tool_finished(),
-                            tool_call.name,
-                            "builtin"
-                        ),
-                    );
+                    if !silent_tool {
+                        state.push(
+                            UiRole::Tool,
+                            format!(
+                                "{}: {} [{}]",
+                                ui_text_tool_finished(),
+                                tool_call.name,
+                                "builtin"
+                            ),
+                        );
+                    }
                     text
                 }
                 Err(err) => json!({
@@ -5120,41 +5265,43 @@ fn execute_tool_call_tui(
             };
             let payload =
                 maybe_persist_task_payload_in_tui(services, state, tool_call, raw_payload.as_str());
-            if payload.contains("\"ok\":false") {
+            if !silent_tool && payload.contains("\"ok\":false") {
                 state.push(
                     UiRole::Tool,
                     format!("{}: {}", ui_text_tool_error(), tool_call.name),
                 );
             }
             let duration_ms = started.elapsed().as_millis();
-            let tool_meta = build_tool_execution_meta(
-                services,
-                ToolExecutionMetaInput {
-                    tool_call_id: tool_call.id.as_str(),
-                    function_name: tool_call.name.as_str(),
-                    command: command_preview.as_str(),
-                    arguments: tool_call.arguments.as_str(),
-                    result_payload: payload.as_str(),
-                    mode: "builtin",
-                    label: tool_call.name.as_str(),
-                    exit_code: None,
-                    duration_ms,
-                    timed_out: false,
-                    interrupted: false,
-                    blocked: false,
-                },
-            );
-            persist_tool_call_record(
-                services,
-                state,
-                group_id,
-                tool_call,
-                &tool_call.arguments,
-                payload.as_str(),
-                tool_meta.clone(),
-            );
-            attach_tool_meta_to_last_tool_message(state, &tool_meta);
-            attach_tool_meta_to_recent_running_tool_message(state, &tool_meta);
+            if !silent_tool {
+                let tool_meta = build_tool_execution_meta(
+                    services,
+                    ToolExecutionMetaInput {
+                        tool_call_id: tool_call.id.as_str(),
+                        function_name: tool_call.name.as_str(),
+                        command: command_preview.as_str(),
+                        arguments: tool_call.arguments.as_str(),
+                        result_payload: payload.as_str(),
+                        mode: "builtin",
+                        label: tool_call.name.as_str(),
+                        exit_code: None,
+                        duration_ms,
+                        timed_out: false,
+                        interrupted: false,
+                        blocked: false,
+                    },
+                );
+                persist_tool_call_record(
+                    services,
+                    state,
+                    group_id,
+                    tool_call,
+                    &tool_call.arguments,
+                    payload.as_str(),
+                    tool_meta.clone(),
+                );
+                attach_tool_meta_to_last_tool_message(state, &tool_meta);
+                attach_tool_meta_to_recent_running_tool_message(state, &tool_meta);
+            }
             return payload;
         }
         if services.mcp.has_ai_tool(&tool_call.name) {
@@ -5598,6 +5745,7 @@ fn prompt_write_confirmation_in_tui(
     }
     let mut selected = 0usize;
     loop {
+        autoresize_tui_terminal(terminal)?;
         terminal
             .draw(|frame| {
                 draw_ui(frame, services, state);
@@ -5628,8 +5776,8 @@ fn prompt_write_confirmation_in_tui(
                 }
                 _ => {}
             },
-            Event::Resize(_, _) => {
-                handle_tui_resize_only(terminal)?;
+            Event::Resize(width, height) => {
+                handle_tui_resize_only(terminal, Some((width, height)))?;
             }
             _ => {}
         }
@@ -5648,6 +5796,7 @@ fn prompt_edit_command_in_tui(
         view_char_offset: 0,
     };
     loop {
+        autoresize_tui_terminal(terminal)?;
         terminal
             .draw(|frame| {
                 draw_ui(frame, services, state);
@@ -5678,8 +5827,8 @@ fn prompt_edit_command_in_tui(
                 }
                 _ => {}
             },
-            Event::Resize(_, _) => {
-                handle_tui_resize_only(terminal)?;
+            Event::Resize(width, height) => {
+                handle_tui_resize_only(terminal, Some((width, height)))?;
             }
             _ => {}
         }
@@ -7813,6 +7962,14 @@ fn chat_input_action_buttons(
         button_area.y,
         max_x,
     );
+    append_chat_input_action_button(
+        &mut buttons,
+        ChatInputActionKind::ClearInput,
+        format!("[ {} ]", ui_text_chat_input_clear()),
+        &mut cursor_x,
+        button_area.y,
+        max_x,
+    );
     if !conversation_is_at_bottom(state, layout.conversation_body.height.max(1)) {
         append_chat_input_action_button(
             &mut buttons,
@@ -8393,9 +8550,13 @@ fn draw_input_panel(
         );
         return;
     }
-    let (visible, cursor_col) = project_input_view(&state.input, content_area.width as usize);
+    let projected = project_chat_input_view(
+        &state.input,
+        content_area.width as usize,
+        content_area.height as usize,
+    );
     frame.render_widget(
-        Paragraph::new(visible).style(Style::default().fg(palette.text)),
+        Paragraph::new(projected.visible).style(Style::default().fg(palette.text)),
         content_area,
     );
     if let Some(button_area) = button_area {
@@ -8419,6 +8580,10 @@ fn draw_input_panel(
                             .add_modifier(Modifier::BOLD)
                     }
                 }
+                ChatInputActionKind::ClearInput => Style::default()
+                    .fg(palette.panel_bg)
+                    .bg(Color::Rgb(255, 174, 102))
+                    .add_modifier(Modifier::BOLD),
                 ChatInputActionKind::JumpToLatest => Style::default()
                     .fg(palette.panel_bg)
                     .bg(Color::Rgb(255, 200, 120))
@@ -8427,8 +8592,11 @@ fn draw_input_panel(
             frame.render_widget(Paragraph::new(button.label).style(style), button.rect);
         }
     }
-    if state.focus == FocusPanel::Input {
-        frame.set_cursor_position((content_area.x + cursor_col as u16, content_area.y));
+    if state.focus == FocusPanel::Input && content_area.width > 0 && content_area.height > 0 {
+        frame.set_cursor_position((
+            content_area.x + projected.cursor_col as u16,
+            content_area.y + projected.cursor_row as u16,
+        ));
     }
 }
 
@@ -9364,6 +9532,75 @@ fn read_skill_summary_for_panel(skill_dir: &Path) -> Option<String> {
         }
     }
     None
+}
+
+struct InputViewProjection {
+    visible: String,
+    cursor_col: usize,
+    cursor_row: usize,
+}
+
+fn project_chat_input_view(
+    input: &InputBuffer,
+    max_width: usize,
+    max_height: usize,
+) -> InputViewProjection {
+    if max_width == 0 || max_height == 0 {
+        return InputViewProjection {
+            visible: String::new(),
+            cursor_col: 0,
+            cursor_row: 0,
+        };
+    }
+    let mut lines = vec![String::new()];
+    let mut widths = vec![0usize];
+    let mut cursor_row = 0usize;
+    let mut cursor_col = 0usize;
+    let mut cursor_marked = false;
+    let mut consumed_chars = 0usize;
+    for grapheme in input.text.graphemes(true) {
+        if !cursor_marked && input.cursor_char <= consumed_chars {
+            cursor_row = lines.len().saturating_sub(1);
+            cursor_col = *widths.last().unwrap_or(&0);
+            cursor_marked = true;
+        }
+        if grapheme == "\n" {
+            lines.push(String::new());
+            widths.push(0);
+            consumed_chars = consumed_chars.saturating_add(1);
+            continue;
+        }
+        let current_row = lines.len().saturating_sub(1);
+        let mut candidate = lines[current_row].clone();
+        candidate.push_str(grapheme);
+        let candidate_width = text_display_width(candidate.as_str());
+        if candidate_width > max_width && !lines[current_row].is_empty() {
+            lines.push(String::new());
+            widths.push(0);
+        }
+        let row = lines.len().saturating_sub(1);
+        lines[row].push_str(grapheme);
+        widths[row] = text_display_width(lines[row].as_str()).min(max_width);
+        consumed_chars = consumed_chars.saturating_add(grapheme.chars().count());
+    }
+    if !cursor_marked {
+        cursor_row = lines.len().saturating_sub(1);
+        cursor_col = *widths.last().unwrap_or(&0);
+    }
+    cursor_col = cursor_col.min(max_width.saturating_sub(1));
+    let mut start_row = 0usize;
+    if cursor_row >= max_height {
+        start_row = cursor_row + 1 - max_height;
+    }
+    if start_row >= lines.len() {
+        start_row = lines.len().saturating_sub(1);
+    }
+    let end_row = (start_row + max_height).min(lines.len());
+    InputViewProjection {
+        visible: lines[start_row..end_row].join("\n"),
+        cursor_col,
+        cursor_row: cursor_row.saturating_sub(start_row),
+    }
 }
 
 fn project_input_view(input: &InputBuffer, max_width: usize) -> (String, usize) {
@@ -11861,6 +12098,15 @@ fn copy_text_to_clipboard(text: &str) -> Result<(), AppError> {
                 }
             }
         }
+        if let Err(err) = copy_text_to_clipboard_via_osc52(text) {
+            if last_err.is_empty() {
+                last_err = err.to_string();
+            } else {
+                last_err = format!("{last_err}; {}", err);
+            }
+        } else {
+            return Ok(());
+        }
         return Err(AppError::Command(format!(
             "failed to copy text to clipboard: {last_err}"
         )));
@@ -11869,6 +12115,84 @@ fn copy_text_to_clipboard(text: &str) -> Result<(), AppError> {
     Err(AppError::Command(
         "clipboard copy is not supported on this platform".to_string(),
     ))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn copy_text_to_clipboard_via_osc52(text: &str) -> Result<(), AppError> {
+    if !io::stdout().is_terminal() {
+        return Err(AppError::Command(
+            "OSC52 fallback requires an interactive terminal".to_string(),
+        ));
+    }
+    let raw = text.as_bytes();
+    if raw.len() > OSC52_MAX_COPY_BYTES {
+        return Err(AppError::Command(format!(
+            "OSC52 fallback payload too large: {} bytes (max {OSC52_MAX_COPY_BYTES})",
+            raw.len()
+        )));
+    }
+    let encoded = encode_base64(raw);
+    let sequence = build_osc52_sequence_for_current_terminal(encoded.as_str());
+    io::stdout().write_all(sequence.as_bytes()).map_err(|err| {
+        AppError::Command(format!("failed to write OSC52 clipboard sequence: {err}"))
+    })?;
+    io::stdout().flush().map_err(|err| {
+        AppError::Command(format!("failed to flush OSC52 clipboard sequence: {err}"))
+    })
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn build_osc52_sequence_for_current_terminal(encoded: &str) -> String {
+    let tmux = env::var_os("TMUX").is_some();
+    let term = env::var("TERM").ok();
+    build_osc52_sequence(encoded, tmux, term.as_deref())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn build_osc52_sequence(encoded: &str, tmux: bool, term: Option<&str>) -> String {
+    let base = format!("\u{1b}]52;c;{encoded}\u{07}");
+    if tmux {
+        let escaped = base.replace('\u{1b}', "\u{1b}\u{1b}");
+        return format!("\u{1b}Ptmux;{escaped}\u{1b}\\");
+    }
+    if term.is_some_and(|value| value.starts_with("screen")) {
+        return format!("\u{1b}P{base}\u{1b}\\");
+    }
+    base
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn encode_base64(raw: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if raw.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(raw.len().div_ceil(3) * 4);
+    let mut idx = 0usize;
+    while idx + 3 <= raw.len() {
+        let chunk =
+            ((raw[idx] as u32) << 16) | ((raw[idx + 1] as u32) << 8) | (raw[idx + 2] as u32);
+        out.push(TABLE[((chunk >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((chunk >> 12) & 0x3F) as usize] as char);
+        out.push(TABLE[((chunk >> 6) & 0x3F) as usize] as char);
+        out.push(TABLE[(chunk & 0x3F) as usize] as char);
+        idx += 3;
+    }
+    let remain = raw.len().saturating_sub(idx);
+    if remain == 1 {
+        let chunk = (raw[idx] as u32) << 16;
+        out.push(TABLE[((chunk >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((chunk >> 12) & 0x3F) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if remain == 2 {
+        let chunk = ((raw[idx] as u32) << 16) | ((raw[idx + 1] as u32) << 8);
+        out.push(TABLE[((chunk >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((chunk >> 12) & 0x3F) as usize] as char);
+        out.push(TABLE[((chunk >> 6) & 0x3F) as usize] as char);
+        out.push('=');
+    }
+    out
 }
 
 fn run_clipboard_command(program: &str, args: &[&str], input: &str) -> Result<(), AppError> {
@@ -12368,45 +12692,7 @@ fn char_to_byte_idx(text: &str, char_idx: usize) -> usize {
 }
 
 fn text_display_width(text: &str) -> usize {
-    text.chars().map(char_display_width).sum::<usize>()
-}
-
-fn char_display_width(ch: char) -> usize {
-    if ch == '\n' || ch == '\r' || is_zero_width_char(ch) {
-        return 0;
-    }
-    if is_emoji_char(ch) {
-        return 1;
-    }
-    UnicodeWidthChar::width(ch).unwrap_or(1)
-}
-
-fn is_zero_width_char(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x200C
-            | 0x200D
-            | 0x0300..=0x036F
-            | 0x1AB0..=0x1AFF
-            | 0x1DC0..=0x1DFF
-            | 0x20D0..=0x20FF
-            | 0xFE20..=0xFE2F
-            | 0xFE00..=0xFE0F
-            | 0x1F3FB..=0x1F3FF
-            | 0xE0100..=0xE01EF
-            | 0xE0020..=0xE007F
-    )
-}
-
-fn is_emoji_char(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x1F000..=0x1FAFF
-            | 0x2600..=0x26FF
-            | 0x2700..=0x27BF
-            | 0x2B50
-            | 0x2B55
-    )
+    UnicodeWidthStr::width(text)
 }
 
 fn normalize_conversation_line(text: &str) -> String {
@@ -12661,26 +12947,14 @@ fn wrap_text_by_display_width(text: &str, max_width: usize) -> Vec<String> {
     }
     let mut out = Vec::<String>::new();
     let mut current = String::new();
-    let mut current_width = 0usize;
-    for ch in text.chars() {
-        let ch_width = char_display_width(ch);
-        if ch_width == 0 {
-            current.push(ch);
-            continue;
+    for grapheme in text.graphemes(true) {
+        let mut candidate = current.clone();
+        candidate.push_str(grapheme);
+        if text_display_width(candidate.as_str()) > max_width && !current.is_empty() {
+            out.push(current);
+            current = String::new();
         }
-        if current_width + ch_width > max_width {
-            if !current.is_empty() {
-                out.push(current);
-                current = String::new();
-                current_width = 0;
-            }
-            if ch_width > max_width {
-                out.push(ch.to_string());
-                continue;
-            }
-        }
-        current.push(ch);
-        current_width += ch_width;
+        current.push_str(grapheme);
     }
     if !current.is_empty() {
         out.push(current);
@@ -13145,6 +13419,12 @@ fn ui_text_jump_to_latest() -> &'static str {
 }
 fn ui_text_jump_to_latest_done() -> &'static str {
     zh_or_en("已定位到最新消息", "Moved to latest messages")
+}
+fn ui_text_chat_input_clear() -> &'static str {
+    zh_or_en("清空输入", "Clear input")
+}
+fn ui_text_chat_input_cleared() -> &'static str {
+    zh_or_en("输入框已清空", "Input cleared")
 }
 fn ui_text_clear_button() -> &'static str {
     zh_or_en("清空", "Clear")
@@ -13747,6 +14027,18 @@ model = "test-model"
     }
 
     #[test]
+    fn chat_input_buttons_include_clear_input() {
+        let state = new_state();
+        let layout = compute_layout(Rect::new(0, 0, 160, 42));
+        let buttons = chat_input_action_buttons(&state, layout, mode_button_area(layout));
+        assert!(
+            buttons
+                .iter()
+                .any(|item| item.kind == ChatInputActionKind::ClearInput)
+        );
+    }
+
+    #[test]
     fn jump_to_latest_button_appears_when_not_at_bottom() {
         let mut state = new_state();
         state.set_conversation_wrap_width(60);
@@ -14194,13 +14486,20 @@ model = "test-model"
     #[test]
     fn display_width_treats_variation_selector_as_zero_width() {
         assert_eq!(text_display_width("🔍"), text_display_width("🔍\u{fe0f}"));
-        assert_eq!(text_display_width("✈"), text_display_width("✈\u{fe0f}"));
+        assert_eq!(text_display_width("A"), text_display_width("A\u{fe0f}"));
+        assert!(text_display_width("✈\u{fe0f}") >= text_display_width("✈"));
     }
 
     #[test]
-    fn display_width_treats_single_emoji_as_one_cell() {
-        assert_eq!(text_display_width("😘"), 1);
-        assert_eq!(text_display_width("😊"), 1);
+    fn display_width_aligns_with_unicode_width_for_emoji() {
+        assert_eq!(
+            text_display_width("😘"),
+            unicode_width::UnicodeWidthChar::width('😘').unwrap_or(1)
+        );
+        assert_eq!(
+            text_display_width("😊"),
+            unicode_width::UnicodeWidthChar::width('😊').unwrap_or(1)
+        );
     }
 
     #[test]
@@ -14257,6 +14556,75 @@ model = "test-model"
     fn wrap_text_by_display_width_no_leading_empty_line_when_first_char_exceeds_limit() {
         let wrapped = wrap_text_by_display_width("🔍", 1);
         assert_eq!(wrapped, vec!["🔍".to_string()]);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn base64_encoder_outputs_expected_payload() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn osc52_sequence_wraps_for_tmux() {
+        let seq = build_osc52_sequence("Zm9v", true, Some("xterm-256color"));
+        assert!(seq.starts_with("\u{1b}Ptmux;"));
+        assert!(seq.contains("]52;c;Zm9v\u{07}"));
+        assert!(seq.ends_with("\u{1b}\\"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn osc52_sequence_wraps_for_screen() {
+        let seq = build_osc52_sequence("Zm9v", false, Some("screen-256color"));
+        assert_eq!(seq, "\u{1b}P\u{1b}]52;c;Zm9v\u{07}\u{1b}\\");
+    }
+
+    #[test]
+    fn chat_input_projection_wraps_long_text_across_multiple_rows() {
+        let mut input = InputBuffer::new();
+        input.text = "abcdefghij".to_string();
+        input.cursor_char = input.char_count();
+        let projected = project_chat_input_view(&input, 4, 2);
+        assert_eq!(projected.visible, "efgh\nij");
+        assert_eq!(projected.cursor_row, 1);
+        assert_eq!(projected.cursor_col, 2);
+    }
+
+    #[test]
+    fn chat_input_projection_keeps_cursor_row_for_explicit_newline() {
+        let mut input = InputBuffer::new();
+        input.text = "ab\ncd".to_string();
+        input.cursor_char = 3;
+        let projected = project_chat_input_view(&input, 4, 3);
+        assert_eq!(projected.visible, "ab\ncd");
+        assert_eq!(projected.cursor_row, 1);
+        assert_eq!(projected.cursor_col, 0);
+    }
+
+    #[test]
+    fn chat_input_projection_wraps_when_emoji_consumes_terminal_width() {
+        let mut input = InputBuffer::new();
+        input.text = "a🤔b".to_string();
+        input.cursor_char = input.char_count();
+        let projected = project_chat_input_view(&input, 3, 2);
+        assert_eq!(projected.visible, "a🤔\nb");
+        assert_eq!(projected.cursor_row, 1);
+        assert_eq!(projected.cursor_col, 1);
+    }
+
+    #[test]
+    fn wrap_text_by_display_width_keeps_zwj_emoji_cluster_intact() {
+        let wrapped = wrap_text_by_display_width("a👨‍👩‍👧‍👦b", 3);
+        assert!(wrapped.iter().any(|line| line.contains("👨‍👩‍👧‍👦")));
+        assert!(
+            !wrapped
+                .iter()
+                .any(|line| line.contains("👨‍") && !line.contains("👨‍👩‍👧‍👦"))
+        );
     }
 
     #[test]

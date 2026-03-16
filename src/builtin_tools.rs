@@ -213,18 +213,6 @@ pub fn external_tool_definitions(cfg: &BuiltinToolsConfig) -> Vec<ExternalToolDe
             }),
         },
         ExternalToolDefinition {
-            name: "Think".to_string(),
-            description: "Record intermediate reasoning in a concise textual form.".to_string(),
-            parameters: json!({
-                "type":"object",
-                "properties":{
-                    "thought":{"type":"string"}
-                },
-                "required":["thought"],
-                "additionalProperties": false
-            }),
-        },
-        ExternalToolDefinition {
             name: "Task".to_string(),
             description: "Plan a sub-task with objective and acceptance criteria.".to_string(),
             parameters: json!({
@@ -328,6 +316,10 @@ pub fn tool_names(cfg: &BuiltinToolsConfig) -> Vec<String> {
 
 pub fn is_builtin_tool(name: &str) -> bool {
     parse_tool_kind(name).is_some()
+}
+
+pub fn is_silent_tool(name: &str) -> bool {
+    matches!(parse_tool_kind(name), Some(BuiltinToolKind::Think))
 }
 
 pub fn execute_tool(
@@ -1298,8 +1290,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        execute_grep_search, execute_list_files, execute_tool, parse_duckduckgo_html_results,
-        read_file_with_limit, resolve_user_path,
+        execute_grep_search, execute_list_files, execute_tool, external_tool_definitions,
+        is_silent_tool, parse_duckduckgo_html_results, read_file_with_limit, resolve_user_path,
     };
     use crate::config::BuiltinToolsConfig;
 
@@ -1497,6 +1489,23 @@ mod tests {
             item.get("snippet").and_then(|v| v.as_str()),
             Some("This is snippet.")
         );
+    }
+
+    #[test]
+    fn external_tool_catalog_excludes_think_tool() {
+        let cfg = BuiltinToolsConfig::default();
+        let names = external_tool_definitions(&cfg)
+            .into_iter()
+            .map(|item| item.name)
+            .collect::<Vec<_>>();
+        assert!(!names.iter().any(|item| item.eq_ignore_ascii_case("think")));
+    }
+
+    #[test]
+    fn think_tool_is_silent_for_compatibility_calls() {
+        assert!(is_silent_tool("Think"));
+        assert!(is_silent_tool("think"));
+        assert!(!is_silent_tool("Task"));
     }
 
     #[test]

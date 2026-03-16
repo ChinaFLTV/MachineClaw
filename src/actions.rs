@@ -989,6 +989,7 @@ fn execute_tool_call(
 ) -> String {
     if tool_call.name != "run_shell_command" {
         if builtin_tools::is_builtin_tool(&tool_call.name) {
+            let silent_tool = builtin_tools::is_silent_tool(&tool_call.name);
             stats.tool_calls += 1;
             let started = Instant::now();
             let raw_payload = match builtin_tools::execute_tool(
@@ -1014,17 +1015,19 @@ fn execute_tool_call(
             };
             let payload =
                 maybe_persist_task_payload(services, tool_call, raw_payload.as_str(), group_id);
-            services.session.add_tool_message(
-                format!(
-                    "tool_call_id={} function={} args={} result={}",
-                    tool_call.id,
-                    tool_call.name,
-                    trim_tool_argument_preview(&tool_call.arguments),
-                    trim_text(&payload, 2400)
-                ),
-                Some(group_id.to_string()),
-            );
-            let _ = services.session.persist();
+            if !silent_tool {
+                services.session.add_tool_message(
+                    format!(
+                        "tool_call_id={} function={} args={} result={}",
+                        tool_call.id,
+                        tool_call.name,
+                        trim_tool_argument_preview(&tool_call.arguments),
+                        trim_text(&payload, 2400)
+                    ),
+                    Some(group_id.to_string()),
+                );
+                let _ = services.session.persist();
+            }
             return payload;
         }
         if services.mcp.has_ai_tool(&tool_call.name) {

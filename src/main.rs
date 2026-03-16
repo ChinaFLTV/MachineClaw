@@ -19,6 +19,7 @@ mod task_store;
 mod test_action;
 mod tls;
 mod tui;
+mod upgrade;
 
 use std::{
     io::{self, IsTerminal, Write},
@@ -56,6 +57,7 @@ use crate::{
         build_snapshot_binary, load_effective_config, render_show_config, render_snapshot_result,
     },
     test_action::run_test_command,
+    upgrade::{UpgradeCommandOptions, run_upgrade_command},
 };
 
 fn main() {
@@ -85,10 +87,14 @@ fn run() -> Result<ExitCode, AppError> {
         set_language(resolve_language(Some(&language_hint)));
     }
     if let Some(topic) = cli::detect_help_topic(&raw_args) {
-        println!(
-            "{}",
-            render::render_markdown_for_terminal(&cli::localized_help(topic), startup_colorful)
-        );
+        let help_markdown = cli::prettify_help_markdown(&cli::localized_help(topic));
+        let help_colorful = render::resolve_colorful_enabled(true);
+        let rendered = if io::stdout().is_terminal() {
+            cli::render_help_panel(&help_markdown, help_colorful)
+        } else {
+            render::render_markdown_for_terminal(&help_markdown, false)
+        };
+        println!("{rendered}");
         return Ok(ExitCode::Success);
     }
 
@@ -119,6 +125,28 @@ fn run() -> Result<ExitCode, AppError> {
         );
         return Ok(ExitCode::Success);
     };
+    if let Commands::Upgrade {
+        check_only,
+        output,
+        allow_prerelease,
+    } = &command
+    {
+        let assets_setup = render::locate_or_init_assets_dir()?;
+        for notice in assets_setup.notices {
+            println!("{}", render::render_info_line(&notice, startup_colorful));
+        }
+        let outcome = run_upgrade_command(
+            &assets_setup.path,
+            startup_colorful,
+            UpgradeCommandOptions {
+                check_only: *check_only,
+                output: output.clone(),
+                allow_prerelease: *allow_prerelease,
+            },
+        )?;
+        println!("{}", outcome.rendered);
+        return Ok(outcome.exit_code);
+    }
     let config_path = resolve_config_path(cli.conf.clone())?;
     if let Some(language_hint) = read_language_hint(&config_path) {
         set_language(resolve_language(Some(&language_hint)));
@@ -315,6 +343,11 @@ fn run() -> Result<ExitCode, AppError> {
         Commands::Snapshot { .. } => {
             return Err(AppError::Runtime(
                 "snapshot command should be handled before runtime actions".to_string(),
+            ));
+        }
+        Commands::Upgrade { .. } => {
+            return Err(AppError::Runtime(
+                "upgrade command should be handled before runtime actions".to_string(),
             ));
         }
         Commands::ShowConfig => {

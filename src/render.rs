@@ -12,11 +12,12 @@ use crate::{error::AppError, i18n};
 const DEFAULT_SYSTEM_PROMPT: &str = "你是 MachineClaw 的系统巡检分析助手。\n\n目标：基于用户给出的关键指标与命令结果，输出可执行、可追溯、风险导向的结论。\n\n输出要求：\n1. 先给结论，再给证据。\n2. 风险等级必须明确（低/中/高）并说明触发原因。\n3. 单独列出异常命令（失败/超时/中断/拦截）及影响。\n4. 给出最多 3 条下一步建议，按优先级排序。\n5. 严禁输出敏感信息（token、cookie、密码、私钥、密钥路径等）。\n6. 文本简洁，避免空话，默认中文输出。\n";
 const DEFAULT_PREPARE_PROMPT: &str = "请基于以下数据总结本次运行前检查结果。\n\n# action\n{{action}}\n\n# target\n{{target}}\n\n# key_metrics\n{{key_metrics}}\n\n# command_details\n{{command_details}}\n\n请按以下结构输出：\n1. 结论（是否可继续执行）\n2. 关键异常与风险等级\n3. 优先处理建议（最多 3 条）\n";
 const DEFAULT_INSPECT_PROMPT: &str = "请基于以下数据总结本次状态检查结果。\n\n# action\n{{action}}\n\n# target\n{{target}}\n\n# key_metrics\n{{key_metrics}}\n\n# command_details\n{{command_details}}\n\n请按以下结构输出：\n1. 当前状态结论\n2. 关键证据与异常项\n3. 风险等级与触发原因\n4. 下一步建议（最多 3 条）\n";
-const DEFAULT_CHAT_SYSTEM_PROMPT: &str = "你是 MachineClaw 的本机交互助手，负责系统巡检、诊断、风险分析与必要的本地执行。\n\n核心原则：\n1. 先用工具拿证据，再下结论；严禁伪造结果。\n2. 工具能力平级：Builtin / Bash / Skills / MCP；禁止固定偏置。\n3. 能力路由顺序：匹配 Skill -> 匹配 MCP -> 匹配 Builtin -> Bash 回退。\n4. 本地文件检索优先使用 Builtin 工具：`View`、`LS`、`GlobTool`、`GrepTool`；非必要不要用 shell 的 `cat/head/tail/ls/find/grep`。\n5. 写操作最小化；仅在必要时执行，并明确影响、前置条件与回滚路径。\n6. 工具参数必须是严格 JSON 对象；参数错误先修参数，不要盲重试。\n7. 允许多轮工具调用，但证据足够后立即收敛，不做无意义链式调用。\n8. 任一轮已产出可展示文本时，必须保留并输出，不得被后续工具轮覆盖或丢弃。\n9. 禁止泄露敏感信息（token/cookie/password/private key/secret path 等）。\n10. MCP 失败时给可执行排障项：开关、服务状态、鉴权头、端点路径；HTTP 优先 `/mcp`。\n\n内置工具约定：\n- `View`：读取文件（支持 offset/limit）。\n- `LS`：列目录（可递归）。\n- `GlobTool`：按 glob 查找路径。\n- `GrepTool`：按 regex 检索内容。\n- `WebSearch`：查询公开网页信息。\n- `Edit` / `Replace` / `NotebookEditCell`：写入型工具，必须显式 `apply=true` 且仅在允许时使用。\n- `Think` / `Task` / `Architect`：用于中间推理、拆解与架构权衡，结果要可执行。\n\n输出规范：\n- 结构：结论 -> 关键证据 -> 风险评估 -> 下一步。\n- 简洁专业，直击要点；默认中文并跟随用户语言。\n";
+const DEFAULT_CHAT_SYSTEM_PROMPT: &str = "你是 MachineClaw 的本机交互助手，负责系统巡检、诊断、风险分析与必要的本地执行。\n\n核心原则：\n1. 先用工具拿证据，再下结论；严禁伪造结果。\n2. 工具能力平级：Builtin / Bash / Skills / MCP；禁止固定偏置。\n3. 能力路由顺序：匹配 Skill -> 匹配 MCP -> 匹配 Builtin -> Bash 回退。\n4. 本地文件检索优先使用 Builtin 工具：`View`、`LS`、`GlobTool`、`GrepTool`；非必要不要用 shell 的 `cat/head/tail/ls/find/grep`。\n5. 写操作最小化；仅在必要时执行，并明确影响、前置条件与回滚路径。\n6. 工具参数必须是严格 JSON 对象；参数错误先修参数，不要盲重试。\n7. 允许多轮工具调用，但证据足够后立即收敛，不做无意义链式调用。\n8. 任一轮已产出可展示文本时，必须保留并输出，不得被后续工具轮覆盖或丢弃。\n9. 禁止泄露敏感信息（token/cookie/password/private key/secret path 等）。\n10. MCP 失败时给可执行排障项：开关、服务状态、鉴权头、端点路径；HTTP 优先 `/mcp`。\n\n内置工具约定：\n- `View`：读取文件（支持 offset/limit）。\n- `LS`：列目录（可递归）。\n- `GlobTool`：按 glob 查找路径。\n- `GrepTool`：按 regex 检索内容。\n- `WebSearch`：查询公开网页信息。\n- `Edit` / `Replace` / `NotebookEditCell`：写入型工具，必须显式 `apply=true` 且仅在允许时使用。\n- `Task` / `Architect`：用于任务拆解与架构权衡，结果要可执行。\n\n输出规范：\n- 结构：结论 -> 关键证据 -> 风险评估 -> 下一步。\n- 简洁专业，直击要点；默认中文并跟随用户语言。\n";
 const DEFAULT_PREPARE_OUTPUT_TEMPLATE: &str = "# Preparation Report\n\nAction: {{action}}\nStatus: {{status}}\n\n## Overview\nKeyMetrics:\n{{key_metrics}}\n\n## Risks\nRiskSummary:\n{{risk_summary}}\n\n## AI Interpretation\nAISummary:\n{{ai_summary}}\n\n## Command Execution\nCommandSummary:\n{{command_summary}}\n\n## Elapsed\nElapsed: {{elapsed}}\n";
 const DEFAULT_INSPECT_OUTPUT_TEMPLATE: &str = "Action: {{action}}\nStatus: {{status}}\nKeyMetrics:\n{{key_metrics}}\nRiskSummary:\n{{risk_summary}}\nAISummary:\n{{ai_summary}}\nCommandSummary:\n{{command_summary}}\nElapsed: {{elapsed}}\n";
 const DEFAULT_CHAT_OUTPUT_TEMPLATE: &str = "Action: {{action}}\nStatus: {{status}}\nKeyMetrics:\n{{key_metrics}}\nRiskSummary:\n{{risk_summary}}\nAISummary:\n{{ai_summary}}\nCommandSummary:\n{{command_summary}}\nElapsed: {{elapsed}}\n";
 const DEFAULT_TEST_OUTPUT_TEMPLATE: &str = "# Configuration Test Report\n\nAction: {{action}}\nStatus: {{status}}\n\n## Overview\nKeyMetrics:\n{{key_metrics}}\n\n## Findings\nRiskSummary:\n{{risk_summary}}\n\n## Assessment\nAISummary:\n{{ai_summary}}\n\n## Checks\nCommandSummary:\n{{command_summary}}\n\n## Elapsed\nElapsed: {{elapsed}}\n";
+const DEFAULT_UPGRADE_OUTPUT_TEMPLATE: &str = "# 🚀 Upgrade Galaxy\n\nAction: {{action}}\nStatus: {{status}}\n\n## 🌈 Version Radar\nKeyMetrics:\n{{key_metrics}}\n\n## 🛡️ Risk Shields\nRiskSummary:\n{{risk_summary}}\n\n## 🎯 Upgrade Decision\nAISummary:\n{{ai_summary}}\n\n## 📦 Download Pipeline\nCommandSummary:\n{{command_summary}}\n\n## ⏱️ Elapsed\nElapsed: {{elapsed}}\n\n> ✨ Tip: If auto-upgrade is blocked by permissions, use the fallback path shown above for manual replacement.\n";
 
 #[derive(Debug, Clone)]
 pub struct ActionRenderData {
@@ -546,6 +547,11 @@ fn ensure_default_assets(dir: &Path) -> Result<Vec<String>, AppError> {
     ensure_file(
         &output_templates_dir.join("test.md"),
         DEFAULT_TEST_OUTPUT_TEMPLATE,
+        &mut notices,
+    )?;
+    ensure_file(
+        &output_templates_dir.join("upgrade.md"),
+        DEFAULT_UPGRADE_OUTPUT_TEMPLATE,
         &mut notices,
     )?;
 
