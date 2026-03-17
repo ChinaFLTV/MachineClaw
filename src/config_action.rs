@@ -356,7 +356,7 @@ pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
         "ai.tools.bash.deny-cmd-list" => Some("[]"),
         "ai.tools.bash.write-cmd-allow-patterns" => Some("[]"),
         "ai.tools.bash.write-cmd-deny-patterns" => Some("[]"),
-        "ai.tools.bash.command-output-max-bytes" => Some("262144"),
+        "ai.tools.bash.command-output-max-bytes" => Some("0"),
         "ai.tools.builtin.enabled" => Some("true"),
         "ai.tools.builtin.web-search-enabled" => Some("true"),
         "ai.tools.builtin.web-search-timeout-seconds" => Some("10"),

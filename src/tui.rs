@@ -81,9 +81,7 @@ const STARTUP_SPLASH_FRAME_INTERVAL_MS: u64 = 56;
 const STARTUP_SPLASH_EVENT_POLL_MS: u64 = 8;
 const STREAM_RENDER_BATCH_CHARS: usize = 24;
 const THINKING_STREAM_PERSIST_INTERVAL_MS: u64 = 500;
-const TOOL_RESULT_MODAL_MAX_RESULT_CHARS: usize = 120_000;
-const TOOL_RESULT_MODAL_PARSE_MAX_BYTES: usize = 512_000;
-const MCP_TOOL_RESULT_CONTENT_MAX_CHARS: usize = 120_000;
+const MODAL_CLOSE_SCROLL_SUPPRESS_MS: u128 = 220;
 const SESSION_AUTO_TITLE_MAX_UNITS: usize = 15;
 const SESSION_AUTO_TITLE_SOURCE_MAX_CHARS: usize = 1200;
 const TASK_BOARD_MAX_ITEMS: usize = 6;
@@ -713,6 +711,7 @@ struct ChatUiState {
     token_usage_committed: u64,
     token_live_estimate: u64,
     token_display_value: u64,
+    suppress_scroll_until_epoch_ms: u128,
     ai_connectivity_checking: bool,
     session_auto_title_workers: Vec<SessionAutoTitleHandle>,
     session_auto_title_attempted: HashSet<String>,
@@ -784,6 +783,7 @@ impl ChatUiState {
             token_usage_committed: 0,
             token_live_estimate: 0,
             token_display_value: 0,
+            suppress_scroll_until_epoch_ms: 0,
             ai_connectivity_checking: false,
             session_auto_title_workers: Vec::new(),
             session_auto_title_attempted: HashSet::new(),
@@ -886,6 +886,22 @@ impl ChatUiState {
     fn commit_token_usage(&mut self, total_tokens: u64) {
         self.token_usage_committed = self.token_usage_committed.saturating_add(total_tokens);
         self.token_live_estimate = 0;
+    }
+
+    fn restore_committed_token_usage(&mut self, committed: u64) {
+        self.token_usage_committed = committed;
+        self.token_live_estimate = 0;
+        self.token_display_value = committed;
+    }
+
+    fn suppress_mouse_scroll_after_modal_close(&mut self) {
+        self.suppress_scroll_until_epoch_ms =
+            now_epoch_ms().saturating_add(MODAL_CLOSE_SCROLL_SUPPRESS_MS);
+    }
+
+    fn should_suppress_mouse_scroll(&self) -> bool {
+        self.suppress_scroll_until_epoch_ms > 0
+            && now_epoch_ms() <= self.suppress_scroll_until_epoch_ms
     }
 
     fn tick_token_display_animation(&mut self) {
@@ -1382,6 +1398,7 @@ pub fn run_chat_tui(services: &mut ActionServices<'_>) -> Result<ActionOutcome, 
         services.cfg,
         services.config_path,
     );
+    state.restore_committed_token_usage(services.session.token_usage_committed());
     state.push(
         UiRole::System,
         format!(
@@ -2984,6 +3001,13 @@ fn handle_mouse_event(
         handle_tool_result_modal_mouse(mouse, state, layout)?;
         return Ok(());
     }
+    if matches!(
+        mouse.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) && state.should_suppress_mouse_scroll()
+    {
+        return Ok(());
+    }
     if state.pending_thread_rename.is_some() {
         handle_thread_rename_modal_mouse(mouse, services, state, layout)?;
         return Ok(());
@@ -3401,6 +3425,7 @@ fn handle_tool_result_modal_mouse(
         MouseEventKind::Down(MouseButton::Left) => {
             if !rect_contains(tool_result_modal_rect(layout), mouse.column, mouse.row) {
                 state.pending_tool_result_modal = None;
+                state.suppress_mouse_scroll_after_modal_close();
                 state.status = ui_text_message_tool_result_modal_closed().to_string();
             }
         }
@@ -3416,6 +3441,7 @@ fn handle_tool_result_modal_key(key: KeyEvent, state: &mut ChatUiState) -> Resul
     match key.code {
         KeyCode::Esc => {
             state.pending_tool_result_modal = None;
+            state.suppress_mouse_scroll_after_modal_close();
             state.status = ui_text_message_tool_result_modal_closed().to_string();
         }
         KeyCode::Up => modal.scroll = modal.scroll.saturating_sub(1),
@@ -3704,6 +3730,7 @@ fn switch_selected_thread(
     let target = state.threads[state.thread_selected].session_id.clone();
     let switched = services.session.switch_session_by_query(&target)?;
     state.set_active_session(switched.session_id.clone());
+    state.restore_committed_token_usage(services.session.token_usage_committed());
     state.pending_thread_action_menu = None;
     state.pending_thread_rename = None;
     state.pending_thread_delete_confirm = None;
@@ -4050,6 +4077,7 @@ fn delete_thread_session_by_index(
     state.set_threads(services.session.list_sessions().unwrap_or_default());
     if previous_active_id != services.session.session_id() {
         state.set_active_session(active_after.session_id.clone());
+        state.restore_committed_token_usage(services.session.token_usage_committed());
         state.clear_conversation_viewport_only();
         state.push(
             UiRole::System,
@@ -4393,20 +4421,23 @@ fn submit_chat_message(
             services
                 .session
                 .add_assistant_message(reply.clone(), Some(group_id.clone()));
-            services.session.persist()?;
             let final_content_already_printed = !wait_outcome.last_round_content.trim().is_empty()
                 && wait_outcome.last_round_content.trim() == reply.trim();
-            if !final_content_already_printed {
-                state.push_persisted(UiRole::Assistant, reply.clone());
-            } else {
-                state.mark_last_message_persisted_if_matches(UiRole::Assistant, &reply);
-            }
             let measured_tokens = if chat_result.metrics.total_tokens > 0 {
                 chat_result.metrics.total_tokens
             } else {
                 state.token_live_estimate
             };
             state.commit_token_usage(measured_tokens);
+            services
+                .session
+                .set_token_usage_committed(state.token_usage_committed);
+            services.session.persist()?;
+            if !final_content_already_printed {
+                state.push_persisted(UiRole::Assistant, reply.clone());
+            } else {
+                state.mark_last_message_persisted_if_matches(UiRole::Assistant, &reply);
+            }
             state.pending_choice = detect_pending_choice(&reply);
             if state.pending_choice.is_some() {
                 state.status = ui_text_choice_ready().to_string();
@@ -4859,6 +4890,13 @@ fn handle_pending_ai_mouse_event(
         handle_tool_result_modal_mouse(mouse, state, layout)?;
         return Ok(());
     }
+    if matches!(
+        mouse.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) && state.should_suppress_mouse_scroll()
+    {
+        return Ok(());
+    }
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
         if rect_contains(layout.nav, mouse.column, mouse.row) {
             let nav_idx = mouse.row.saturating_sub(layout.nav.y.saturating_add(1)) as usize;
@@ -5120,6 +5158,7 @@ fn execute_builtin_command(
             services.session.start_new_session_with_new_file()?;
             services.session.persist()?;
             state.set_active_session(services.session.session_id().to_string());
+            state.restore_committed_token_usage(services.session.token_usage_committed());
             state.clear_conversation_viewport_only();
             state.push(
                 UiRole::System,
@@ -5158,6 +5197,7 @@ fn execute_builtin_command(
             Ok(switched) => {
                 state.remember_current_session_messages();
                 state.set_active_session(switched.session_id.clone());
+                state.restore_committed_token_usage(services.session.token_usage_committed());
                 state.clear_conversation_viewport_only();
                 state.push(
                     UiRole::System,
@@ -6459,7 +6499,7 @@ fn execute_mcp_tool_call_tui(
                     "command": tool_call.name,
                     "exit_code": exit_code,
                     "duration_ms": duration_ms,
-                    "content": trim_tool_text(&content, MCP_TOOL_RESULT_CONTENT_MAX_CHARS),
+                    "content": content,
                 })
                 .to_string(),
                 exit_code,
@@ -6625,8 +6665,8 @@ fn format_tool_result_payload(result: &CommandResult) -> String {
         "interrupted": result.interrupted,
         "blocked": result.blocked,
         "block_reason": trim_tool_text(&result.block_reason, 300),
-        "stdout": trim_tool_text(result.stdout.trim(), 3000),
-        "stderr": trim_tool_text(result.stderr.trim(), 2000),
+        "stdout": result.stdout.trim(),
+        "stderr": result.stderr.trim(),
     })
     .to_string()
 }
@@ -12620,11 +12660,8 @@ fn tool_result_output_for_modal(raw_payload: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    if trimmed.len() > TOOL_RESULT_MODAL_PARSE_MAX_BYTES {
-        return trim_ui_text(trimmed, TOOL_RESULT_MODAL_MAX_RESULT_CHARS);
-    }
     let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-        return trim_ui_text(trimmed, TOOL_RESULT_MODAL_MAX_RESULT_CHARS);
+        return trimmed.to_string();
     };
     let stdout = value
         .get("stdout")
@@ -12636,22 +12673,14 @@ fn tool_result_output_for_modal(raw_payload: &str) -> String {
         .unwrap_or_default();
     if !stdout.is_empty() || !stderr.is_empty() {
         if !stdout.is_empty() && stderr.is_empty() {
-            return trim_ui_text(stdout, TOOL_RESULT_MODAL_MAX_RESULT_CHARS);
+            return stdout.to_string();
         }
         if stdout.is_empty() && !stderr.is_empty() {
-            return trim_ui_text(stderr, TOOL_RESULT_MODAL_MAX_RESULT_CHARS);
+            return stderr.to_string();
         }
-        return trim_ui_text(
-            format!("stdout:\n{}\n\nstderr:\n{}", stdout, stderr).as_str(),
-            TOOL_RESULT_MODAL_MAX_RESULT_CHARS,
-        );
+        return format!("stdout:\n{}\n\nstderr:\n{}", stdout, stderr);
     }
-    trim_ui_text(
-        serde_json::to_string_pretty(&value)
-            .unwrap_or_else(|_| trimmed.to_string())
-            .as_str(),
-        TOOL_RESULT_MODAL_MAX_RESULT_CHARS,
-    )
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| trimmed.to_string())
 }
 
 fn format_tool_status_summary_from_meta(meta: &ToolExecutionMeta) -> String {
@@ -15454,6 +15483,42 @@ model = "test-model"
         let content = modal.content.clone();
         assert!(content.contains(ui_text_message_tool_result_meta_output()));
         assert!(content.contains("Sun Mar 15 12:00:00"));
+    }
+
+    #[test]
+    fn closing_tool_result_modal_with_mouse_enables_scroll_suppression() {
+        let layout = compute_layout(Rect::new(0, 0, 140, 40));
+        let mut state = new_state();
+        state.pending_tool_result_modal = Some(ToolResultModalState {
+            message_index: 0,
+            content: "payload".to_string(),
+            scroll: 0,
+            wrap_cache: None,
+        });
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_tool_result_modal_mouse(mouse, &mut state, layout).expect("close should succeed");
+        assert!(state.pending_tool_result_modal.is_none());
+        assert!(state.should_suppress_mouse_scroll());
+    }
+
+    #[test]
+    fn closing_tool_result_modal_with_escape_enables_scroll_suppression() {
+        let mut state = new_state();
+        state.pending_tool_result_modal = Some(ToolResultModalState {
+            message_index: 0,
+            content: "payload".to_string(),
+            scroll: 0,
+            wrap_cache: None,
+        });
+        handle_tool_result_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut state)
+            .expect("esc close should succeed");
+        assert!(state.pending_tool_result_modal.is_none());
+        assert!(state.should_suppress_mouse_scroll());
     }
 
     #[test]

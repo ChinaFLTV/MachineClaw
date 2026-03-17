@@ -891,6 +891,7 @@ where
     let thread_state = Arc::clone(&state);
     let handle = thread::spawn(move || {
         let mut tmp = [0_u8; 4096];
+        let unlimited = cap == 0;
         loop {
             match reader.read(&mut tmp) {
                 Ok(0) => break,
@@ -899,6 +900,10 @@ where
                         Ok(guard) => guard,
                         Err(_) => break,
                     };
+                    if unlimited {
+                        guard.bytes.extend_from_slice(&tmp[..n]);
+                        continue;
+                    }
                     let remaining = cap.saturating_sub(guard.bytes.len());
                     if remaining > 0 {
                         let take = std::cmp::min(remaining, n);
@@ -991,14 +996,15 @@ fn mode_to_str(mode: CommandMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::time::{Duration, Instant};
 
     use crate::config::CmdConfig;
 
     use super::{
-        CommandMode, CommandSpec, ShellExecutor, WriteDecision, command_matches_regex_rule,
-        looks_like_detached_command, note_interactive_input_wait, parse_write_decision_input,
-        take_interactive_input_refresh_hint,
+        CommandMode, CommandSpec, ShellExecutor, WriteDecision, collect_capture_output,
+        command_matches_regex_rule, looks_like_detached_command, note_interactive_input_wait,
+        parse_write_decision_input, spawn_capture_thread, take_interactive_input_refresh_hint,
     };
 
     #[test]
@@ -1077,6 +1083,18 @@ mod tests {
     fn regex_rule_matches_command_after_heredoc_body() {
         let command = "cat > demo.txt <<'EOF'\nhello\nEOF\nrm *";
         assert!(command_matches_regex_rule(command, "rm *"));
+    }
+
+    #[test]
+    fn capture_thread_with_zero_cap_keeps_full_output() {
+        let payload = "x".repeat(32_768).into_bytes();
+        let capture = spawn_capture_thread(Cursor::new(payload.clone()), 0);
+        let (bytes, truncated, incomplete) =
+            collect_capture_output(capture, "unit-test", "stdout", false)
+                .expect("capture should complete");
+        assert_eq!(bytes.len(), payload.len());
+        assert!(!truncated);
+        assert!(!incomplete);
     }
 
     #[test]

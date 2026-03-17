@@ -120,6 +120,8 @@ pub struct SessionState {
     pub messages: Vec<SessionMessage>,
     #[serde(default)]
     pub compass: SessionCompass,
+    #[serde(default)]
+    pub token_usage_committed: u64,
 }
 
 pub struct SessionStore {
@@ -376,6 +378,18 @@ impl SessionStore {
         &self.state.compass
     }
 
+    pub fn token_usage_committed(&self) -> u64 {
+        self.state.token_usage_committed
+    }
+
+    pub fn set_token_usage_committed(&mut self, value: u64) {
+        if self.state.token_usage_committed == value {
+            return;
+        }
+        self.state.token_usage_committed = value;
+        self.state.compass.last_updated_epoch_ms = now_epoch_ms();
+    }
+
     pub fn recent_messages_for_display(&self, limit: usize) -> Vec<SessionMessage> {
         let mut items = Vec::<SessionMessage>::new();
         for idx in self.recent_display_state_indices(limit) {
@@ -514,6 +528,7 @@ impl SessionStore {
             summary: String::new(),
             messages: Vec::new(),
             compass: new_compass(),
+            token_usage_committed: 0,
         };
         let session_dir = session_dir_from_session_path(&self.path);
         fs::create_dir_all(&session_dir).map_err(|err| {
@@ -1178,6 +1193,7 @@ fn load_state_with_autosave_or_new(path: &Path) -> Result<SessionState, AppError
             summary: String::new(),
             messages: Vec::new(),
             compass: new_compass(),
+            token_usage_committed: 0,
         }),
     }
 }
@@ -1268,6 +1284,7 @@ fn parse_session_state_lenient(raw: &str) -> Option<SessionState> {
             })
             .unwrap_or_default(),
         compass: parse_session_compass_lenient(object.get("compass")),
+        token_usage_committed: value_to_u64(object.get("token_usage_committed")).unwrap_or(0),
     };
     if state.session_id.trim().is_empty() {
         state.session_id = default_session_id();
@@ -1420,6 +1437,10 @@ fn value_to_u128(value: Option<&serde_json::Value>) -> Option<u128> {
 
 fn value_to_usize(value: Option<&serde_json::Value>) -> Option<usize> {
     value_to_u128(value).map(|item| item.min(usize::MAX as u128) as usize)
+}
+
+fn value_to_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    value_to_u128(value).map(|item| item.min(u64::MAX as u128) as u64)
 }
 
 fn value_to_i32(value: Option<&serde_json::Value>) -> Option<i32> {
@@ -1859,6 +1880,7 @@ mod tests {
                     },
                 ],
                 compass: new_compass(),
+                token_usage_committed: 0,
             },
             recent_limit: 40,
             max_limit: 80,
@@ -2045,6 +2067,7 @@ mod tests {
                 tool_meta: None,
             }],
             compass: new_compass(),
+            token_usage_committed: 0,
         };
         let raw = serde_json::to_string_pretty(&autosave_state).expect("autosave state to json");
         fs::write(&autosave_path, raw).expect("autosave file should be written");
@@ -2128,6 +2151,25 @@ mod tests {
             .expect("tool meta should be present");
         assert_eq!(meta.result_payload.len(), full_payload.len());
         assert_eq!(meta.result_payload, full_payload);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn token_usage_committed_roundtrip_persists() {
+        let temp_dir = std::env::temp_dir().join(format!("machineclaw-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let session_path = temp_dir.join("session.json");
+        let mut store = SessionStore::load_or_new(session_path, 40, 80, 40, 80_000)
+            .expect("new session store should be created");
+        store.set_token_usage_committed(12_345);
+        store.persist().expect("session should persist");
+        let persisted_path = store.file_path().to_path_buf();
+        drop(store);
+
+        let reloaded = SessionStore::load_or_new(persisted_path, 40, 80, 40, 80_000)
+            .expect("session store should reload");
+        assert_eq!(reloaded.token_usage_committed(), 12_345);
 
         let _ = fs::remove_dir_all(temp_dir);
     }

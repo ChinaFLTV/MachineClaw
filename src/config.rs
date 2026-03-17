@@ -14,7 +14,7 @@ const DEFAULT_CMD_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_CMD_TIMEOUT_KILL_AFTER_SECONDS: u64 = 5;
 const DEFAULT_WRITE_CMD_RUN_CONFIRM: bool = true;
 const DEFAULT_WRITE_CMD_CONFIRM_MODE: &str = "allow-once";
-const DEFAULT_COMMAND_OUTPUT_MAX_BYTES: usize = 262_144;
+const DEFAULT_COMMAND_OUTPUT_MAX_BYTES: usize = 0;
 const DEFAULT_SKILLS_DIR: &str = "~/.skills";
 const DEFAULT_SKILLS_ENABLED: bool = false;
 const DEFAULT_CONSOLE_COLORFUL: bool = true;
@@ -657,7 +657,7 @@ write-cmd-allow-patterns = [] # optional
 write-cmd-deny-patterns = [] # optional
 command-timeout-seconds = 30 # optional, default 30
 command-timeout-kill-after-seconds = 5 # optional, default 5
-command-output-max-bytes = 262144 # optional, default 262144
+command-output-max-bytes = 0 # optional, default 0 (0 means unlimited)
 
 [ai.tools.skills]
 enabled = false # optional, default false
@@ -735,9 +735,9 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
             "ai.tools.bash.command-timeout-kill-after-seconds must be greater than 0".to_string(),
         ));
     }
-    if bash_cfg.command_output_max_bytes < 1024 {
+    if bash_cfg.command_output_max_bytes != 0 && bash_cfg.command_output_max_bytes < 1024 {
         return Err(AppError::Config(
-            "ai.tools.bash.command-output-max-bytes must be >= 1024".to_string(),
+            "ai.tools.bash.command-output-max-bytes must be 0 (unlimited) or >= 1024".to_string(),
         ));
     }
     for item in &bash_cfg.allow_cmd_list {
@@ -1369,6 +1369,24 @@ command-timeout-seconds = 12
         )
         .expect("config should parse");
         assert_eq!(cfg.ai.tools.bash.command_timeout_seconds, 12);
+    }
+
+    #[test]
+    fn parse_config_text_allows_unlimited_command_output_when_set_to_zero() {
+        let cfg = parse_config_text(
+            r#"
+[ai]
+base-url = "https://example.com/v1"
+token = "sk-test"
+model = "test-model"
+
+[ai.tools.bash]
+command-output-max-bytes = 0
+"#,
+            "inline",
+        )
+        .expect("config should parse");
+        assert_eq!(cfg.ai.tools.bash.command_output_max_bytes, 0);
     }
 
     #[test]
