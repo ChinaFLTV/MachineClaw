@@ -10,6 +10,7 @@ dependencies = [
  "chrono",
  "clap",
  "colored",
+ "comrak 0.51.0",
  "crossterm 0.29.0",
  "ctrlc",
  "dialoguer",
@@ -450,7 +451,7 @@ checksum = "453dcb42e33f7b474d7e0db12e0b8d82802c88f35cf5a1d8c297d0dfcecb154f"
 dependencies = [
  "bon",
  "caseless",
- "emojis",
+ "emojis 0.6.4",
  "entities",
  "memchr",
  "once_cell",
@@ -458,6 +459,30 @@ dependencies = [
  "slug",
  "typed-arena",
  "unicode_categories",
+]
+
+[[package]]
+name = "comrak"
+version = "0.51.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f07383e7799d964bf7ffa6fc4457d177c54a44614661c7458bb0bd91b108e32"
+dependencies = [
+ "bon",
+ "caseless",
+ "clap",
+ "emojis 0.8.0",
+ "entities",
+ "finl_unicode",
+ "fmt2io",
+ "jetscii",
+ "phf 0.13.1",
+ "phf_codegen 0.13.1",
+ "rustc-hash",
+ "shell-words",
+ "smallvec",
+ "syntect",
+ "typed-arena",
+ "xdg",
 ]
 
 [[package]]
@@ -803,6 +828,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "emojis"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50c1c1870b766fc398e5f0526498d09c94b6de15be5fd769a28bbc804fb1b05d"
+dependencies = [
+ "phf 0.13.1",
+]
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -904,6 +938,12 @@ dependencies = [
  "crc32fast",
  "miniz_oxide",
 ]
+
+[[package]]
+name = "fmt2io"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b6129284da9f7e5296cc22183a63f24300e945e297705dcc0672f7df01d62c8"
 
 [[package]]
 name = "fnv"
@@ -1412,6 +1452,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
+name = "jetscii"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47f142fe24a9c9944451e8349de0a56af5f3e7226dc46f3ed4d4ecc0b85af75e"
+
+[[package]]
 name = "jni"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1584,7 +1630,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c41257e065136c62db7cbaa04f0d90c812a4febded4bcde35b3eb0c62b831cda"
 dependencies = [
  "clap",
- "comrak",
+ "comrak 0.31.0",
  "crossterm 0.28.1",
  "serde",
  "strip-ansi-escapes",
@@ -1745,6 +1791,28 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "onig"
+version = "6.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "336b9c63443aceef14bea841b899035ae3abe89b7c486aaf4c5bd8aafedac3f0"
+dependencies = [
+ "bitflags 2.11.0",
+ "libc",
+ "once_cell",
+ "onig_sys",
+]
+
+[[package]]
+name = "onig_sys"
+version = "69.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f86c6eef3d6df15f23bcfb6af487cbd2fed4e5581d58d5bf1f5f8b7f6727dc"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
 
 [[package]]
 name = "opaque-debug"
@@ -1961,6 +2029,12 @@ name = "pin-utils"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
+
+[[package]]
+name = "pkg-config"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "plist"
@@ -2778,6 +2852,7 @@ dependencies = [
  "flate2",
  "fnv",
  "once_cell",
+ "onig",
  "plist",
  "regex-syntax",
  "serde",
@@ -3983,6 +4058,12 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+
+[[package]]
+name = "xdg"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fb433233f2df9344722454bc7e96465c9d03bff9d77c248f9e7523fe79585b5"
 
 [[package]]
 name = "yaml-rust"

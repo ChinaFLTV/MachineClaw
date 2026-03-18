@@ -203,6 +203,7 @@ impl SessionStore {
             ),
         };
         store.ensure_session_path_in_sessions_dir()?;
+        store.cleanup_empty_sessions_on_scan()?;
         store.repair_compass();
         store.enforce_max_limit();
         store.persist_active_session_pointer()?;
@@ -1139,6 +1140,76 @@ impl SessionStore {
         self.path = target_path;
         self.persist()
     }
+
+    fn cleanup_empty_sessions_on_scan(&mut self) -> Result<(), AppError> {
+        let sessions_dir = session_dir_from_session_path(&self.path);
+        if !sessions_dir.exists() {
+            return Ok(());
+        }
+        let entries = fs::read_dir(&sessions_dir).map_err(|err| {
+            AppError::Runtime(format!(
+                "failed to read session directory {}: {err}",
+                sessions_dir.display()
+            ))
+        })?;
+        let mut removable_paths = Vec::<PathBuf>::new();
+        let mut fallback_candidates = Vec::<(u128, u128, PathBuf)>::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .and_then(|item| item.to_str())
+                .unwrap_or_default();
+            if !is_session_state_file_name(file_name) {
+                continue;
+            }
+            let state = match read_state_from_file(&path) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if is_removable_empty_session_state(&state) {
+                removable_paths.push(path);
+            } else {
+                fallback_candidates.push((
+                    state.compass.last_updated_epoch_ms,
+                    state.compass.created_at_epoch_ms,
+                    path,
+                ));
+            }
+        }
+        if removable_paths.is_empty() {
+            return Ok(());
+        }
+        let current_path = self.path.clone();
+        let remove_current = removable_paths.iter().any(|path| path == &current_path);
+        for path in removable_paths.iter().filter(|path| *path != &current_path) {
+            remove_session_files(path)?;
+        }
+        if remove_current {
+            let stale_path = current_path;
+            if let Some((_, _, fallback_path)) = fallback_candidates
+                .into_iter()
+                .filter(|(_, _, path)| path != &stale_path)
+                .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+            {
+                let mut state = read_state_from_file(&fallback_path)?;
+                state.session_name =
+                    normalize_session_name(&state.session_id, Some(&state.session_name));
+                self.state = state;
+                self.path = fallback_path;
+                self.repair_compass();
+                self.enforce_max_limit();
+                self.persist()?;
+            } else {
+                self.start_new_session_with_new_file()?;
+            }
+            remove_session_files(&stale_path)?;
+        }
+        Ok(())
+    }
 }
 
 fn is_visible_display_message(item: &SessionMessage) -> bool {
@@ -1160,6 +1231,36 @@ fn is_persisted_tool_trace_message(content: &str) -> bool {
         && trimmed.contains(" function=")
         && trimmed.contains(" args=")
         && trimmed.contains(" result=")
+}
+
+fn is_removable_empty_session_state(state: &SessionState) -> bool {
+    if !state.summary.trim().is_empty() {
+        return false;
+    }
+    if state.compass.total_user_messages > 0 || state.compass.total_assistant_messages > 0 {
+        return false;
+    }
+    if state.messages.is_empty() {
+        return true;
+    }
+    let mut has_system_message = false;
+    for item in &state.messages {
+        let role = item.role.trim().to_ascii_lowercase();
+        let content = item.content.trim();
+        if role.is_empty() && content.is_empty() {
+            continue;
+        }
+        if matches!(role.as_str(), "user" | "assistant" | "thinking")
+            || matches!(item.kind, MessageKind::User | MessageKind::Assistant)
+        {
+            return false;
+        }
+        if !role.is_empty() && role != "system" {
+            return false;
+        }
+        has_system_message = true;
+    }
+    has_system_message
 }
 
 fn compute_keep_recent_messages(max_history_messages: usize) -> usize {
@@ -1890,6 +1991,14 @@ mod tests {
         }
     }
 
+    fn write_state_file(path: &PathBuf, state: &SessionState) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("parent dir should be created");
+        }
+        let raw = serde_json::to_string_pretty(state).expect("state should serialize");
+        fs::write(path, raw).expect("state file should be written");
+    }
+
     #[test]
     fn archived_role_counts_only_counts_persisted_messages() {
         let store = build_store("");
@@ -2099,6 +2208,119 @@ mod tests {
             .expect("lenient parser should recover session shape");
         assert!(!store.session_id().trim().is_empty());
         assert_eq!(store.message_count(), 2);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn load_or_new_scan_removes_system_only_empty_session_files() {
+        let temp_dir = std::env::temp_dir().join(format!("machineclaw-test-{}", Uuid::new_v4()));
+        let sessions_dir = temp_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let active_path = sessions_dir.join("session-active.json");
+        let stale_empty_path = sessions_dir.join("session-stale-empty.json");
+        let mut active_state = SessionState {
+            session_id: "session-active".to_string(),
+            session_name: "session-active".to_string(),
+            summary: String::new(),
+            messages: vec![super::SessionMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                kind: MessageKind::User,
+                group_id: None,
+                created_at_epoch_ms: 1,
+                tool_meta: None,
+            }],
+            compass: new_compass(),
+            token_usage_committed: 0,
+        };
+        active_state.compass.total_user_messages = 1;
+        let stale_empty_state = SessionState {
+            session_id: "session-empty".to_string(),
+            session_name: "session-empty".to_string(),
+            summary: String::new(),
+            messages: vec![super::SessionMessage {
+                role: "system".to_string(),
+                content: "AI 连通性检查已在后台运行".to_string(),
+                kind: MessageKind::System,
+                group_id: None,
+                created_at_epoch_ms: 2,
+                tool_meta: None,
+            }],
+            compass: new_compass(),
+            token_usage_committed: 0,
+        };
+        write_state_file(&active_path, &active_state);
+        write_state_file(&stale_empty_path, &stale_empty_state);
+
+        let store = SessionStore::load_or_new(active_path.clone(), 40, 80, 40, 80_000)
+            .expect("store should load");
+        assert_eq!(store.file_path(), active_path.as_path());
+        assert!(
+            !stale_empty_path.exists(),
+            "system-only empty session should be deleted during scan"
+        );
+        let sessions = store.list_sessions().expect("sessions should list");
+        assert!(
+            sessions
+                .iter()
+                .all(|item| item.session_id != "session-empty"),
+            "deleted empty session should not appear in list"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn load_or_new_scan_replaces_active_system_only_empty_session() {
+        let temp_dir = std::env::temp_dir().join(format!("machineclaw-test-{}", Uuid::new_v4()));
+        let sessions_dir = temp_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let active_path = sessions_dir.join("session-empty-active.json");
+        let fallback_path = sessions_dir.join("session-history.json");
+        let active_empty_state = SessionState {
+            session_id: "session-empty-active".to_string(),
+            session_name: "session-empty-active".to_string(),
+            summary: String::new(),
+            messages: vec![super::SessionMessage {
+                role: "system".to_string(),
+                content: "正在执行启动前检查…".to_string(),
+                kind: MessageKind::System,
+                group_id: None,
+                created_at_epoch_ms: 1,
+                tool_meta: None,
+            }],
+            compass: new_compass(),
+            token_usage_committed: 0,
+        };
+        let mut fallback_state = SessionState {
+            session_id: "session-history".to_string(),
+            session_name: "session-history".to_string(),
+            summary: String::new(),
+            messages: vec![super::SessionMessage {
+                role: "assistant".to_string(),
+                content: "history".to_string(),
+                kind: MessageKind::Assistant,
+                group_id: None,
+                created_at_epoch_ms: 10,
+                tool_meta: None,
+            }],
+            compass: new_compass(),
+            token_usage_committed: 0,
+        };
+        fallback_state.compass.total_assistant_messages = 1;
+        fallback_state.compass.last_updated_epoch_ms = 10;
+        write_state_file(&active_path, &active_empty_state);
+        write_state_file(&fallback_path, &fallback_state);
+
+        let store = SessionStore::load_or_new(active_path.clone(), 40, 80, 40, 80_000)
+            .expect("store should load");
+        assert_eq!(store.session_id(), "session-history");
+        assert_eq!(store.file_path(), fallback_path.as_path());
+        assert!(
+            !active_path.exists(),
+            "active system-only empty session should be deleted"
+        );
 
         let _ = fs::remove_dir_all(temp_dir);
     }

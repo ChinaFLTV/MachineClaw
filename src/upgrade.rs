@@ -27,9 +27,11 @@ use crate::{
     tls::ensure_rustls_crypto_provider,
 };
 
-const RELEASES_API_URL: &str = "https://api.github.com/repos/ChinaFLTV/MachineClaw/releases?per_page=20";
+const RELEASES_API_URL: &str =
+    "https://api.github.com/repos/ChinaFLTV/MachineClaw/releases?per_page=20";
 const RELEASES_WEB_URL: &str = "https://github.com/ChinaFLTV/MachineClaw/releases";
-const UPGRADE_USER_AGENT: &str = "MachineClaw-upgrade/1.0 (+https://github.com/ChinaFLTV/MachineClaw)";
+const UPGRADE_USER_AGENT: &str =
+    "MachineClaw-upgrade/1.0 (+https://github.com/ChinaFLTV/MachineClaw)";
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 8;
 const HTTP_REQUEST_TIMEOUT_SECS: u64 = 45;
 const HTTP_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
@@ -270,8 +272,12 @@ impl UpgradeLocale {
         match self.language {
             Language::ZhCn => format!("本地版本 `{version}` 格式无效，无法安全比较"),
             Language::ZhTw => format!("本機版本 `{version}` 格式無效，無法安全比較"),
-            Language::Fr => format!("la version locale `{version}` est invalide, comparaison impossible"),
-            Language::De => format!("lokale Version `{version}` ist ungueltig, Vergleich nicht sicher moeglich"),
+            Language::Fr => {
+                format!("la version locale `{version}` est invalide, comparaison impossible")
+            }
+            Language::De => {
+                format!("lokale Version `{version}` ist ungueltig, Vergleich nicht sicher moeglich")
+            }
             Language::Ja => format!("ローカル版 `{version}` の形式が不正で安全に比較できません"),
             Language::En => format!("local version `{version}` is invalid, cannot compare safely"),
         }
@@ -292,7 +298,9 @@ impl UpgradeLocale {
         match self.language {
             Language::ZhCn => "无法判断升级可用性，保持当前版本",
             Language::ZhTw => "無法判斷升級可用性，保持當前版本",
-            Language::Fr => "impossible de verifier la mise a niveau, conservation de la version actuelle",
+            Language::Fr => {
+                "impossible de verifier la mise a niveau, conservation de la version actuelle"
+            }
             Language::De => "Upgrade-Verfuegbarkeit unklar, aktuelle Version wird beibehalten",
             Language::Ja => "アップグレード可否を判定できないため現行版を維持します",
             Language::En => "unable to check upgrade availability; keep current version",
@@ -303,10 +311,18 @@ impl UpgradeLocale {
         match self.language {
             Language::ZhCn => "未找到可用 Release（可能为空、仅草稿或仅预发布）",
             Language::ZhTw => "未找到可用 Release（可能為空、僅草稿或僅預發布）",
-            Language::Fr => "aucune release eligible trouvee (vide, brouillon seulement, ou prerelease seulement)",
-            Language::De => "keine geeignete Release gefunden (leer, nur Entwurf oder nur Vorabversion)",
-            Language::Ja => "対象となる release がありません（空、ドラフトのみ、またはプレリリースのみ）",
-            Language::En => "no eligible release found (possibly empty, draft-only, or prerelease-only)",
+            Language::Fr => {
+                "aucune release eligible trouvee (vide, brouillon seulement, ou prerelease seulement)"
+            }
+            Language::De => {
+                "keine geeignete Release gefunden (leer, nur Entwurf oder nur Vorabversion)"
+            }
+            Language::Ja => {
+                "対象となる release がありません（空、ドラフトのみ、またはプレリリースのみ）"
+            }
+            Language::En => {
+                "no eligible release found (possibly empty, draft-only, or prerelease-only)"
+            }
         }
     }
 
@@ -314,10 +330,18 @@ impl UpgradeLocale {
         match self.language {
             Language::ZhCn => "默认排除预发布版本，可用 `--allow-prerelease` 重新检查",
             Language::ZhTw => "預設排除預發布版本，可用 `--allow-prerelease` 重新檢查",
-            Language::Fr => "les prereleases sont exclues par defaut, relancez avec `--allow-prerelease`",
-            Language::De => "Vorabversionen sind standardmaessig ausgeschlossen, erneut mit `--allow-prerelease` pruefen",
-            Language::Ja => "プレリリースは既定で除外されています。`--allow-prerelease` で再確認してください",
-            Language::En => "prerelease is excluded by default; rerun with `--allow-prerelease` if needed",
+            Language::Fr => {
+                "les prereleases sont exclues par defaut, relancez avec `--allow-prerelease`"
+            }
+            Language::De => {
+                "Vorabversionen sind standardmaessig ausgeschlossen, erneut mit `--allow-prerelease` pruefen"
+            }
+            Language::Ja => {
+                "プレリリースは既定で除外されています。`--allow-prerelease` で再確認してください"
+            }
+            Language::En => {
+                "prerelease is excluded by default; rerun with `--allow-prerelease` if needed"
+            }
         }
     }
 
@@ -429,7 +453,9 @@ impl UpgradeLocale {
             Language::ZhCn => "下载结果是压缩包，为避免误替换已跳过自动覆盖",
             Language::ZhTw => "下載結果是壓縮包，為避免誤替換已跳過自動覆蓋",
             Language::Fr => "asset archive detecte, remplacement automatique ignore pour securite",
-            Language::De => "Archiv erkannt, automatisches Ersetzen wird aus Sicherheitsgruenden uebersprungen",
+            Language::De => {
+                "Archiv erkannt, automatisches Ersetzen wird aus Sicherheitsgruenden uebersprungen"
+            }
             Language::Ja => "アーカイブ資産のため、誤置換防止として自動適用をスキップしました",
             Language::En => "downloaded asset is an archive, auto-replace is skipped",
         }
@@ -477,18 +503,38 @@ impl UpgradeLocale {
             Language::Fr => "`--output` personnalise detecte, telechargement uniquement",
             Language::De => "benutzerdefiniertes `--output` erkannt, nur Download ohne Auto-Apply",
             Language::Ja => "カスタム `--output` 指定のため、ダウンロードのみ実行しました",
-            Language::En => "custom `--output` path provided, download completed without auto-apply",
+            Language::En => {
+                "custom `--output` path provided, download completed without auto-apply"
+            }
         }
     }
 
     fn decision_manual_replace(self, downloaded: &Path) -> String {
         match self.language {
-            Language::ZhCn => format!("如需立即切换，请手动将 `{}` 替换到当前程序路径", downloaded.display()),
-            Language::ZhTw => format!("如需立即切換，請手動將 `{}` 替換到當前程式路徑", downloaded.display()),
-            Language::Fr => format!("pour basculer maintenant, remplacez manuellement avec `{}`", downloaded.display()),
-            Language::De => format!("fuer sofortige Umstellung bitte manuell mit `{}` ersetzen", downloaded.display()),
-            Language::Ja => format!("今すぐ切り替える場合は `{}` を手動で配置してください", downloaded.display()),
-            Language::En => format!("if you want to switch now: replace current executable with `{}` manually", downloaded.display()),
+            Language::ZhCn => format!(
+                "如需立即切换，请手动将 `{}` 替换到当前程序路径",
+                downloaded.display()
+            ),
+            Language::ZhTw => format!(
+                "如需立即切換，請手動將 `{}` 替換到當前程式路徑",
+                downloaded.display()
+            ),
+            Language::Fr => format!(
+                "pour basculer maintenant, remplacez manuellement avec `{}`",
+                downloaded.display()
+            ),
+            Language::De => format!(
+                "fuer sofortige Umstellung bitte manuell mit `{}` ersetzen",
+                downloaded.display()
+            ),
+            Language::Ja => format!(
+                "今すぐ切り替える場合は `{}` を手動で配置してください",
+                downloaded.display()
+            ),
+            Language::En => format!(
+                "if you want to switch now: replace current executable with `{}` manually",
+                downloaded.display()
+            ),
         }
     }
 
@@ -496,10 +542,18 @@ impl UpgradeLocale {
         match self.language {
             Language::ZhCn => format!("升级已完成，请重新启动 MachineClaw（新版本 `{version}`）"),
             Language::ZhTw => format!("升級已完成，請重新啟動 MachineClaw（新版本 `{version}`）"),
-            Language::Fr => format!("mise a niveau appliquee, redemarrez MachineClaw (version `{version}`)"),
-            Language::De => format!("Upgrade abgeschlossen, MachineClaw neu starten (neue Version `{version}`)"),
-            Language::Ja => format!("アップグレード適用済みです。MachineClaw を再起動してください（新バージョン `{version}`）"),
-            Language::En => format!("upgrade applied successfully; restart MachineClaw (new version `{version}`)"),
+            Language::Fr => {
+                format!("mise a niveau appliquee, redemarrez MachineClaw (version `{version}`)")
+            }
+            Language::De => {
+                format!("Upgrade abgeschlossen, MachineClaw neu starten (neue Version `{version}`)")
+            }
+            Language::Ja => format!(
+                "アップグレード適用済みです。MachineClaw を再起動してください（新バージョン `{version}`）"
+            ),
+            Language::En => format!(
+                "upgrade applied successfully; restart MachineClaw (new version `{version}`)"
+            ),
         }
     }
 
@@ -573,7 +627,9 @@ impl UpgradeLocale {
         match self.language {
             Language::ZhCn => "版本探测 · 资源路由 · 安全替换 · 失败回退",
             Language::ZhTw => "版本探測 · 資源路由 · 安全替換 · 失敗回退",
-            Language::Fr => "Detection version · Routage assets · Remplacement sur · Repli securise",
+            Language::Fr => {
+                "Detection version · Routage assets · Remplacement sur · Repli securise"
+            }
             Language::De => "Versionspruefung · Asset-Routing · Sicheres Ersetzen · Rollback",
             Language::Ja => "バージョン検知・資産ルーティング・安全置換・ロールバック",
             Language::En => "Version Probe · Asset Routing · Safe Replace · Rollback",
@@ -728,13 +784,23 @@ pub fn run_upgrade_command(
     let mut exit_code = ExitCode::Success;
     let mut status = i18n::status_success().to_string();
     let local_version_raw = env!("CARGO_PKG_VERSION").to_string();
-    key_metrics.push(metric_entry(locale.metric_local_version(), format!("`{}`", local_version_raw).as_str()));
-    key_metrics.push(metric_entry(locale.metric_repo(), format!("`{}`", RELEASES_WEB_URL).as_str()));
+    key_metrics.push(metric_entry(
+        locale.metric_local_version(),
+        format!("`{}`", local_version_raw).as_str(),
+    ));
+    key_metrics.push(metric_entry(
+        locale.metric_repo(),
+        format!("`{}`", RELEASES_WEB_URL).as_str(),
+    ));
     commands.push(format!("GET {}", RELEASES_API_URL));
 
     let local_version = normalize_version(local_version_raw.as_str());
     if local_version.is_none() {
-        risks.push(bullet(locale.risk_local_version_invalid(local_version_raw.as_str()).as_str()));
+        risks.push(bullet(
+            locale
+                .risk_local_version_invalid(local_version_raw.as_str())
+                .as_str(),
+        ));
     }
 
     let client = build_http_client(HTTP_REQUEST_TIMEOUT_SECS)?;
@@ -772,7 +838,10 @@ pub fn run_upgrade_command(
     let latest = pick_latest_release(releases.as_slice(), options.allow_prerelease);
     let Some(release) = latest else {
         decision.push(bullet(locale.decision_no_eligible_release()));
-        key_metrics.push(metric_entry(locale.metric_latest_release(), format!("`{}`", locale.na_value()).as_str()));
+        key_metrics.push(metric_entry(
+            locale.metric_latest_release(),
+            format!("`{}`", locale.na_value()).as_str(),
+        ));
         if !options.allow_prerelease {
             risks.push(bullet(locale.risk_prerelease_excluded()));
         }
@@ -800,9 +869,18 @@ pub fn run_upgrade_command(
     } else {
         release.html_url.clone()
     };
-    key_metrics.push(metric_entry(locale.metric_latest_release(), format!("`{}`", release.tag_name).as_str()));
-    key_metrics.push(metric_entry(locale.metric_release_title(), format!("`{}`", release_title).as_str()));
-    key_metrics.push(metric_entry(locale.metric_release_page(), format!("`{}`", release_link).as_str()));
+    key_metrics.push(metric_entry(
+        locale.metric_latest_release(),
+        format!("`{}`", release.tag_name).as_str(),
+    ));
+    key_metrics.push(metric_entry(
+        locale.metric_release_title(),
+        format!("`{}`", release_title).as_str(),
+    ));
+    key_metrics.push(metric_entry(
+        locale.metric_release_page(),
+        format!("`{}`", release_link).as_str(),
+    ));
     if let Some(published) = release.published_at.as_deref() {
         key_metrics.push(metric_entry(locale.metric_published_at(), published));
     }
@@ -852,7 +930,10 @@ pub fn run_upgrade_command(
         Ordering::Less | Ordering::Equal => {
             decision.push(bullet(
                 locale
-                    .decision_already_up_to_date(local_version.raw.as_str(), latest_version.raw.as_str())
+                    .decision_already_up_to_date(
+                        local_version.raw.as_str(),
+                        latest_version.raw.as_str(),
+                    )
                     .as_str(),
             ));
             return render_upgrade_outcome(
@@ -871,7 +952,10 @@ pub fn run_upgrade_command(
         Ordering::Greater => {
             decision.push(bullet(
                 locale
-                    .decision_upgrade_available(local_version.raw.as_str(), latest_version.raw.as_str())
+                    .decision_upgrade_available(
+                        local_version.raw.as_str(),
+                        latest_version.raw.as_str(),
+                    )
                     .as_str(),
             ));
         }
@@ -914,7 +998,10 @@ pub fn run_upgrade_command(
         );
     };
 
-    key_metrics.push(metric_entry(locale.metric_selected_asset(), format!("`{}`", asset.name).as_str()));
+    key_metrics.push(metric_entry(
+        locale.metric_selected_asset(),
+        format!("`{}`", asset.name).as_str(),
+    ));
     key_metrics.push(metric_entry(
         locale.metric_declared_asset_size(),
         format!("`{}`", i18n::human_bytes(asset.size as u128)).as_str(),
@@ -938,16 +1025,22 @@ pub fn run_upgrade_command(
 
     let current_exe = std::env::current_exe()
         .map_err(|err| AppError::Runtime(format!("failed to locate current executable: {err}")))?;
-    let download_target = resolve_download_path(options.output.as_ref(), &current_exe, asset.name.as_str())?;
+    let download_target =
+        resolve_download_path(options.output.as_ref(), &current_exe, asset.name.as_str())?;
     key_metrics.push(metric_entry(
         locale.metric_download_target(),
         format!("`{}`", download_target.display()).as_str(),
     ));
-    commands.push(format!("{}: {}", locale.command_download(), asset.browser_download_url));
+    commands.push(format!(
+        "{}: {}",
+        locale.command_download(),
+        asset.browser_download_url
+    ));
 
     let download_client = build_http_client(HTTP_DOWNLOAD_TIMEOUT_SECS)?;
     let mut download_spinner = UpgradeSpinner::start(locale.progress_downloading(), colorful);
-    let downloaded_bytes = match download_asset(&download_client, asset, download_target.as_path()) {
+    let downloaded_bytes = match download_asset(&download_client, asset, download_target.as_path())
+    {
         Ok(bytes) => bytes,
         Err(err) => {
             download_spinner.stop();
@@ -1130,13 +1223,7 @@ fn render_upgrade_dashboard(
         locale,
     );
     out.push(mid_border(inner_width));
-    append_section(
-        &mut out,
-        inner_width,
-        locale.section_risk(),
-        risks,
-        locale,
-    );
+    append_section(&mut out, inner_width, locale.section_risk(), risks, locale);
     out.push(mid_border(inner_width));
     append_section(
         &mut out,
@@ -1166,12 +1253,16 @@ fn append_section(
 ) {
     out.push(box_line(inner_width, format!("[ {title} ]").as_str()));
     if items.is_empty() {
-        out.push(box_line(inner_width, format!("  • {}", locale.item_none()).as_str()));
+        out.push(box_line(
+            inner_width,
+            format!("  • {}", locale.item_none()).as_str(),
+        ));
         return;
     }
     for item in items {
         let normalized = normalize_item(item);
-        let wrapped = wrap_text_by_display_width(normalized.as_str(), inner_width.saturating_sub(4));
+        let wrapped =
+            wrap_text_by_display_width(normalized.as_str(), inner_width.saturating_sub(4));
         for (idx, line) in wrapped.iter().enumerate() {
             let prefix = if idx == 0 { "  • " } else { "    " };
             out.push(box_line(inner_width, format!("{prefix}{line}").as_str()));
@@ -1289,7 +1380,8 @@ fn style_dashboard_lines(
         if line.contains(status_key.as_str()) {
             let mut body_styled = body.bright_white().to_string();
             if status == i18n::status_success() {
-                body_styled = body_styled.replace(status, &status.bright_green().bold().to_string());
+                body_styled =
+                    body_styled.replace(status, &status.bright_green().bold().to_string());
             } else if status == i18n::status_failed() {
                 body_styled = body_styled.replace(status, &status.bright_red().bold().to_string());
             }
@@ -1408,11 +1500,11 @@ fn display_width(text: &str) -> usize {
 fn build_http_client(timeout_secs: u64) -> Result<Client, AppError> {
     ensure_rustls_crypto_provider();
     let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static(UPGRADE_USER_AGENT));
     headers.insert(
-        USER_AGENT,
-        HeaderValue::from_static(UPGRADE_USER_AGENT),
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
     );
-    headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github+json"));
     Client::builder()
         .default_headers(headers)
         .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
@@ -1549,8 +1641,12 @@ fn download_asset(
     let parent = destination
         .parent()
         .ok_or_else(|| "download destination has no parent directory".to_string())?;
-    fs::create_dir_all(parent)
-        .map_err(|err| format!("failed to create download directory {}: {err}", parent.display()))?;
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "failed to create download directory {}: {err}",
+            parent.display()
+        )
+    })?;
 
     let file_name = destination
         .file_name()
@@ -1580,7 +1676,8 @@ fn download_asset(
     let mut output = fs::File::create(&temp_path)
         .map_err(|err| format!("failed to create temp file {}: {err}", temp_path.display()))?;
     let copied = io::copy(&mut response, &mut output)
-        .map_err(|err| format!("failed to write downloaded bytes: {err}"))? as u128;
+        .map_err(|err| format!("failed to write downloaded bytes: {err}"))?
+        as u128;
     output
         .sync_all()
         .map_err(|err| format!("failed to flush temp file {}: {err}", temp_path.display()))?;
@@ -1645,8 +1742,9 @@ fn ensure_executable_permission(path: &Path) -> Result<(), AppError> {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let metadata = fs::metadata(path)
-            .map_err(|err| AppError::Command(format!("failed to read {}: {err}", path.display())))?;
+        let metadata = fs::metadata(path).map_err(|err| {
+            AppError::Command(format!("failed to read {}: {err}", path.display()))
+        })?;
         let mut permissions = metadata.permissions();
         let mode = permissions.mode();
         if mode & 0o111 == 0 {
@@ -1735,10 +1833,14 @@ fn compare_version(left: &NormalizedVersion, right: &NormalizedVersion) -> Order
 
 fn platform_profile(os: OsType, arch: &str) -> PlatformProfile {
     let normalized_arch = arch.to_ascii_lowercase();
-    let (arch_tokens, incompatible_arch_tokens): (&[&str], &[&str]) = match normalized_arch.as_str() {
+    let (arch_tokens, incompatible_arch_tokens): (&[&str], &[&str]) = match normalized_arch.as_str()
+    {
         "x86_64" | "amd64" => (&["x86_64", "amd64", "x64"], &["arm64", "aarch64", "armv7"]),
         "aarch64" | "arm64" => (&["aarch64", "arm64"], &["x86_64", "amd64", "x64", "armv7"]),
-        "arm" | "armv7" => (&["armv7", "arm"], &["x86_64", "amd64", "x64", "arm64", "aarch64"]),
+        "arm" | "armv7" => (
+            &["armv7", "arm"],
+            &["x86_64", "amd64", "x64", "arm64", "aarch64"],
+        ),
         _ => (&["unknown"], &[]),
     };
     match os {

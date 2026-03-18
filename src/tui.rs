@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     env, fs,
     io::{self, IsTerminal, Stdout, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc,
@@ -17,6 +17,7 @@ use std::{
 };
 
 use chrono::{Local, TimeZone};
+use comrak::{Options as ComrakOptions, markdown_to_html};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -57,7 +58,7 @@ use crate::{
     builtin_tools,
     cli::InspectTarget,
     config::{AppConfig, McpServerConfig, expand_tilde},
-    context::{SessionMessage, SessionOverview, ToolExecutionMeta},
+    context::{MessageKind, SessionMessage, SessionOverview, SessionState, ToolExecutionMeta},
     error::{AppError, ExitCode},
     i18n, mask,
     mcp::{self, McpServerRecord},
@@ -232,6 +233,12 @@ struct ThreadActionMenuState {
 
 #[derive(Debug, Clone)]
 struct ThreadRenameModalState {
+    thread_index: usize,
+    input: InputBuffer,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadExportHtmlModalState {
     thread_index: usize,
     input: InputBuffer,
 }
@@ -693,6 +700,7 @@ struct ChatUiState {
     pending_delete_confirm: Option<DeleteMessageConfirmState>,
     pending_thread_action_menu: Option<ThreadActionMenuState>,
     pending_thread_rename: Option<ThreadRenameModalState>,
+    pending_thread_export_html: Option<ThreadExportHtmlModalState>,
     pending_thread_delete_confirm: Option<ThreadDeleteConfirmState>,
     pending_thread_metadata_modal: Option<ThreadMetadataModalState>,
     pending_tool_result_modal: Option<ToolResultModalState>,
@@ -765,6 +773,7 @@ impl ChatUiState {
             pending_delete_confirm: None,
             pending_thread_action_menu: None,
             pending_thread_rename: None,
+            pending_thread_export_html: None,
             pending_thread_delete_confirm: None,
             pending_thread_metadata_modal: None,
             pending_tool_result_modal: None,
@@ -2310,6 +2319,9 @@ fn handle_key_event(
     if state.pending_thread_rename.is_some() {
         return handle_thread_rename_modal_key(key, services, state);
     }
+    if state.pending_thread_export_html.is_some() {
+        return handle_thread_export_html_modal_key(key, services, state);
+    }
     if state.pending_thread_action_menu.is_some() {
         return handle_thread_action_menu_key(key, services, state);
     }
@@ -3012,6 +3024,10 @@ fn handle_mouse_event(
         handle_thread_rename_modal_mouse(mouse, services, state, layout)?;
         return Ok(());
     }
+    if state.pending_thread_export_html.is_some() {
+        handle_thread_export_html_modal_mouse(mouse, services, state, layout)?;
+        return Ok(());
+    }
     if state.pending_thread_action_menu.is_some() {
         handle_thread_action_menu_mouse(mouse, services, state, layout)?;
         return Ok(());
@@ -3643,6 +3659,35 @@ fn handle_thread_rename_modal_mouse(
     Ok(())
 }
 
+fn handle_thread_export_html_modal_mouse(
+    mouse: MouseEvent,
+    _services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+    layout: UiLayout,
+) -> Result<(), AppError> {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return Ok(());
+    }
+    if let Some(button) = thread_export_html_clear_button_data(layout)
+        && rect_contains(button.rect, mouse.column, mouse.row)
+    {
+        if let Some(modal) = state.pending_thread_export_html.as_mut() {
+            modal.input.clear();
+        }
+        state.status = ui_text_thread_export_html_cleared().to_string();
+        return Ok(());
+    }
+    if !rect_contains(
+        thread_export_html_modal_rect(layout),
+        mouse.column,
+        mouse.row,
+    ) {
+        state.pending_thread_export_html = None;
+        state.status = ui_text_thread_export_html_cancelled().to_string();
+    }
+    Ok(())
+}
+
 fn delete_message_from_session(
     services: &mut ActionServices<'_>,
     state: &mut ChatUiState,
@@ -3733,6 +3778,7 @@ fn switch_selected_thread(
     state.restore_committed_token_usage(services.session.token_usage_committed());
     state.pending_thread_action_menu = None;
     state.pending_thread_rename = None;
+    state.pending_thread_export_html = None;
     state.pending_thread_delete_confirm = None;
     state.pending_thread_metadata_modal = None;
     state.clear_conversation_viewport_only();
@@ -3964,6 +4010,41 @@ fn handle_thread_rename_modal_key(
     Ok(false)
 }
 
+fn handle_thread_export_html_modal_key(
+    key: KeyEvent,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+) -> Result<bool, AppError> {
+    let Some(modal) = state.pending_thread_export_html.as_mut() else {
+        return Ok(false);
+    };
+    match key.code {
+        KeyCode::Esc => {
+            state.pending_thread_export_html = None;
+            state.status = ui_text_thread_export_html_cancelled().to_string();
+        }
+        KeyCode::Left => modal.input.move_left(),
+        KeyCode::Right => modal.input.move_right(),
+        KeyCode::Home => modal.input.move_home(),
+        KeyCode::End => modal.input.move_end(),
+        KeyCode::Backspace => modal.input.backspace(),
+        KeyCode::Delete => modal.input.delete(),
+        KeyCode::Char(ch) => {
+            if key.modifiers == KeyModifiers::CONTROL && matches!(ch, 'u' | 'U') {
+                modal.input.clear();
+                state.status = ui_text_thread_export_html_cleared().to_string();
+            } else if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                modal.input.insert_char(ch);
+            }
+        }
+        KeyCode::Enter => {
+            apply_thread_export_html_modal(services, state)?;
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 fn apply_thread_action_menu_selection(
     services: &mut ActionServices<'_>,
     state: &mut ChatUiState,
@@ -3975,7 +4056,8 @@ fn apply_thread_action_menu_selection(
     match menu.selected {
         0 => open_thread_delete_confirm(state, idx)?,
         1 => open_thread_rename_modal(state, idx)?,
-        _ => open_thread_metadata_modal(services, state, idx)?,
+        2 => open_thread_metadata_modal(services, state, idx)?,
+        _ => open_thread_export_html_modal(state, idx)?,
     }
     Ok(())
 }
@@ -3989,6 +4071,7 @@ fn open_thread_delete_confirm(
         return Ok(());
     }
     state.pending_thread_metadata_modal = None;
+    state.pending_thread_export_html = None;
     state.pending_thread_delete_confirm = Some(ThreadDeleteConfirmState {
         thread_index,
         selected: 1,
@@ -4003,6 +4086,7 @@ fn open_thread_rename_modal(state: &mut ChatUiState, thread_index: usize) -> Res
         return Ok(());
     };
     state.pending_thread_metadata_modal = None;
+    state.pending_thread_export_html = None;
     let mut input = InputBuffer::new();
     input.text = target.session_name.clone();
     input.cursor_char = input.char_count();
@@ -4051,6 +4135,93 @@ fn apply_thread_rename_modal(
     Ok(())
 }
 
+fn open_thread_export_html_modal(
+    state: &mut ChatUiState,
+    thread_index: usize,
+) -> Result<(), AppError> {
+    let Some(target) = state.threads.get(thread_index) else {
+        state.status = ui_text_thread_not_found().to_string();
+        return Ok(());
+    };
+    state.pending_thread_metadata_modal = None;
+    state.pending_thread_rename = None;
+    state.pending_thread_delete_confirm = None;
+    let mut input = InputBuffer::new();
+    input.text = format!("./{}.html", target.session_name);
+    input.cursor_char = input.char_count();
+    input.view_char_offset = 0;
+    state.pending_thread_export_html = Some(ThreadExportHtmlModalState {
+        thread_index,
+        input,
+    });
+    state.status = ui_text_thread_export_html_prompt().to_string();
+    Ok(())
+}
+
+fn apply_thread_export_html_modal(
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+) -> Result<(), AppError> {
+    let Some(modal) = state.pending_thread_export_html.as_ref() else {
+        return Ok(());
+    };
+    let Some(target) = state.threads.get(modal.thread_index).cloned() else {
+        state.pending_thread_export_html = None;
+        state.status = ui_text_thread_not_found().to_string();
+        return Ok(());
+    };
+    let raw_output = modal.input.text.trim();
+    if raw_output.is_empty() {
+        state.status = ui_text_thread_export_html_empty().to_string();
+        return Ok(());
+    }
+    let output_path = match resolve_export_html_output_path(raw_output) {
+        Ok(path) => path,
+        Err(message) => {
+            state.status = format!("{}: {}", ui_text_thread_export_html_invalid_path(), message);
+            return Ok(());
+        }
+    };
+    let session_state = match load_session_state_for_export(target.file_path.as_path()) {
+        Ok(value) => value,
+        Err(err) => {
+            state.status = format!(
+                "{}: {}",
+                ui_text_thread_export_html_failed(),
+                trim_ui_text(i18n::localize_error(&err).as_str(), 120)
+            );
+            return Ok(());
+        }
+    };
+    let payload = build_session_export_payload(services, state, &target, &session_state);
+    let payload_text = match serde_json::to_string_pretty(&payload) {
+        Ok(raw) => sanitize_json_for_html_script(raw.as_str()),
+        Err(err) => {
+            state.status = format!("{}: {}", ui_text_thread_export_html_failed(), err);
+            return Ok(());
+        }
+    };
+    let html = build_session_export_html_document(payload_text.as_str());
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        state.status = format!("{}: {}", ui_text_thread_export_html_failed(), err);
+        return Ok(());
+    }
+    if let Err(err) = fs::write(&output_path, html) {
+        state.status = format!("{}: {}", ui_text_thread_export_html_failed(), err);
+        return Ok(());
+    }
+    state.pending_thread_export_html = None;
+    state.status = format!(
+        "{}: {}",
+        ui_text_thread_export_html_success(),
+        trim_ui_text(output_path.display().to_string().as_str(), 120)
+    );
+    Ok(())
+}
+
 fn delete_thread_session_by_index(
     services: &mut ActionServices<'_>,
     state: &mut ChatUiState,
@@ -4072,6 +4243,7 @@ fn delete_thread_session_by_index(
         .retain(|item| item.session_id != target.session_id);
     state.pending_thread_rename = None;
     state.pending_thread_action_menu = None;
+    state.pending_thread_export_html = None;
     state.pending_thread_delete_confirm = None;
     state.pending_thread_metadata_modal = None;
     state.set_threads(services.session.list_sessions().unwrap_or_default());
@@ -4119,6 +4291,7 @@ fn open_thread_metadata_modal(
     };
     state.pending_thread_delete_confirm = None;
     state.pending_thread_rename = None;
+    state.pending_thread_export_html = None;
     state.pending_thread_metadata_modal = Some(ThreadMetadataModalState {
         session_id: target.session_id.clone(),
         session_name: target.session_name.clone(),
@@ -4137,6 +4310,7 @@ fn activate_nav_item(
     state.pending_delete_confirm = None;
     state.pending_thread_action_menu = None;
     state.pending_thread_rename = None;
+    state.pending_thread_export_html = None;
     state.pending_thread_delete_confirm = None;
     state.pending_thread_metadata_modal = None;
     state.pending_tool_result_modal = None;
@@ -4821,6 +4995,9 @@ fn handle_pending_ai_key_event(
     if state.pending_tool_result_modal.is_some() {
         return handle_tool_result_modal_key(key, state);
     }
+    if state.pending_thread_export_html.is_some() {
+        return handle_thread_export_html_modal_key(key, services, state);
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         cancel_requested.store(true, Ordering::SeqCst);
         if let Some(live) = state.ai_live.as_mut() {
@@ -4888,6 +5065,10 @@ fn handle_pending_ai_mouse_event(
     }
     if state.pending_tool_result_modal.is_some() {
         handle_tool_result_modal_mouse(mouse, state, layout)?;
+        return Ok(());
+    }
+    if state.pending_thread_export_html.is_some() {
+        handle_thread_export_html_modal_mouse(mouse, services, state, layout)?;
         return Ok(());
     }
     if matches!(
@@ -6474,6 +6655,90 @@ fn draw_thread_rename_modal(
     }
 }
 
+fn draw_thread_export_html_modal(
+    frame: &mut Frame<'_>,
+    state: &ChatUiState,
+    layout: UiLayout,
+    palette: ThemePalette,
+) {
+    let Some(modal_state) = state.pending_thread_export_html.as_ref() else {
+        return;
+    };
+    draw_modal_overlay(frame, palette);
+    let modal = thread_export_html_modal_rect(layout);
+    frame.render_widget(Clear, modal);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(ui_text_thread_export_html_modal_title())
+        .style(Style::default().bg(palette.panel_bg))
+        .border_style(Style::default().fg(Color::Rgb(115, 227, 255)));
+    frame.render_widget(outer, modal);
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .margin(1)
+        .split(modal);
+    frame.render_widget(
+        Paragraph::new(ui_text_thread_export_html_prompt())
+            .style(Style::default().fg(palette.muted)),
+        body[0],
+    );
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.border_focus));
+    frame.render_widget(input_block, body[1]);
+    let input_inner = body[1].inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let (visible, cursor_col) = project_input_view(&modal_state.input, input_inner.width as usize);
+    frame.render_widget(
+        Paragraph::new(visible).style(Style::default().fg(palette.text)),
+        input_inner,
+    );
+    if input_inner.width > 0 && input_inner.height > 0 {
+        frame.set_cursor_position((input_inner.x + cursor_col as u16, input_inner.y));
+    }
+    let clear_button = thread_export_html_clear_button_data(layout);
+    let hint_rect = clear_button
+        .as_ref()
+        .map(|button| Rect {
+            x: body[2]
+                .x
+                .saturating_add(button.rect.width.saturating_add(1)),
+            y: body[2].y,
+            width: body[2]
+                .width
+                .saturating_sub(button.rect.width.saturating_add(1))
+                .max(1),
+            height: body[2].height.max(1),
+        })
+        .unwrap_or(body[2]);
+    frame.render_widget(
+        Paragraph::new(trim_ui_text(
+            ui_text_thread_export_html_modal_hint(),
+            hint_rect.width.max(1) as usize,
+        ))
+        .style(Style::default().fg(palette.muted)),
+        hint_rect,
+    );
+    if let Some(button) = clear_button {
+        frame.render_widget(
+            Paragraph::new(button.label).style(
+                Style::default()
+                    .fg(palette.panel_bg)
+                    .bg(Color::Rgb(255, 176, 122))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            button.rect,
+        );
+    }
+}
+
 fn execute_mcp_tool_call_tui(
     services: &mut ActionServices<'_>,
     group_id: &str,
@@ -7236,6 +7501,9 @@ fn draw_ui(frame: &mut Frame<'_>, services: &ActionServices<'_>, state: &mut Cha
     }
     if state.pending_thread_rename.is_some() {
         draw_thread_rename_modal(frame, state, layout, palette);
+    }
+    if state.pending_thread_export_html.is_some() {
+        draw_thread_export_html_modal(frame, state, layout, palette);
     }
     if state.pending_thread_metadata_modal.is_some() {
         draw_thread_metadata_modal(frame, state, layout, palette);
@@ -11637,7 +11905,7 @@ fn delete_message_modal_rect(layout: UiLayout) -> Rect {
 }
 
 fn thread_action_menu_rect(layout: UiLayout) -> Rect {
-    centered_rect(layout.threads, 86, 8)
+    centered_rect(layout.threads, 86, 9)
 }
 
 fn thread_delete_modal_rect(layout: UiLayout) -> Rect {
@@ -11650,6 +11918,10 @@ fn thread_metadata_modal_rect(layout: UiLayout) -> Rect {
 
 fn thread_rename_modal_rect(layout: UiLayout) -> Rect {
     centered_rect(layout.conversation, 62, 9)
+}
+
+fn thread_export_html_modal_rect(layout: UiLayout) -> Rect {
+    centered_rect(layout.conversation, 82, 9)
 }
 
 fn thread_rename_clear_button_data(layout: UiLayout) -> Option<ThreadRenameClearButton> {
@@ -11674,6 +11946,37 @@ fn thread_rename_clear_button_data(layout: UiLayout) -> Option<ThreadRenameClear
     let x = hint_row
         .x
         .saturating_add(hint_row.width.saturating_sub(width));
+    Some(ThreadRenameClearButton {
+        label: trim_ui_text(label.as_str(), hint_row.width as usize),
+        rect: Rect {
+            x,
+            y: hint_row.y,
+            width,
+            height: 1,
+        },
+    })
+}
+
+fn thread_export_html_clear_button_data(layout: UiLayout) -> Option<ThreadRenameClearButton> {
+    let modal = thread_export_html_modal_rect(layout);
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .margin(1)
+        .split(modal);
+    let hint_row = body[2];
+    if hint_row.width < 8 {
+        return None;
+    }
+    let label = format!("[ {} ]", ui_text_clear_button());
+    let width = text_display_width(label.as_str())
+        .max(1)
+        .min(hint_row.width as usize) as u16;
+    let x = hint_row.x;
     Some(ThreadRenameClearButton {
         label: trim_ui_text(label.as_str(), hint_row.width as usize),
         rect: Rect {
@@ -11839,11 +12142,12 @@ fn format_u64_compact(value: u64) -> String {
     out.chars().rev().collect()
 }
 
-fn thread_action_menu_options() -> [&'static str; 3] {
+fn thread_action_menu_options() -> [&'static str; 4] {
     [
         ui_text_thread_action_delete(),
         ui_text_thread_action_rename(),
         ui_text_thread_action_metadata(),
+        ui_text_thread_action_export_html(),
     ]
 }
 
@@ -12056,6 +12360,1700 @@ fn build_thread_metadata_report(
             task_latest,
         )
     }
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn resolve_export_html_output_path(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ui_text_thread_export_html_empty().to_string());
+    }
+    let candidate = if trimmed.starts_with('~') {
+        expand_tilde(trimmed)
+    } else {
+        PathBuf::from(trimmed)
+    };
+    let mut output_path = if candidate.is_absolute() {
+        candidate
+    } else {
+        let cwd = env::current_dir().map_err(|err| err.to_string())?;
+        cwd.join(candidate)
+    };
+    output_path = normalize_path_lexically(output_path.as_path());
+    let invalid_file_name = match output_path.file_name() {
+        Some(name) => {
+            let text = name.to_string_lossy();
+            text.trim().is_empty() || text == "." || text == ".."
+        }
+        None => true,
+    };
+    if invalid_file_name {
+        return Err(ui_text_thread_export_html_invalid_path().to_string());
+    }
+    let extension = output_path
+        .extension()
+        .and_then(|item| item.to_str())
+        .map(|item| item.to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension.is_empty() {
+        output_path.set_extension("html");
+    } else if extension != "html" && extension != "htm" {
+        return Err(ui_text_thread_export_html_suffix_required().to_string());
+    }
+    Ok(output_path)
+}
+
+fn load_session_state_for_export(path: &Path) -> Result<SessionState, AppError> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        AppError::Runtime(format!(
+            "failed to read session file {}: {err}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str::<SessionState>(&raw).map_err(|err| {
+        AppError::Runtime(format!(
+            "failed to parse session file {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+fn push_unique_non_empty(raw: &str, seen: &mut HashSet<String>, values: &mut Vec<String>) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let value = trimmed.to_string();
+    if seen.insert(value.clone()) {
+        values.push(value);
+    }
+}
+
+fn message_kind_text(kind: MessageKind) -> &'static str {
+    match kind {
+        MessageKind::User => "user",
+        MessageKind::Assistant => "assistant",
+        MessageKind::Tool => "tool",
+        MessageKind::System => "system",
+    }
+}
+
+fn role_counts_from_messages(messages: &[SessionMessage]) -> (usize, usize, usize, usize) {
+    let mut user = 0usize;
+    let mut assistant = 0usize;
+    let mut tool = 0usize;
+    let mut system = 0usize;
+    for item in messages {
+        match item.role.as_str() {
+            "user" => user = user.saturating_add(1),
+            "assistant" | "thinking" => assistant = assistant.saturating_add(1),
+            "tool" => tool = tool.saturating_add(1),
+            "system" => system = system.saturating_add(1),
+            _ => {}
+        }
+    }
+    (user, assistant, tool, system)
+}
+
+fn markdown_render_options_for_export() -> ComrakOptions<'static> {
+    let mut options = ComrakOptions::default();
+    options.extension.table = true;
+    options.extension.strikethrough = true;
+    options.extension.tasklist = true;
+    options.extension.autolink = true;
+    options.extension.tagfilter = true;
+    options.parse.smart = true;
+    options.render.hardbreaks = true;
+    options.render.r#unsafe = false;
+    options
+}
+
+fn render_markdown_html_for_export(raw: &str, options: &ComrakOptions<'_>) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    markdown_to_html(trimmed, options)
+}
+
+fn pretty_json_or_raw_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn build_session_export_payload(
+    services: &ActionServices<'_>,
+    state: &ChatUiState,
+    session_overview: &SessionOverview,
+    session_state: &SessionState,
+) -> serde_json::Value {
+    let markdown_options = markdown_render_options_for_export();
+    let (user_count, assistant_count, tool_count, system_count) =
+        role_counts_from_messages(&session_state.messages);
+    let message_count = session_state.messages.len();
+    let summary_chars = session_state.summary.chars().count();
+    let context_usage = message_count
+        .saturating_mul(100)
+        .saturating_div(services.cfg.session.max_messages.max(1))
+        .min(100);
+    let mut account_set = HashSet::<String>::new();
+    let mut environment_set = HashSet::<String>::new();
+    let mut os_set = HashSet::<String>::new();
+    let mut cwd_set = HashSet::<String>::new();
+    let mut mode_set = HashSet::<String>::new();
+    let mut label_set = HashSet::<String>::new();
+    let mut accounts = Vec::<String>::new();
+    let mut environments = Vec::<String>::new();
+    let mut os_names = Vec::<String>::new();
+    let mut cwds = Vec::<String>::new();
+    let mut modes = Vec::<String>::new();
+    let mut labels = Vec::<String>::new();
+    let mut tool_call_total = 0usize;
+    let messages = session_state
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let content_pretty = pretty_json_or_raw_text(item.content.as_str());
+            let content_html =
+                render_markdown_html_for_export(content_pretty.as_str(), &markdown_options);
+            let tool_meta_json = if let Some(meta) = item.tool_meta.as_ref() {
+                tool_call_total = tool_call_total.saturating_add(1);
+                push_unique_non_empty(meta.account.as_str(), &mut account_set, &mut accounts);
+                push_unique_non_empty(
+                    meta.environment.as_str(),
+                    &mut environment_set,
+                    &mut environments,
+                );
+                push_unique_non_empty(meta.os_name.as_str(), &mut os_set, &mut os_names);
+                push_unique_non_empty(meta.cwd.as_str(), &mut cwd_set, &mut cwds);
+                push_unique_non_empty(meta.mode.as_str(), &mut mode_set, &mut modes);
+                push_unique_non_empty(meta.label.as_str(), &mut label_set, &mut labels);
+                let command_pretty = pretty_json_or_raw_text(meta.command.as_str());
+                let arguments_pretty = pretty_json_or_raw_text(meta.arguments.as_str());
+                let result_pretty = pretty_json_or_raw_text(meta.result_payload.as_str());
+                json!({
+                    "tool_call_id": meta.tool_call_id,
+                    "function_name": meta.function_name,
+                    "command": meta.command,
+                    "command_pretty": command_pretty,
+                    "arguments": meta.arguments,
+                    "arguments_pretty": arguments_pretty,
+                    "result_payload": meta.result_payload,
+                    "result_pretty": result_pretty,
+                    "executed_at_epoch_ms": meta.executed_at_epoch_ms,
+                    "executed_at": format_epoch_ms(meta.executed_at_epoch_ms),
+                    "account": meta.account,
+                    "environment": meta.environment,
+                    "os_name": meta.os_name,
+                    "cwd": meta.cwd,
+                    "mode": meta.mode,
+                    "label": meta.label,
+                    "exit_code": meta.exit_code,
+                    "duration_ms": meta.duration_ms,
+                    "timed_out": meta.timed_out,
+                    "interrupted": meta.interrupted,
+                    "blocked": meta.blocked,
+                })
+            } else {
+                serde_json::Value::Null
+            };
+            json!({
+                "index": idx + 1,
+                "role": item.role,
+                "kind": message_kind_text(item.kind),
+                "group_id": item.group_id,
+                "created_at_epoch_ms": item.created_at_epoch_ms,
+                "created_at": format_epoch_ms(item.created_at_epoch_ms),
+                "content": item.content,
+                "content_pretty": content_pretty,
+                "content_html": content_html,
+                "tool_meta": tool_meta_json,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "session": {
+            "id": session_state.session_id,
+            "name": session_state.session_name,
+            "file_path": session_overview.file_path.display().to_string(),
+            "created_at_epoch_ms": session_overview.created_at_epoch_ms,
+            "updated_at_epoch_ms": session_overview.last_updated_epoch_ms,
+            "created_at": format_epoch_ms(session_overview.created_at_epoch_ms),
+            "updated_at": format_epoch_ms(session_overview.last_updated_epoch_ms),
+            "summary": session_state.summary,
+            "summary_chars": summary_chars,
+            "message_count": message_count,
+            "context_usage_percent": context_usage,
+            "token_usage_committed": session_state.token_usage_committed,
+            "counts": {
+                "user": user_count,
+                "assistant": assistant_count,
+                "tool": tool_count,
+                "system": system_count
+            },
+            "active": session_overview.active,
+        },
+        "compass": {
+            "created_at_epoch_ms": session_state.compass.created_at_epoch_ms,
+            "last_updated_epoch_ms": session_state.compass.last_updated_epoch_ms,
+            "created_at": format_epoch_ms(session_state.compass.created_at_epoch_ms),
+            "last_updated": format_epoch_ms(session_state.compass.last_updated_epoch_ms),
+            "truncated_messages": session_state.compass.truncated_messages,
+            "compression_rounds": session_state.compass.compression_rounds,
+            "dropped_groups": session_state.compass.dropped_groups,
+            "total_user_messages": session_state.compass.total_user_messages,
+            "total_assistant_messages": session_state.compass.total_assistant_messages,
+            "total_tool_messages": session_state.compass.total_tool_messages,
+            "last_action": session_state.compass.last_action,
+            "last_user_topic": session_state.compass.last_user_topic,
+            "last_assistant_focus": session_state.compass.last_assistant_focus,
+            "last_compaction_preview": session_state.compass.last_compaction_preview,
+        },
+        "runtime": {
+            "exported_at": Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            "model": services.cfg.ai.model,
+            "app_language": services.cfg.app.language.clone().unwrap_or_default(),
+            "default_language": i18n::language_code(i18n::resolve_language(services.cfg.app.language.as_deref())),
+            "cwd": env::current_dir().ok().map(|item| item.display().to_string()).unwrap_or_default(),
+            "os": env::consts::OS,
+            "arch": env::consts::ARCH,
+            "recent_messages": services.cfg.session.recent_messages,
+            "max_messages": services.cfg.session.max_messages,
+            "task_directory": task_store::resolve_tasks_dir(session_overview.file_path.as_path()).display().to_string(),
+            "ui_token_committed": state.token_usage_committed,
+            "ui_token_live_estimate": state.token_live_estimate,
+            "ui_token_display": state.token_display_value,
+        },
+        "environment": {
+            "tool_call_total": tool_call_total,
+            "accounts": accounts,
+            "environments": environments,
+            "os_names": os_names,
+            "cwds": cwds,
+            "modes": modes,
+            "labels": labels,
+        },
+        "messages": messages,
+    })
+}
+
+fn sanitize_json_for_html_script(raw: &str) -> String {
+    raw.replace("</script>", "<\\/script>")
+        .replace("<!--", "<\\!--")
+}
+
+fn build_session_export_html_document(payload_json: &str) -> String {
+    let template = r##"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Session Export</title>
+  <style>
+    :root {
+      --bg-0: #08132b;
+      --bg-1: #0f2451;
+      --bg-2: #1b3c77;
+      --panel: rgba(14, 24, 46, 0.74);
+      --panel-border: rgba(140, 193, 255, 0.28);
+      --text: #f3f8ff;
+      --muted: #b9c9e8;
+      --accent: #66d9ff;
+      --success: #74ef9a;
+      --warning: #ffd166;
+      --danger: #ff7b8b;
+      --tool: #c2a7ff;
+      --radius: 18px;
+      --shadow: 0 18px 44px rgba(0, 0, 0, 0.32);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; min-height: 100%; }
+    body {
+      font-family: "SF Pro Display", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--text);
+      background: linear-gradient(130deg, var(--bg-0), var(--bg-1), var(--bg-2), #2f0f5e);
+      background-size: 320% 320%;
+      animation: aurora 16s ease infinite;
+      overflow-x: hidden;
+    }
+    @keyframes aurora {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    .decor {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+      opacity: 0.34;
+      background:
+        radial-gradient(circle at 12% 20%, rgba(112, 223, 255, 0.35), transparent 35%),
+        radial-gradient(circle at 88% 12%, rgba(255, 126, 182, 0.28), transparent 32%),
+        radial-gradient(circle at 52% 88%, rgba(117, 255, 173, 0.22), transparent 36%);
+      filter: blur(4px);
+    }
+    .container {
+      position: relative;
+      z-index: 1;
+      width: min(1220px, calc(100vw - 32px));
+      margin: 28px auto 48px;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+      overflow: hidden;
+    }
+    .hero {
+      padding: 22px 22px 20px;
+      display: grid;
+      gap: 14px;
+    }
+    .hero h1 {
+      margin: 0;
+      font-size: clamp(22px, 4vw, 34px);
+      line-height: 1.15;
+      letter-spacing: .3px;
+      text-shadow: 0 8px 24px rgba(0, 0, 0, .35);
+    }
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+      word-break: break-all;
+    }
+    .chips {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .chip {
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 12px;
+      color: #fff;
+      background: rgba(255, 255, 255, 0.08);
+      animation: pulse 2.8s ease infinite;
+      animation-delay: var(--delay, 0s);
+    }
+    @keyframes pulse {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-1px); }
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .lang-select-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, .2);
+      background: rgba(255, 255, 255, .08);
+      padding: 5px 8px;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, .2);
+    }
+    .lang-select-wrap .label {
+      color: #e8f3ff;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .2px;
+      white-space: nowrap;
+    }
+    .lang-select {
+      min-width: 166px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, .2);
+      color: #f1f6ff;
+      background: rgba(4, 10, 24, .55);
+      padding: 5px 8px;
+      font-size: 12px;
+      outline: none;
+    }
+    button {
+      border: none;
+      border-radius: 12px;
+      padding: 9px 14px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #041328;
+      background: linear-gradient(135deg, #8ef8ff, #7affbc);
+      cursor: pointer;
+      transition: transform .2s ease, filter .2s ease, box-shadow .2s ease;
+      box-shadow: 0 8px 24px rgba(73, 226, 193, 0.24);
+    }
+    button.secondary {
+      background: linear-gradient(135deg, #d4ddff, #f0d2ff);
+      box-shadow: 0 8px 24px rgba(181, 162, 255, 0.26);
+    }
+    button:disabled {
+      cursor: not-allowed;
+      filter: grayscale(.2) brightness(.85);
+      transform: none;
+      box-shadow: none;
+    }
+    button:hover:not(:disabled) {
+      transform: translateY(-1px);
+      filter: saturate(1.08);
+    }
+    .status {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 14px 16px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+      background: rgba(255, 255, 255, 0.03);
+    }
+    .section-head h2 {
+      margin: 0;
+      font-size: 15px;
+      letter-spacing: .2px;
+    }
+    .meta-overview {
+      color: #bcd0f3;
+      font-size: 12px;
+      letter-spacing: .2px;
+    }
+    .meta-highlights {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 10px;
+      padding: 12px 16px 8px;
+    }
+    .meta-kpi {
+      position: relative;
+      overflow: hidden;
+      border-radius: 14px;
+      border: 1px solid rgba(255, 255, 255, .16);
+      background: linear-gradient(135deg, rgba(255, 255, 255, .11), rgba(255, 255, 255, .04));
+      padding: 11px 12px 10px;
+      min-height: 86px;
+    }
+    .meta-kpi::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 3px;
+      background: var(--kpi-color, #8edfff);
+      box-shadow: 0 0 12px var(--kpi-color, #8edfff);
+    }
+    .meta-kpi .k {
+      color: #b7c9ee;
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+    .meta-kpi .v {
+      color: #f3f8ff;
+      font-size: 24px;
+      line-height: 1.1;
+      font-weight: 800;
+      letter-spacing: .2px;
+    }
+    .meta-kpi .sub {
+      margin-top: 6px;
+      color: #bfd2f7;
+      font-size: 12px;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .meta-columns {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
+      padding: 6px 16px 14px;
+    }
+    .meta-group {
+      border-radius: 14px;
+      border: 1px solid rgba(255, 255, 255, .14);
+      background: linear-gradient(160deg, rgba(255, 255, 255, .09), rgba(255, 255, 255, .03));
+      padding: 10px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .12);
+    }
+    .meta-group-title {
+      color: #9fc6ff;
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: .2px;
+      margin-bottom: 8px;
+      padding-bottom: 7px;
+      border-bottom: 1px solid rgba(255, 255, 255, .12);
+    }
+    .meta-row {
+      display: grid;
+      grid-template-columns: 100px minmax(0, 1fr);
+      gap: 8px;
+      align-items: start;
+      padding: 6px 0;
+      border-bottom: 1px dashed rgba(255, 255, 255, .1);
+    }
+    .meta-row:last-child { border-bottom: none; }
+    .meta-row .k {
+      color: #90b7f0;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .meta-row .v {
+      color: #ecf4ff;
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .meta-row .v code {
+      padding: 1px 5px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, .11);
+      color: #f8fcff;
+    }
+    .tag-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 2px 16px 16px;
+    }
+    .tag {
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 12px;
+      border: 1px solid rgba(255, 255, 255, .2);
+      color: #f2f7ff;
+      background: linear-gradient(140deg, rgba(255, 255, 255, .14), rgba(255, 255, 255, .06));
+      box-shadow: 0 4px 14px rgba(0, 0, 0, .22);
+    }
+    .tag[data-type="account"] { border-color: rgba(111, 227, 255, .55); }
+    .tag[data-type="env"] { border-color: rgba(117, 245, 160, .55); }
+    .tag[data-type="os"] { border-color: rgba(255, 224, 125, .55); }
+    .tag[data-type="mode"] { border-color: rgba(203, 171, 255, .55); }
+    .tag[data-type="label"] { border-color: rgba(255, 151, 188, .55); }
+    .toolbar {
+      display: grid;
+      grid-template-columns: 1.7fr .8fr auto;
+      gap: 8px;
+      padding: 12px 16px;
+      border-bottom: 1px solid rgba(255, 255, 255, .1);
+    }
+    input, select {
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, .2);
+      color: #f1f6ff;
+      background: rgba(4, 10, 24, .45);
+      padding: 9px 10px;
+      font-size: 13px;
+      outline: none;
+    }
+    input:focus, select:focus {
+      border-color: rgba(134, 225, 255, 0.9);
+      box-shadow: 0 0 0 2px rgba(96, 219, 255, .24);
+    }
+    #messageStats {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .messages {
+      padding: 14px 16px 18px;
+      display: grid;
+      gap: 10px;
+    }
+    .message {
+      border-radius: 14px;
+      border: 1px solid rgba(255, 255, 255, .1);
+      padding: 12px;
+      background: rgba(255, 255, 255, .045);
+      animation: reveal .4s ease both;
+      transform-origin: center;
+    }
+    @keyframes reveal {
+      from { opacity: 0; transform: translateY(8px) scale(.985); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .message.user { border-color: rgba(102, 217, 255, .45); background: rgba(47, 191, 237, .12); }
+    .message.assistant { border-color: rgba(124, 245, 175, .36); background: rgba(58, 204, 123, .11); }
+    .message.tool { border-color: rgba(194, 167, 255, .42); background: rgba(155, 117, 242, .12); }
+    .message.system { border-color: rgba(255, 143, 188, .38); background: rgba(236, 95, 157, .12); }
+    .message.thinking { border-color: rgba(255, 219, 126, .38); background: rgba(255, 190, 66, .12); }
+    .message-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: baseline;
+      margin-bottom: 8px;
+      font-size: 12px;
+    }
+    .message-role { font-weight: 800; letter-spacing: .3px; text-transform: uppercase; }
+    .message-time { color: var(--muted); }
+    .message-body {
+      margin: 0;
+      color: #edf5ff;
+      font-size: 14px;
+      line-height: 1.6;
+      overflow-wrap: anywhere;
+    }
+    .message-body.markdown > :first-child { margin-top: 0; }
+    .message-body.markdown > :last-child { margin-bottom: 0; }
+    .message-body.markdown h1,
+    .message-body.markdown h2,
+    .message-body.markdown h3,
+    .message-body.markdown h4 {
+      margin: 12px 0 8px;
+      color: #dcf3ff;
+      line-height: 1.25;
+      letter-spacing: .2px;
+    }
+    .message-body.markdown p { margin: 8px 0; }
+    .message-body.markdown ul,
+    .message-body.markdown ol {
+      margin: 8px 0;
+      padding-left: 22px;
+    }
+    .message-body.markdown blockquote {
+      margin: 10px 0;
+      padding: 8px 12px;
+      border-left: 3px solid rgba(145, 220, 255, .72);
+      background: rgba(255, 255, 255, .07);
+      border-radius: 8px;
+    }
+    .message-body.markdown hr {
+      border: none;
+      border-top: 1px dashed rgba(255, 255, 255, .25);
+      margin: 12px 0;
+    }
+    .message-body.markdown a {
+      color: #8fe9ff;
+      text-decoration: none;
+      border-bottom: 1px dashed rgba(143, 233, 255, .6);
+    }
+    .message-body.markdown code {
+      background: rgba(255, 255, 255, .12);
+      border: 1px solid rgba(255, 255, 255, .15);
+      border-radius: 6px;
+      padding: 1px 6px;
+      font-family: "JetBrains Mono", "SF Mono", Menlo, monospace;
+      font-size: 12px;
+    }
+    .message-body.markdown pre {
+      margin: 10px 0;
+      padding: 10px;
+      max-height: 360px;
+      overflow: auto;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, .16);
+      background: rgba(9, 16, 33, .64);
+    }
+    .message-body.markdown pre code {
+      background: transparent;
+      border: none;
+      padding: 0;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre;
+      overflow-wrap: normal;
+    }
+    .message-body.markdown table {
+      width: 100%;
+      margin: 10px 0;
+      border-collapse: collapse;
+      border: 1px solid rgba(255, 255, 255, .2);
+      border-radius: 10px;
+      overflow: hidden;
+      background: rgba(255, 255, 255, .04);
+    }
+    .message-body.markdown th,
+    .message-body.markdown td {
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(255, 255, 255, .12);
+      border-right: 1px solid rgba(255, 255, 255, .1);
+      font-size: 13px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .message-body.markdown th {
+      color: #bce6ff;
+      background: rgba(143, 233, 255, .1);
+      font-weight: 800;
+    }
+    .message-body.markdown tr:last-child td { border-bottom: none; }
+    .message-body.markdown td:last-child,
+    .message-body.markdown th:last-child { border-right: none; }
+    .tool-shell {
+      margin-top: 10px;
+      border-top: 1px dashed rgba(255, 255, 255, .2);
+      padding-top: 10px;
+      display: grid;
+      gap: 8px;
+    }
+    .tool-chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .tool-chip {
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 12px;
+      border: 1px solid rgba(255, 255, 255, .2);
+      color: #edf7ff;
+      background: rgba(255, 255, 255, .08);
+    }
+    .tool-chip.good {
+      border-color: rgba(117, 245, 160, .65);
+      color: #baffce;
+      background: rgba(117, 245, 160, .14);
+    }
+    .tool-chip.bad {
+      border-color: rgba(255, 130, 151, .65);
+      color: #ffd8e0;
+      background: rgba(255, 130, 151, .18);
+    }
+    .tool-meta-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 8px;
+    }
+    .tool-meta-item {
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, .14);
+      background: rgba(255, 255, 255, .07);
+      padding: 8px 10px;
+      line-height: 1.45;
+      font-size: 12px;
+    }
+    .tool-meta-item .k {
+      color: #9fd3ff;
+      font-weight: 800;
+      margin-right: 6px;
+    }
+    .tool-meta-item .v {
+      color: #e9f4ff;
+      overflow-wrap: anywhere;
+    }
+    .tool-sections {
+      display: grid;
+      gap: 8px;
+    }
+    .tool-section {
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, .16);
+      background: rgba(8, 17, 36, .52);
+      overflow: hidden;
+    }
+    .tool-section > summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 8px 10px;
+      color: #bfe8ff;
+      font-size: 12px;
+      font-weight: 800;
+      border-bottom: 1px solid rgba(255, 255, 255, .12);
+      user-select: none;
+      background: rgba(159, 211, 255, .08);
+    }
+    .tool-section > summary::-webkit-details-marker { display: none; }
+    .tool-section > summary::before {
+      content: "▸";
+      margin-right: 6px;
+      color: #9fd3ff;
+    }
+    .tool-section[open] > summary::before { content: "▾"; }
+    .tool-section pre {
+      margin: 0;
+      padding: 10px;
+      max-height: 280px;
+      overflow: auto;
+      white-space: pre-wrap;
+      line-height: 1.45;
+      font-size: 12px;
+      color: #eaf4ff;
+      font-family: "JetBrains Mono", "SF Mono", Menlo, monospace;
+      background: rgba(7, 13, 28, .62);
+    }
+    .empty {
+      padding: 18px;
+      color: var(--muted);
+      text-align: center;
+      border: 1px dashed rgba(255, 255, 255, .2);
+      border-radius: 12px;
+    }
+    @media (max-width: 820px) {
+      .toolbar { grid-template-columns: 1fr; }
+      #messageStats { justify-content: flex-start; }
+      .container { width: calc(100vw - 20px); margin-top: 12px; }
+      .hero { padding: 16px; }
+      .meta-highlights { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .meta-columns { grid-template-columns: 1fr; }
+      .meta-row { grid-template-columns: 88px minmax(0, 1fr); }
+      .tool-meta-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="decor"></div>
+  <main class="container">
+    <section class="panel hero">
+      <h1 id="heroTitle">Session Export</h1>
+      <p id="heroSubtitle"></p>
+      <div id="statChips" class="chips"></div>
+      <div class="actions">
+        <button id="exportImageBtn">Export Chat Long Image</button>
+        <button id="toggleMetaBtn" class="secondary">Collapse Metadata</button>
+        <label class="lang-select-wrap" for="languageSelect">
+          <span id="languageSelectLabel" class="label">Language</span>
+          <select id="languageSelect" class="lang-select"></select>
+        </label>
+        <span id="actionStatus" class="status"></span>
+      </div>
+    </section>
+
+    <section id="metadataPanel" class="panel">
+      <div class="section-head">
+        <h2 id="metaTitle">Session Metadata / Runtime</h2>
+        <span id="metaOverview" class="meta-overview"></span>
+      </div>
+      <div id="metaHighlights" class="meta-highlights"></div>
+      <div id="metadataColumns" class="meta-columns"></div>
+      <div id="environmentTags" class="tag-list"></div>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <h2 id="messagesTitle">Messages</h2>
+      </div>
+      <div class="toolbar">
+        <input id="messageFilter" type="text" placeholder="Search messages..." />
+        <select id="roleFilter">
+          <option value="all">All Roles</option>
+          <option value="user">user</option>
+          <option value="assistant">assistant</option>
+          <option value="thinking">thinking</option>
+          <option value="tool">tool</option>
+          <option value="system">system</option>
+        </select>
+        <span id="messageStats">0</span>
+      </div>
+      <div id="messages" class="messages"></div>
+    </section>
+  </main>
+
+  <script id="machineclaw-session-data" type="application/json">__SESSION_EXPORT_DATA__</script>
+  <script>
+    (() => {
+      const statusEl = document.getElementById("actionStatus");
+      const roleColor = {
+        user: "#66d9ff",
+        assistant: "#74ef9a",
+        thinking: "#ffd166",
+        tool: "#c2a7ff",
+        system: "#ff8fbc",
+      };
+      const I18N = {
+        zh: {
+          doc_title: "会话导出",
+          na: "N/A",
+          meta_title: "会话元数据 / 运行时",
+          messages_title: "聊天消息",
+          btn_export_image: "导出聊天长图",
+          btn_toggle_meta_expand: "展开元数据",
+          btn_toggle_meta_collapse: "折叠元数据",
+          language_label: "语言",
+          filter_placeholder: "按内容搜索消息...",
+          role_all: "全部角色",
+          role_user: "用户",
+          role_assistant: "助手",
+          role_thinking: "思考",
+          role_tool: "工具",
+          role_system: "系统",
+          label_id: "ID",
+          label_file: "文件",
+          label_exported: "导出时间",
+          chip_messages: "消息",
+          chip_summary_chars: "摘要字符",
+          chip_context_usage: "上下文占用",
+          meta_overview: "消息 {count} 条 · 上下文占用 {usage}% · 导出时间 {exported}",
+          kpi_messages: "消息总数",
+          kpi_context_usage: "上下文占用",
+          kpi_compression_rounds: "压缩轮次",
+          kpi_token_stats: "Token 统计",
+          sub_recent_max: "最近窗口={recent} · 最大窗口={max}",
+          sub_truncated_dropped: "截断 {truncated} · 丢弃分组 {dropped}",
+          sub_token_mix: "已提交 {committed} / 实时 {live} / 展示 {display}",
+          group_session_identity: "会话身份",
+          group_runtime: "运行环境",
+          group_compass: "压缩与上下文",
+          group_recent_clues: "最近线索",
+          field_session_id: "会话ID",
+          field_session_name: "会话名",
+          field_session_file: "会话文件",
+          field_created_at: "创建时间",
+          field_updated_at: "更新时间",
+          field_active_session: "当前会话",
+          field_model: "模型",
+          field_exported_at: "导出时间",
+          field_cwd: "运行目录",
+          field_os_arch: "系统/架构",
+          field_task_dir: "任务目录",
+          field_compression_rounds: "压缩轮次",
+          field_truncated_messages: "截断消息数",
+          field_dropped_groups: "丢弃分组数",
+          field_last_compaction_preview: "最近压缩预览",
+          field_token_mix: "Token(已提交/实时/展示)",
+          field_last_user_topic: "最近用户主题",
+          field_last_assistant_focus: "最近助手焦点",
+          field_last_action: "最近动作",
+          field_summary: "摘要",
+          yes: "是",
+          no: "否",
+          tag_account: "账号",
+          tag_env: "环境",
+          tag_os: "系统",
+          tag_mode: "模式",
+          tag_label: "标签",
+          tag_environment_na: "环境:N/A",
+          tool_structured_note: "工具消息已结构化展示（含命令/参数/结果）",
+          tool_function: "函数",
+          tool_status: "状态",
+          tool_duration: "耗时",
+          tool_mode: "模式",
+          tool_status_ok: "正常",
+          tool_status_blocked: "已阻止",
+          tool_status_timeout: "超时",
+          tool_status_interrupted: "已中断",
+          tool_call_id: "调用ID",
+          tool_executed_at: "执行时间",
+          tool_account: "执行账号",
+          tool_environment: "环境",
+          tool_os_name: "操作系统",
+          tool_cwd: "工作目录",
+          tool_label: "标签",
+          tool_flags: "标记",
+          tool_exit_code: "退出码",
+          tool_section_command: "命令",
+          tool_section_arguments: "参数",
+          tool_section_result: "结果",
+          tool_section_raw: "原始消息",
+          tool_flag_format: "超时={timeout} 中断={interrupted} 阻止={blocked}",
+          empty_filtered_messages: "当前筛选条件下没有消息。",
+          group_label: "group",
+          status_data_parse_failed: "会话数据解析失败",
+          status_generating_image: "正在生成长图...",
+          status_image_done: "长图导出完成",
+          status_image_failed: "长图导出失败",
+          status_loaded: "HTML 已加载，可导出聊天长图",
+          status_language_switched: "语言已切换",
+          image_title_suffix: "聊天导出",
+          image_messages: "消息",
+        },
+        en: {
+          doc_title: "Session Export",
+          na: "N/A",
+          meta_title: "Session Metadata / Runtime",
+          messages_title: "Messages",
+          btn_export_image: "Export Chat Long Image",
+          btn_toggle_meta_expand: "Expand Metadata",
+          btn_toggle_meta_collapse: "Collapse Metadata",
+          language_label: "Language",
+          filter_placeholder: "Search messages...",
+          role_all: "All Roles",
+          role_user: "User",
+          role_assistant: "Assistant",
+          role_thinking: "Thinking",
+          role_tool: "Tool",
+          role_system: "System",
+          label_id: "ID",
+          label_file: "File",
+          label_exported: "Exported",
+          chip_messages: "Messages",
+          chip_summary_chars: "Summary Chars",
+          chip_context_usage: "Context Usage",
+          meta_overview: "{count} messages · context usage {usage}% · exported {exported}",
+          kpi_messages: "Total Messages",
+          kpi_context_usage: "Context Usage",
+          kpi_compression_rounds: "Compression Rounds",
+          kpi_token_stats: "Token Stats",
+          sub_recent_max: "recent={recent} · max={max}",
+          sub_truncated_dropped: "truncated {truncated} · dropped groups {dropped}",
+          sub_token_mix: "committed {committed} / live {live} / display {display}",
+          group_session_identity: "Session Identity",
+          group_runtime: "Runtime",
+          group_compass: "Compression & Context",
+          group_recent_clues: "Recent Clues",
+          field_session_id: "Session ID",
+          field_session_name: "Session Name",
+          field_session_file: "Session File",
+          field_created_at: "Created At",
+          field_updated_at: "Updated At",
+          field_active_session: "Active Session",
+          field_model: "Model",
+          field_exported_at: "Exported At",
+          field_cwd: "CWD",
+          field_os_arch: "OS / Arch",
+          field_task_dir: "Task Directory",
+          field_compression_rounds: "Compression Rounds",
+          field_truncated_messages: "Truncated Messages",
+          field_dropped_groups: "Dropped Groups",
+          field_last_compaction_preview: "Last Compaction Preview",
+          field_token_mix: "Token(committed/live/display)",
+          field_last_user_topic: "Last User Topic",
+          field_last_assistant_focus: "Last Assistant Focus",
+          field_last_action: "Last Action",
+          field_summary: "Summary",
+          yes: "Yes",
+          no: "No",
+          tag_account: "account",
+          tag_env: "env",
+          tag_os: "os",
+          tag_mode: "mode",
+          tag_label: "label",
+          tag_environment_na: "environment:N/A",
+          tool_structured_note: "Tool message is structured (command/arguments/result)",
+          tool_function: "function",
+          tool_status: "status",
+          tool_duration: "duration",
+          tool_mode: "mode",
+          tool_status_ok: "ok",
+          tool_status_blocked: "blocked",
+          tool_status_timeout: "timeout",
+          tool_status_interrupted: "interrupted",
+          tool_call_id: "call_id",
+          tool_executed_at: "executed_at",
+          tool_account: "account",
+          tool_environment: "environment",
+          tool_os_name: "os_name",
+          tool_cwd: "cwd",
+          tool_label: "label",
+          tool_flags: "flags",
+          tool_exit_code: "exit_code",
+          tool_section_command: "command",
+          tool_section_arguments: "arguments",
+          tool_section_result: "result",
+          tool_section_raw: "raw_message",
+          tool_flag_format: "timeout={timeout} interrupted={interrupted} blocked={blocked}",
+          empty_filtered_messages: "No messages for current filters.",
+          group_label: "group",
+          status_data_parse_failed: "Failed to parse session data",
+          status_generating_image: "Generating long image...",
+          status_image_done: "Long image exported",
+          status_image_failed: "Failed to export long image",
+          status_loaded: "HTML loaded, ready to export long image",
+          status_language_switched: "Language switched",
+          image_title_suffix: "Chat Export",
+          image_messages: "Messages",
+        },
+      };
+      I18N.fr = I18N.en;
+      I18N.de = I18N.en;
+      I18N.ja = I18N.en;
+      const datasetNode = document.getElementById("machineclaw-session-data");
+      let data = {};
+      try {
+        data = JSON.parse(datasetNode.textContent || "{}");
+      } catch (_) {
+        statusEl.textContent = "Failed to parse session data";
+        return;
+      }
+      const SUPPORTED_LANGUAGE_OPTIONS = [
+        { code: "zh-CN", label: "简体中文 (zh-CN)" },
+        { code: "zh-TW", label: "繁體中文 (zh-TW)" },
+        { code: "en", label: "English (en)" },
+        { code: "fr", label: "Français (fr)" },
+        { code: "de", label: "Deutsch (de)" },
+        { code: "ja", label: "日本語 (ja)" },
+      ];
+      function normalizeLanguageCode(raw) {
+        const value = String(raw || "").trim().replace(/_/g, "-").toLowerCase();
+        if (!value) return "en";
+        if (value.indexOf("zh-tw") === 0 || value.indexOf("hant") !== -1) return "zh-TW";
+        if (value.indexOf("zh") === 0) return "zh-CN";
+        if (value.indexOf("fr") === 0) return "fr";
+        if (value.indexOf("de") === 0) return "de";
+        if (value.indexOf("ja") === 0) return "ja";
+        return "en";
+      }
+      function languageBucket(code) {
+        const normalized = normalizeLanguageCode(code);
+        if (normalized.indexOf("zh-") === 0) return "zh";
+        if (normalized === "fr") return "fr";
+        if (normalized === "de") return "de";
+        if (normalized === "ja") return "ja";
+        return "en";
+      }
+      let currentLanguageCode = normalizeLanguageCode(
+        ((data.runtime || {}).default_language || (data.runtime || {}).app_language || navigator.language || "en")
+      );
+      const rawMessages = Array.isArray(data.messages) ? data.messages : [];
+      let filteredMessages = rawMessages.slice();
+
+      const messageList = document.getElementById("messages");
+      const messageStats = document.getElementById("messageStats");
+      const filterInput = document.getElementById("messageFilter");
+      const roleFilter = document.getElementById("roleFilter");
+      const toggleMetaBtn = document.getElementById("toggleMetaBtn");
+      const metadataPanel = document.getElementById("metadataPanel");
+      const languageSelect = document.getElementById("languageSelect");
+      const languageSelectLabel = document.getElementById("languageSelectLabel");
+      const metaTitle = document.getElementById("metaTitle");
+      const messagesTitle = document.getElementById("messagesTitle");
+      const exportImageBtn = document.getElementById("exportImageBtn");
+
+      function t(key) {
+        const dict = I18N[languageBucket(currentLanguageCode)] || I18N.en;
+        return dict[key] !== undefined ? dict[key] : I18N.en[key] || key;
+      }
+      function tf(key, vars) {
+        const text = t(key);
+        return text.replace(/\{([a-zA-Z0-9_]+)\}/g, (all, name) => {
+          if (vars && Object.prototype.hasOwnProperty.call(vars, name)) {
+            return String(vars[name]);
+          }
+          return all;
+        });
+      }
+      function roleText(role) {
+        const normalized = String(role || "system").toLowerCase();
+        if (normalized === "user") return t("role_user");
+        if (normalized === "assistant") return t("role_assistant");
+        if (normalized === "thinking") return t("role_thinking");
+        if (normalized === "tool") return t("role_tool");
+        return t("role_system");
+      }
+      function setRoleFilterLabels() {
+        Array.from(roleFilter.options).forEach((option) => {
+          const value = String(option.value || "").toLowerCase();
+          if (value === "all") option.textContent = t("role_all");
+          if (value === "user") option.textContent = t("role_user");
+          if (value === "assistant") option.textContent = t("role_assistant");
+          if (value === "thinking") option.textContent = t("role_thinking");
+          if (value === "tool") option.textContent = t("role_tool");
+          if (value === "system") option.textContent = t("role_system");
+        });
+      }
+      function updateToggleMetaButton() {
+        const hidden = metadataPanel.style.display === "none";
+        toggleMetaBtn.textContent = hidden ? t("btn_toggle_meta_expand") : t("btn_toggle_meta_collapse");
+      }
+      function renderLanguageOptions() {
+        const selected = normalizeLanguageCode(currentLanguageCode);
+        languageSelect.innerHTML = "";
+        SUPPORTED_LANGUAGE_OPTIONS.forEach((item) => {
+          const option = document.createElement("option");
+          option.value = item.code;
+          option.textContent = item.label;
+          languageSelect.appendChild(option);
+        });
+        languageSelect.value = selected;
+        currentLanguageCode = selected;
+      }
+      function applyI18nStatic() {
+        document.documentElement.lang = normalizeLanguageCode(currentLanguageCode);
+        const sessionName = String((data.session || {}).name || "").trim();
+        document.title = sessionName ? `${sessionName} - ${t("doc_title")}` : t("doc_title");
+        metaTitle.textContent = t("meta_title");
+        messagesTitle.textContent = t("messages_title");
+        exportImageBtn.textContent = t("btn_export_image");
+        languageSelectLabel.textContent = t("language_label");
+        filterInput.placeholder = t("filter_placeholder");
+        setRoleFilterLabels();
+        updateToggleMetaButton();
+        renderLanguageOptions();
+      }
+
+      function fmt(v) {
+        if (v === null || v === undefined || v === "") return t("na");
+        if (Array.isArray(v)) return v.length ? v.join(" / ") : t("na");
+        if (typeof v === "object") return JSON.stringify(v);
+        return String(v);
+      }
+      function create(tag, className, text) {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined) node.textContent = text;
+        return node;
+      }
+
+      function renderHero() {
+        const s = data.session || {};
+        document.getElementById("heroTitle").textContent = s.name || t("doc_title");
+        document.getElementById("heroSubtitle").textContent =
+          `${t("label_id")}: ${fmt(s.id)} | ${t("label_file")}: ${fmt(s.file_path)} | ${t("label_exported")}: ${fmt((data.runtime || {}).exported_at)}`;
+        const chips = document.getElementById("statChips");
+        chips.innerHTML = "";
+        const chipRows = [
+          `${t("chip_messages")} ${fmt(s.message_count)}`,
+          `${t("chip_summary_chars")} ${fmt(s.summary_chars)}`,
+          `${t("chip_context_usage")} ${fmt(s.context_usage_percent)}%`,
+          `${t("role_user")} ${fmt((s.counts || {}).user)}`,
+          `${t("role_assistant")} ${fmt((s.counts || {}).assistant)}`,
+          `${t("role_tool")} ${fmt((s.counts || {}).tool)}`,
+          `${t("role_system")} ${fmt((s.counts || {}).system)}`,
+        ];
+        chipRows.forEach((text, idx) => {
+          const chip = create("span", "chip", text);
+          chip.style.setProperty("--delay", `${(idx % 6) * 0.08}s`);
+          chips.appendChild(chip);
+        });
+      }
+
+      function renderMetadata() {
+        const overview = document.getElementById("metaOverview");
+        const highlights = document.getElementById("metaHighlights");
+        const columns = document.getElementById("metadataColumns");
+        const envTags = document.getElementById("environmentTags");
+        highlights.innerHTML = "";
+        columns.innerHTML = "";
+        envTags.innerHTML = "";
+        const s = data.session || {};
+        const runtime = data.runtime || {};
+        const compass = data.compass || {};
+        const env = data.environment || {};
+        const safeCount = Number(s.message_count) || 0;
+        const safeUsage = Number(s.context_usage_percent) || 0;
+        overview.textContent = tf("meta_overview", {
+          count: safeCount,
+          usage: safeUsage,
+          exported: fmt(runtime.exported_at),
+        });
+
+        const kpiRows = [
+          { k: t("kpi_messages"), v: safeCount, sub: `${t("role_user")} ${fmt((s.counts || {}).user)} / ${t("role_assistant")} ${fmt((s.counts || {}).assistant)} / ${t("role_tool")} ${fmt((s.counts || {}).tool)} / ${t("role_system")} ${fmt((s.counts || {}).system)}`, color: "#78dbff" },
+          { k: t("kpi_context_usage"), v: `${safeUsage}%`, sub: tf("sub_recent_max", { recent: fmt(runtime.recent_messages), max: fmt(runtime.max_messages) }), color: "#74ef9a" },
+          { k: t("kpi_compression_rounds"), v: fmt(compass.compression_rounds), sub: tf("sub_truncated_dropped", { truncated: fmt(compass.truncated_messages), dropped: fmt(compass.dropped_groups) }), color: "#ffd166" },
+          { k: t("kpi_token_stats"), v: fmt(s.token_usage_committed), sub: tf("sub_token_mix", { committed: fmt(s.token_usage_committed), live: fmt(runtime.ui_token_live_estimate), display: fmt(runtime.ui_token_display) }), color: "#c6a8ff" },
+        ];
+        kpiRows.forEach((item) => {
+          const card = create("div", "meta-kpi");
+          card.style.setProperty("--kpi-color", item.color);
+          card.appendChild(create("div", "k", item.k));
+          card.appendChild(create("div", "v", String(item.v)));
+          card.appendChild(create("div", "sub", item.sub));
+          highlights.appendChild(card);
+        });
+
+        function renderGroup(title, rows) {
+          const group = create("section", "meta-group");
+          group.appendChild(create("div", "meta-group-title", title));
+          rows.forEach(([k, v]) => {
+            const row = create("div", "meta-row");
+            row.appendChild(create("div", "k", k));
+            row.appendChild(create("div", "v", fmt(v)));
+            group.appendChild(row);
+          });
+          columns.appendChild(group);
+        }
+
+        renderGroup(t("group_session_identity"), [
+          [t("field_session_id"), s.id],
+          [t("field_session_name"), s.name],
+          [t("field_session_file"), s.file_path],
+          [t("field_created_at"), s.created_at],
+          [t("field_updated_at"), s.updated_at],
+          [t("field_active_session"), s.active ? t("yes") : t("no")],
+        ]);
+        renderGroup(t("group_runtime"), [
+          [t("field_model"), runtime.model],
+          [t("field_exported_at"), runtime.exported_at],
+          [t("field_cwd"), runtime.cwd],
+          [t("field_os_arch"), `${fmt(runtime.os)} / ${fmt(runtime.arch)}`],
+          [t("field_task_dir"), runtime.task_directory],
+        ]);
+        renderGroup(t("group_compass"), [
+          [t("field_compression_rounds"), compass.compression_rounds],
+          [t("field_truncated_messages"), compass.truncated_messages],
+          [t("field_dropped_groups"), compass.dropped_groups],
+          [t("field_last_compaction_preview"), compass.last_compaction_preview],
+          [t("field_token_mix"), `${fmt(s.token_usage_committed)} / ${fmt(runtime.ui_token_live_estimate)} / ${fmt(runtime.ui_token_display)}`],
+        ]);
+        renderGroup(t("group_recent_clues"), [
+          [t("field_last_user_topic"), compass.last_user_topic],
+          [t("field_last_assistant_focus"), compass.last_assistant_focus],
+          [t("field_last_action"), compass.last_action],
+          [t("field_summary"), s.summary],
+        ]);
+
+        const tags = [
+          ...(env.accounts || []).map((v) => ({ type: "account", text: `${t("tag_account")}:${v}` })),
+          ...(env.environments || []).map((v) => ({ type: "env", text: `${t("tag_env")}:${v}` })),
+          ...(env.os_names || []).map((v) => ({ type: "os", text: `${t("tag_os")}:${v}` })),
+          ...(env.modes || []).map((v) => ({ type: "mode", text: `${t("tag_mode")}:${v}` })),
+          ...(env.labels || []).map((v) => ({ type: "label", text: `${t("tag_label")}:${v}` })),
+        ];
+        if (!tags.length) tags.push({ type: "env", text: t("tag_environment_na") });
+        tags.forEach((tag) => {
+          const pill = create("span", "tag", tag.text);
+          pill.setAttribute("data-type", tag.type);
+          envTags.appendChild(pill);
+        });
+      }
+
+      function toolStatus(meta) {
+        if (meta.blocked) return { text: t("tool_status_blocked"), kind: "bad" };
+        if (meta.timed_out) return { text: t("tool_status_timeout"), kind: "bad" };
+        if (meta.interrupted) return { text: t("tool_status_interrupted"), kind: "bad" };
+        if (meta.exit_code !== null && meta.exit_code !== undefined && Number(meta.exit_code) !== 0) {
+          return { text: `exit=${meta.exit_code}`, kind: "bad" };
+        }
+        return { text: t("tool_status_ok"), kind: "good" };
+      }
+
+      function addToolMetaItem(container, key, value) {
+        const text = value === undefined || value === null ? "" : String(value).trim();
+        if (!text) return;
+        const item = create("div", "tool-meta-item");
+        item.appendChild(create("span", "k", `${key}:`));
+        item.appendChild(create("span", "v", text));
+        container.appendChild(item);
+      }
+
+      function buildToolSection(title, content, openByDefault) {
+        const text = content === undefined || content === null ? "" : String(content).trim();
+        if (!text) return null;
+        const details = create("details", "tool-section");
+        if (openByDefault) details.open = true;
+        details.appendChild(create("summary", "", title));
+        details.appendChild(create("pre", "", text));
+        return details;
+      }
+
+      function toolMetaItems(meta, rawContent) {
+        if (!meta || typeof meta !== "object") return null;
+        const wrap = create("section", "tool-shell");
+        const status = toolStatus(meta);
+
+        const chips = create("div", "tool-chip-row");
+        const fnChip = create("span", "tool-chip", `${t("tool_function")}: ${fmt(meta.function_name)}`);
+        chips.appendChild(fnChip);
+        const statusChip = create("span", `tool-chip ${status.kind}`, `${t("tool_status")}: ${status.text}`);
+        chips.appendChild(statusChip);
+        const durationChip = create("span", "tool-chip", `${t("tool_duration")}: ${fmt(meta.duration_ms)}ms`);
+        chips.appendChild(durationChip);
+        const modeChip = create("span", "tool-chip", `${t("tool_mode")}: ${fmt(meta.mode)}`);
+        chips.appendChild(modeChip);
+        wrap.appendChild(chips);
+
+        const grid = create("div", "tool-meta-grid");
+        addToolMetaItem(grid, t("tool_call_id"), meta.tool_call_id);
+        addToolMetaItem(grid, t("tool_executed_at"), meta.executed_at);
+        addToolMetaItem(grid, t("tool_account"), meta.account);
+        addToolMetaItem(grid, t("tool_environment"), meta.environment);
+        addToolMetaItem(grid, t("tool_os_name"), meta.os_name);
+        addToolMetaItem(grid, t("tool_cwd"), meta.cwd);
+        addToolMetaItem(grid, t("tool_label"), meta.label);
+        addToolMetaItem(
+          grid,
+          t("tool_flags"),
+          tf("tool_flag_format", {
+            timeout: !!meta.timed_out,
+            interrupted: !!meta.interrupted,
+            blocked: !!meta.blocked,
+          })
+        );
+        addToolMetaItem(grid, t("tool_exit_code"), meta.exit_code === undefined ? "" : meta.exit_code);
+        if (grid.childElementCount > 0) wrap.appendChild(grid);
+
+        const sections = create("div", "tool-sections");
+        const command = meta.command_pretty || meta.command || "";
+        const arguments = meta.arguments_pretty || meta.arguments || "";
+        const result = meta.result_pretty || meta.result_payload || "";
+        const commandSec = buildToolSection(t("tool_section_command"), command, true);
+        const argumentsSec = buildToolSection(t("tool_section_arguments"), arguments, true);
+        const resultSec = buildToolSection(t("tool_section_result"), result, false);
+        const rawSec = buildToolSection(t("tool_section_raw"), rawContent, false);
+        [commandSec, argumentsSec, resultSec, rawSec].forEach((item) => {
+          if (item) sections.appendChild(item);
+        });
+        if (sections.childElementCount > 0) wrap.appendChild(sections);
+        return wrap;
+      }
+
+      function renderMessageMarkdown(msg) {
+        const body = create("div", "message-body markdown");
+        const html = typeof msg.content_html === "string" ? msg.content_html.trim() : "";
+        if (html) {
+          body.innerHTML = html;
+        } else {
+          body.textContent = msg.content_pretty || msg.content || "";
+        }
+        return body;
+      }
+
+      function renderMessages() {
+        messageList.innerHTML = "";
+        if (!filteredMessages.length) {
+          messageList.appendChild(create("div", "empty", t("empty_filtered_messages")));
+          messageStats.textContent = `0 / ${rawMessages.length}`;
+          return;
+        }
+        filteredMessages.forEach((msg, idx) => {
+          const role = (msg.role || "system").toLowerCase();
+          const card = create("article", `message ${role}`);
+          card.style.animationDelay = `${Math.min(idx, 25) * 0.015}s`;
+          const head = create("div", "message-head");
+          const left = create("span", "message-role", `#${msg.index || idx + 1} · ${roleText(role)}`);
+          left.style.color = roleColor[role] || "#f0f6ff";
+          const right = create("span", "message-time", msg.created_at || t("na"));
+          head.appendChild(left);
+          head.appendChild(right);
+          card.appendChild(head);
+          if (msg.group_id) {
+            card.appendChild(create("div", "message-time", `${t("group_label")}: ${msg.group_id}`));
+          }
+          if (role === "tool" && msg.tool_meta) {
+            const note = create("div", "message-time", t("tool_structured_note"));
+            card.appendChild(note);
+            const toolMeta = toolMetaItems(msg.tool_meta, msg.content_pretty || msg.content || "");
+            if (toolMeta) card.appendChild(toolMeta);
+          } else {
+            card.appendChild(renderMessageMarkdown(msg));
+          }
+          messageList.appendChild(card);
+        });
+        messageStats.textContent = `${filteredMessages.length} / ${rawMessages.length}`;
+      }
+
+      function applyFilters() {
+        const keyword = (filterInput.value || "").trim().toLowerCase();
+        const role = roleFilter.value || "all";
+        filteredMessages = rawMessages.filter((item) => {
+          const roleMatch = role === "all" || String(item.role || "").toLowerCase() === role;
+          if (!roleMatch) return false;
+          if (!keyword) return true;
+          const haystack = `${item.role || ""}\n${item.content || ""}\n${item.content_pretty || ""}\n${JSON.stringify(item.tool_meta || {})}`.toLowerCase();
+          return haystack.includes(keyword);
+        });
+        renderMessages();
+      }
+
+      function roundedRect(ctx, x, y, w, h, r) {
+        const rr = Math.min(r, w / 2, h / 2);
+        ctx.beginPath();
+        ctx.moveTo(x + rr, y);
+        ctx.arcTo(x + w, y, x + w, y + h, rr);
+        ctx.arcTo(x + w, y + h, x, y + h, rr);
+        ctx.arcTo(x, y + h, x, y, rr);
+        ctx.arcTo(x, y, x + w, y, rr);
+        ctx.closePath();
+      }
+
+      function wrapText(ctx, text, maxWidth) {
+        const lines = [];
+        const raw = String(text || "").replace(/\r\n/g, "\n");
+        const parts = raw.split("\n");
+        for (const part of parts) {
+          if (!part.length) {
+            lines.push("");
+            continue;
+          }
+          let line = "";
+          for (const ch of Array.from(part)) {
+            const next = line + ch;
+            if (ctx.measureText(next).width > maxWidth && line) {
+              lines.push(line);
+              line = ch;
+            } else {
+              line = next;
+            }
+          }
+          if (line) lines.push(line);
+        }
+        return lines.length ? lines : [""];
+      }
+
+      function safeFilename(name) {
+        return String(name || "session")
+          .replace(/[\\/:*?"<>|]+/g, "-")
+          .replace(/\s+/g, "_")
+          .slice(0, 64) || "session";
+      }
+
+      async function exportLongImage() {
+        const btn = document.getElementById("exportImageBtn");
+        btn.disabled = true;
+        statusEl.textContent = t("status_generating_image");
+        try {
+          const targetMessages = rawMessages;
+          const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
+          const width = 1380;
+          const padding = 34;
+          const gap = 16;
+          const headerHeight = 130;
+          const bodyWidth = width - padding * 2;
+          const textWidth = bodyWidth - 28;
+          const m = document.createElement("canvas");
+          const mctx = m.getContext("2d");
+          mctx.font = '500 19px "SF Pro Display", "PingFang SC", sans-serif';
+          const blocks = targetMessages.map((msg, idx) => {
+            const lines = wrapText(mctx, msg.content || "", textWidth);
+            const headerLines = [
+              `#${msg.index || idx + 1} · ${roleText(msg.role || "system")} · ${msg.created_at || t("na")}`,
+            ];
+            if (msg.group_id) headerLines.push(`${t("group_label")}: ${msg.group_id}`);
+            if (msg.tool_meta) {
+              headerLines.push(`${t("role_tool")}: ${msg.tool_meta.function_name || t("na")} | exit=${msg.tool_meta.exit_code === undefined || msg.tool_meta.exit_code === null ? t("na") : msg.tool_meta.exit_code} | ${t("tool_mode")}=${msg.tool_meta.mode || t("na")}`);
+            }
+            return {
+              role: String(msg.role || "system").toLowerCase(),
+              headerLines,
+              contentLines: lines,
+              height: 18 + headerLines.length * 24 + lines.length * 24 + 18,
+            };
+          });
+          let height = padding + headerHeight + gap;
+          blocks.forEach((b) => { height += b.height + gap; });
+          height = Math.min(Math.max(height, 540), 56000);
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.floor(width * dpr);
+          canvas.height = Math.floor(height * dpr);
+          const ctx = canvas.getContext("2d");
+          ctx.scale(dpr, dpr);
+          const bg = ctx.createLinearGradient(0, 0, width, height);
+          bg.addColorStop(0, "#081735");
+          bg.addColorStop(0.45, "#112e5f");
+          bg.addColorStop(1, "#2f0e61");
+          ctx.fillStyle = bg;
+          ctx.fillRect(0, 0, width, height);
+          const shine = ctx.createRadialGradient(width * 0.15, 20, 10, width * 0.15, 20, 300);
+          shine.addColorStop(0, "rgba(132,235,255,0.35)");
+          shine.addColorStop(1, "rgba(132,235,255,0)");
+          ctx.fillStyle = shine;
+          ctx.fillRect(0, 0, width, 340);
+
+          roundedRect(ctx, padding, padding, bodyWidth, headerHeight, 18);
+          ctx.fillStyle = "rgba(255,255,255,0.09)";
+          ctx.fill();
+          ctx.strokeStyle = "rgba(156,214,255,0.45)";
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          ctx.fillStyle = "#ecf5ff";
+          ctx.font = '700 32px "SF Pro Display", "PingFang SC", sans-serif';
+          const imageSessionName = (data.session || {}).name || "Session";
+          ctx.fillText(`${imageSessionName} · ${t("image_title_suffix")}`, padding + 18, padding + 46);
+          ctx.font = '500 18px "SF Pro Display", "PingFang SC", sans-serif';
+          ctx.fillStyle = "rgba(235,246,255,0.88)";
+          ctx.fillText(`${t("label_id")}: ${((data.session || {}).id || t("na"))}`, padding + 18, padding + 78);
+          ctx.fillText(`${t("image_messages")}: ${targetMessages.length} | ${t("label_exported")}: ${((data.runtime || {}).exported_at || t("na"))}`, padding + 18, padding + 104);
+
+          let y = padding + headerHeight + gap;
+          ctx.textBaseline = "top";
+          blocks.forEach((block) => {
+            const cardColor = roleColor[block.role] || "#f2f6ff";
+            roundedRect(ctx, padding, y, bodyWidth, block.height, 14);
+            ctx.fillStyle = "rgba(255,255,255,0.07)";
+            ctx.fill();
+            ctx.strokeStyle = `${cardColor}99`;
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            let textY = y + 14;
+            ctx.font = '700 17px "SF Pro Display", "PingFang SC", sans-serif';
+            ctx.fillStyle = cardColor;
+            block.headerLines.forEach((line) => {
+              ctx.fillText(line, padding + 14, textY);
+              textY += 24;
+            });
+            ctx.font = '500 16px "SF Mono", "Menlo", monospace';
+            ctx.fillStyle = "#eaf2ff";
+            block.contentLines.forEach((line) => {
+              ctx.fillText(line, padding + 14, textY);
+              textY += 24;
+            });
+            y += block.height + gap;
+          });
+
+          const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+          const fileName = `${safeFilename((data.session || {}).name || (data.session || {}).id)}-chat.png`;
+          if (blob) {
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(a.href);
+          } else {
+            const a = document.createElement("a");
+            a.href = canvas.toDataURL("image/png");
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+          }
+          statusEl.textContent = t("status_image_done");
+        } catch (err) {
+          statusEl.textContent = `${t("status_image_failed")}: ${err && err.message ? err.message : err}`;
+        } finally {
+          document.getElementById("exportImageBtn").disabled = false;
+        }
+      }
+
+      document.getElementById("exportImageBtn").addEventListener("click", exportLongImage);
+      toggleMetaBtn.addEventListener("click", () => {
+        const hidden = metadataPanel.style.display === "none";
+        metadataPanel.style.display = hidden ? "block" : "none";
+        updateToggleMetaButton();
+      });
+      languageSelect.addEventListener("change", () => {
+        currentLanguageCode = normalizeLanguageCode(languageSelect.value);
+        applyI18nStatic();
+        renderHero();
+        renderMetadata();
+        applyFilters();
+        statusEl.textContent = t("status_language_switched");
+      });
+      filterInput.addEventListener("input", applyFilters);
+      roleFilter.addEventListener("change", applyFilters);
+
+      applyI18nStatic();
+      renderHero();
+      renderMetadata();
+      applyFilters();
+      statusEl.textContent = t("status_loaded");
+    })();
+  </script>
+</body>
+</html>
+"##;
+    template.replace("__SESSION_EXPORT_DATA__", payload_json)
 }
 
 fn format_task_summary_latest(items: &[task_store::PersistedTask]) -> String {
@@ -13346,6 +15344,9 @@ fn ui_text_thread_action_rename() -> &'static str {
 fn ui_text_thread_action_metadata() -> &'static str {
     zh_or_en("元数据", "Metadata")
 }
+fn ui_text_thread_action_export_html() -> &'static str {
+    zh_or_en("导出为HTML", "Export as HTML")
+}
 fn ui_text_thread_metadata_modal_title() -> &'static str {
     zh_or_en("线程元数据", "Thread Metadata")
 }
@@ -13372,6 +15373,15 @@ fn ui_text_thread_action_menu_hint() -> &'static str {
 }
 fn ui_text_thread_rename_modal_title() -> &'static str {
     zh_or_en("重命名线程", "Rename Thread")
+}
+fn ui_text_thread_export_html_modal_title() -> &'static str {
+    zh_or_en("导出线程为HTML", "Export Thread as HTML")
+}
+fn ui_text_thread_export_html_modal_hint() -> &'static str {
+    zh_or_en(
+        "输入目标HTML路径(绝对或相对，建议带 .html/.htm)，Enter导出，Esc取消，Ctrl+U清空",
+        "Input target HTML path (absolute or relative, prefer .html/.htm), Enter export, Esc cancel, Ctrl+U clear",
+    )
 }
 fn ui_text_thread_rename_modal_hint() -> &'static str {
     zh_or_en(
@@ -13874,6 +15884,36 @@ fn ui_text_thread_not_found() -> &'static str {
 }
 fn ui_text_thread_rename_prompt() -> &'static str {
     zh_or_en("请输入新的线程名称", "Please input a new thread name")
+}
+fn ui_text_thread_export_html_prompt() -> &'static str {
+    zh_or_en(
+        "请输入导出HTML文件路径",
+        "Please input the HTML export file path",
+    )
+}
+fn ui_text_thread_export_html_empty() -> &'static str {
+    zh_or_en("导出路径不能为空", "Export path cannot be empty")
+}
+fn ui_text_thread_export_html_invalid_path() -> &'static str {
+    zh_or_en("导出路径无效", "Invalid export path")
+}
+fn ui_text_thread_export_html_suffix_required() -> &'static str {
+    zh_or_en(
+        "仅支持 .html 或 .htm 后缀",
+        "Only .html or .htm suffix is supported",
+    )
+}
+fn ui_text_thread_export_html_cancelled() -> &'static str {
+    zh_or_en("已取消导出HTML", "HTML export cancelled")
+}
+fn ui_text_thread_export_html_cleared() -> &'static str {
+    zh_or_en("导出路径输入已清空", "Export path input cleared")
+}
+fn ui_text_thread_export_html_success() -> &'static str {
+    zh_or_en("线程已导出为HTML", "Thread exported as HTML")
+}
+fn ui_text_thread_export_html_failed() -> &'static str {
+    zh_or_en("线程导出HTML失败", "Thread HTML export failed")
 }
 fn ui_text_thread_rename_empty() -> &'static str {
     zh_or_en("线程名称不能为空", "Thread name cannot be empty")
