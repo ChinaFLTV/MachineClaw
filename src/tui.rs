@@ -13135,6 +13135,14 @@ fn pretty_json_or_raw_text(raw: &str) -> String {
         .unwrap_or_else(|| trimmed.to_string())
 }
 
+fn export_masked_text(raw: &str) -> String {
+    mask_ui_sensitive(raw)
+}
+
+fn export_masked_pretty_text(raw: &str) -> String {
+    mask_ui_sensitive(pretty_json_or_raw_text(raw).as_str())
+}
+
 fn build_session_export_payload(
     services: &ActionServices<'_>,
     state: &ChatUiState,
@@ -13168,7 +13176,8 @@ fn build_session_export_payload(
         .iter()
         .enumerate()
         .map(|(idx, item)| {
-            let content_pretty = pretty_json_or_raw_text(item.content.as_str());
+            let content_masked = export_masked_text(item.content.as_str());
+            let content_pretty = export_masked_pretty_text(item.content.as_str());
             let content_html =
                 render_markdown_html_for_export(content_pretty.as_str(), &markdown_options);
             let tool_meta_json = if let Some(meta) = item.tool_meta.as_ref() {
@@ -13183,17 +13192,20 @@ fn build_session_export_payload(
                 push_unique_non_empty(meta.cwd.as_str(), &mut cwd_set, &mut cwds);
                 push_unique_non_empty(meta.mode.as_str(), &mut mode_set, &mut modes);
                 push_unique_non_empty(meta.label.as_str(), &mut label_set, &mut labels);
-                let command_pretty = pretty_json_or_raw_text(meta.command.as_str());
-                let arguments_pretty = pretty_json_or_raw_text(meta.arguments.as_str());
-                let result_pretty = pretty_json_or_raw_text(meta.result_payload.as_str());
+                let command_masked = export_masked_text(meta.command.as_str());
+                let arguments_masked = export_masked_text(meta.arguments.as_str());
+                let result_masked = export_masked_text(meta.result_payload.as_str());
+                let command_pretty = export_masked_pretty_text(meta.command.as_str());
+                let arguments_pretty = export_masked_pretty_text(meta.arguments.as_str());
+                let result_pretty = export_masked_pretty_text(meta.result_payload.as_str());
                 json!({
                     "tool_call_id": meta.tool_call_id,
                     "function_name": meta.function_name,
-                    "command": meta.command,
+                    "command": command_masked,
                     "command_pretty": command_pretty,
-                    "arguments": meta.arguments,
+                    "arguments": arguments_masked,
                     "arguments_pretty": arguments_pretty,
-                    "result_payload": meta.result_payload,
+                    "result_payload": result_masked,
                     "result_pretty": result_pretty,
                     "executed_at_epoch_ms": meta.executed_at_epoch_ms,
                     "executed_at": format_epoch_ms(meta.executed_at_epoch_ms),
@@ -13219,7 +13231,7 @@ fn build_session_export_payload(
                 "group_id": item.group_id,
                 "created_at_epoch_ms": item.created_at_epoch_ms,
                 "created_at": format_epoch_ms(item.created_at_epoch_ms),
-                "content": item.content,
+                "content": content_masked,
                 "content_pretty": content_pretty,
                 "content_html": content_html,
                 "tool_meta": tool_meta_json,
@@ -13235,7 +13247,7 @@ fn build_session_export_payload(
             "updated_at_epoch_ms": session_overview.last_updated_epoch_ms,
             "created_at": format_epoch_ms(session_overview.created_at_epoch_ms),
             "updated_at": format_epoch_ms(session_overview.last_updated_epoch_ms),
-            "summary": session_state.summary,
+            "summary": export_masked_text(session_state.summary.as_str()),
             "summary_chars": summary_chars,
             "message_count": message_count,
             "context_usage_percent": context_usage,
@@ -13259,10 +13271,10 @@ fn build_session_export_payload(
             "total_user_messages": session_state.compass.total_user_messages,
             "total_assistant_messages": session_state.compass.total_assistant_messages,
             "total_tool_messages": session_state.compass.total_tool_messages,
-            "last_action": session_state.compass.last_action,
-            "last_user_topic": session_state.compass.last_user_topic,
-            "last_assistant_focus": session_state.compass.last_assistant_focus,
-            "last_compaction_preview": session_state.compass.last_compaction_preview,
+            "last_action": export_masked_text(session_state.compass.last_action.as_str()),
+            "last_user_topic": export_masked_text(session_state.compass.last_user_topic.as_str()),
+            "last_assistant_focus": export_masked_text(session_state.compass.last_assistant_focus.as_str()),
+            "last_compaction_preview": export_masked_text(session_state.compass.last_compaction_preview.as_str()),
         },
         "runtime": {
             "exported_at": Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -13293,8 +13305,9 @@ fn build_session_export_payload(
 }
 
 fn sanitize_json_for_html_script(raw: &str) -> String {
-    raw.replace("</script>", "<\\/script>")
-        .replace("<!--", "<\\!--")
+    raw.replace('&', "\\u0026")
+        .replace('<', "\\u003C")
+        .replace('>', "\\u003E")
 }
 
 fn build_session_export_html_document(payload_json: &str) -> String {
@@ -19756,6 +19769,27 @@ model = "test-model"
         assert!(html.contains("message_stats: \"Showing {shown} / Total {total}\""));
         assert!(html.contains("if (normalized === \"zh-TW\") return \"zh-TW\";"));
         assert!(!html.contains("I18N.fr = I18N.en;"));
+    }
+
+    #[test]
+    fn sanitize_json_for_html_script_escapes_html_sensitive_chars() {
+        let raw = r#"{"payload":"</ScRiPt><!--token=sk-test12345678&x=1>"}"#;
+        let sanitized = sanitize_json_for_html_script(raw);
+        assert!(!sanitized.contains("</ScRiPt>"));
+        assert!(!sanitized.contains("<!--"));
+        assert!(!sanitized.contains("&x=1>"));
+        assert!(sanitized.contains("\\u003C/ScRiPt\\u003E"));
+        assert!(sanitized.contains("\\u003C!--token=sk-test12345678\\u0026x=1\\u003E"));
+    }
+
+    #[test]
+    fn export_masked_pretty_text_redacts_sensitive_tokens() {
+        let rendered = export_masked_pretty_text(
+            r#"{"authorization":"Bearer sk-secret12345678","token":"sk-secret87654321"}"#,
+        );
+        assert!(!rendered.contains("sk-secret12345678"));
+        assert!(!rendered.contains("sk-secret87654321"));
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]

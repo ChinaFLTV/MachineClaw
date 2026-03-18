@@ -1237,6 +1237,9 @@ fn is_removable_empty_session_state(state: &SessionState) -> bool {
     if !state.summary.trim().is_empty() {
         return false;
     }
+    if state.token_usage_committed > 0 {
+        return false;
+    }
     if state.compass.total_user_messages > 0 || state.compass.total_assistant_messages > 0 {
         return false;
     }
@@ -2394,5 +2397,18 @@ mod tests {
         assert_eq!(reloaded.token_usage_committed(), 12_345);
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn removable_empty_session_keeps_runtime_only_token_usage() {
+        let state = SessionState {
+            session_id: "session-token".to_string(),
+            session_name: "session-token".to_string(),
+            summary: String::new(),
+            messages: Vec::new(),
+            compass: new_compass(),
+            token_usage_committed: 7,
+        };
+        assert!(!super::is_removable_empty_session_state(&state));
     }
 }
