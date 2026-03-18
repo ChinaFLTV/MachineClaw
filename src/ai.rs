@@ -479,7 +479,7 @@ impl AiClient {
         }
     }
 
-    pub fn validate_connectivity(&self) -> Result<(), AppError> {
+    pub fn validate_connectivity_with_response(&self) -> Result<String, AppError> {
         let system_prompt = "You are a connectivity checker. Reply with one word: OK.";
         let user_prompt = "Respond with OK only.";
         let response = self.chat(&[], system_prompt, user_prompt)?;
@@ -488,7 +488,11 @@ impl AiClient {
                 "AI validation returned empty response".to_string(),
             ));
         }
-        Ok(())
+        Ok(response)
+    }
+
+    pub fn validate_connectivity(&self) -> Result<(), AppError> {
+        self.validate_connectivity_with_response().map(|_| ())
     }
 
     pub fn prepare_model_pricing(&self, skip_probe: bool) -> ModelPriceCheckResult {

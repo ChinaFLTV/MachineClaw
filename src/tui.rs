@@ -86,6 +86,11 @@ const MODAL_CLOSE_SCROLL_SUPPRESS_MS: u128 = 220;
 const SESSION_AUTO_TITLE_MAX_UNITS: usize = 15;
 const SESSION_AUTO_TITLE_SOURCE_MAX_CHARS: usize = 1200;
 const TASK_BOARD_MAX_ITEMS: usize = 6;
+const HOVER_RAW_DEBUG_MAX_CHARS: usize = 10_000;
+const HOVER_RAW_DEBUG_FIELD_MAX_CHARS: usize = 4_000;
+const AI_CONNECTIVITY_SYSTEM_PROMPT: &str =
+    "You are a connectivity checker. Reply with one word: OK.";
+const AI_CONNECTIVITY_USER_PROMPT: &str = "Respond with OK only.";
 #[cfg(all(unix, not(target_os = "macos")))]
 const OSC52_MAX_COPY_BYTES: usize = 100_000;
 
@@ -166,22 +171,18 @@ struct PendingAiWaitOutcome {
     saw_stream_events: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ConversationCopyButton {
-    message_index: usize,
-    rect: Rect,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversationHoverActionKind {
+    Copy,
+    Delete,
+    ToolResult,
+    RawData,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ConversationDeleteButton {
+struct ConversationHoverAction {
     message_index: usize,
-    rect: Rect,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ConversationToolResultButton {
-    message_index: usize,
-    rect: Rect,
+    kind: ConversationHoverActionKind,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -190,6 +191,7 @@ struct ConversationHoverButtons {
     copy_rect: Rect,
     result_rect: Option<Rect>,
     delete_rect: Rect,
+    raw_data_rect: Option<Rect>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +199,7 @@ enum ChatInputActionKind {
     ModeToggle,
     TrackingToggle,
     ClearInput,
+    StopAnswer,
     JumpToLatest,
 }
 
@@ -266,6 +269,15 @@ struct ToolResultModalWrapCache {
 #[derive(Debug, Clone)]
 struct ToolResultModalState {
     message_index: usize,
+    content: String,
+    scroll: u16,
+    wrap_cache: Option<ToolResultModalWrapCache>,
+}
+
+#[derive(Debug, Clone)]
+struct RawDataModalState {
+    message_index: usize,
+    title: String,
     content: String,
     scroll: u16,
     wrap_cache: Option<ToolResultModalWrapCache>,
@@ -587,8 +599,28 @@ struct InspectWorkerHandle {
     join: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Debug)]
+struct AiConnectivityCheckOutcome {
+    response: Result<String, AppError>,
+    started_at_epoch_ms: u128,
+    finished_at_epoch_ms: u128,
+}
+
 struct AiConnectivityCheckHandle {
-    rx: mpsc::Receiver<Result<(), AppError>>,
+    rx: mpsc::Receiver<AiConnectivityCheckOutcome>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AiConnectivityDebugSnapshot {
+    transport: String,
+    request_url: String,
+    request_body: String,
+    response_body: String,
+    started_at_epoch_ms: u128,
+    finished_at_epoch_ms: u128,
+    duration_ms: u128,
+    success: Option<bool>,
+    error: String,
 }
 
 #[derive(Debug)]
@@ -704,6 +736,7 @@ struct ChatUiState {
     pending_thread_delete_confirm: Option<ThreadDeleteConfirmState>,
     pending_thread_metadata_modal: Option<ThreadMetadataModalState>,
     pending_tool_result_modal: Option<ToolResultModalState>,
+    pending_raw_data_modal: Option<RawDataModalState>,
     last_thread_click: Option<ThreadClickState>,
     ai_live: Option<AiLiveState>,
     config_ui: ConfigUiState,
@@ -720,6 +753,13 @@ struct ChatUiState {
     token_live_estimate: u64,
     token_display_value: u64,
     suppress_scroll_until_epoch_ms: u128,
+    ai_debug_enabled: bool,
+    ai_connectivity_request_url: String,
+    ai_connectivity_transport: String,
+    startup_preflight_started_epoch_ms: u128,
+    startup_preflight_finished_epoch_ms: u128,
+    startup_preflight_duration_ms: u128,
+    ai_connectivity_debug_snapshot: Option<AiConnectivityDebugSnapshot>,
     ai_connectivity_checking: bool,
     session_auto_title_workers: Vec<SessionAutoTitleHandle>,
     session_auto_title_attempted: HashSet<String>,
@@ -777,6 +817,7 @@ impl ChatUiState {
             pending_thread_delete_confirm: None,
             pending_thread_metadata_modal: None,
             pending_tool_result_modal: None,
+            pending_raw_data_modal: None,
             last_thread_click: None,
             ai_live: None,
             config_ui: build_config_ui_state(cfg, config_path),
@@ -793,6 +834,13 @@ impl ChatUiState {
             token_live_estimate: 0,
             token_display_value: 0,
             suppress_scroll_until_epoch_ms: 0,
+            ai_debug_enabled: cfg.ai.debug,
+            ai_connectivity_request_url: cfg.ai.base_url.clone(),
+            ai_connectivity_transport: cfg.ai.r#type.clone(),
+            startup_preflight_started_epoch_ms: 0,
+            startup_preflight_finished_epoch_ms: 0,
+            startup_preflight_duration_ms: 0,
+            ai_connectivity_debug_snapshot: None,
             ai_connectivity_checking: false,
             session_auto_title_workers: Vec::new(),
             session_auto_title_attempted: HashSet::new(),
@@ -939,6 +987,7 @@ impl ChatUiState {
         self.pending_delete_confirm = None;
         self.pending_thread_delete_confirm = None;
         self.pending_tool_result_modal = None;
+        self.pending_raw_data_modal = None;
     }
 
     fn jump_to_latest(&mut self, viewport_height: u16, enable_tracking: bool) {
@@ -1007,6 +1056,11 @@ impl ChatUiState {
         {
             self.pending_tool_result_modal = None;
         }
+        if let Some(modal) = self.pending_raw_data_modal.as_ref()
+            && modal.message_index == index
+        {
+            self.pending_raw_data_modal = None;
+        }
         if let Some(hovered) = self.hovered_message_idx {
             self.hovered_message_idx = if hovered == index {
                 None
@@ -1017,6 +1071,11 @@ impl ChatUiState {
             };
         }
         if let Some(modal) = self.pending_tool_result_modal.as_mut()
+            && modal.message_index > index
+        {
+            modal.message_index -= 1;
+        }
+        if let Some(modal) = self.pending_raw_data_modal.as_mut()
             && modal.message_index > index
         {
             modal.message_index -= 1;
@@ -1490,6 +1549,9 @@ fn run_startup_checks_in_tui(
     state: &mut ChatUiState,
 ) -> Result<Option<AiConnectivityCheckHandle>, AppError> {
     let started = Instant::now();
+    state.startup_preflight_started_epoch_ms = now_epoch_ms();
+    state.startup_preflight_finished_epoch_ms = 0;
+    state.startup_preflight_duration_ms = 0;
     state.push(UiRole::System, i18n::preflight_notice_start());
     state.push(UiRole::System, i18n::preflight_notice_config_check());
     state.push(UiRole::System, i18n::preflight_notice_permission_check());
@@ -1501,6 +1563,17 @@ fn run_startup_checks_in_tui(
     if services.cfg.ai.connectivity_check {
         state.ai_connectivity_checking = true;
         state.status = ui_text_status_ai_connectivity().to_string();
+        state.ai_connectivity_debug_snapshot = Some(AiConnectivityDebugSnapshot {
+            transport: state.ai_connectivity_transport.clone(),
+            request_url: state.ai_connectivity_request_url.clone(),
+            request_body: pretty_debug_json(&build_ai_connectivity_request_payload_preview()),
+            response_body: String::new(),
+            started_at_epoch_ms: now_epoch_ms(),
+            finished_at_epoch_ms: 0,
+            duration_ms: 0,
+            success: None,
+            error: String::new(),
+        });
         state.push(
             UiRole::System,
             ui_text_status_ai_connectivity_background_started(),
@@ -1510,9 +1583,11 @@ fn run_startup_checks_in_tui(
         state.push(UiRole::System, i18n::preflight_notice_ai_check_skipped());
     }
     refresh_mcp_runtime_metadata_if_needed(services, state, true);
+    state.startup_preflight_duration_ms = started.elapsed().as_millis();
+    state.startup_preflight_finished_epoch_ms = now_epoch_ms();
     state.push(
         UiRole::System,
-        i18n::preflight_notice_done(&i18n::human_duration_ms(started.elapsed().as_millis())),
+        i18n::preflight_notice_done(&i18n::human_duration_ms(state.startup_preflight_duration_ms)),
     );
     if !state.ai_connectivity_checking {
         state.status = ui_text_ready().to_string();
@@ -1952,9 +2027,16 @@ fn sanitize_terminal_size(width: u16, height: u16) -> Option<(u16, u16)> {
 }
 
 fn spawn_ai_connectivity_check_worker(ai: crate::ai::AiClient) -> AiConnectivityCheckHandle {
-    let (tx, rx) = mpsc::channel::<Result<(), AppError>>();
+    let (tx, rx) = mpsc::channel::<AiConnectivityCheckOutcome>();
     thread::spawn(move || {
-        let _ = tx.send(ai.validate_connectivity());
+        let started_at_epoch_ms = now_epoch_ms();
+        let response = ai.validate_connectivity_with_response();
+        let finished_at_epoch_ms = now_epoch_ms();
+        let _ = tx.send(AiConnectivityCheckOutcome {
+            response,
+            started_at_epoch_ms,
+            finished_at_epoch_ms,
+        });
     });
     AiConnectivityCheckHandle { rx }
 }
@@ -1969,23 +2051,56 @@ fn poll_ai_connectivity_check(
     let check_result = match handle.rx.try_recv() {
         Ok(result) => Some(result),
         Err(mpsc::TryRecvError::Empty) => None,
-        Err(mpsc::TryRecvError::Disconnected) => Some(Err(AppError::Runtime(
-            "AI connectivity worker channel disconnected".to_string(),
-        ))),
+        Err(mpsc::TryRecvError::Disconnected) => Some(AiConnectivityCheckOutcome {
+            response: Err(AppError::Runtime(
+                "AI connectivity worker channel disconnected".to_string(),
+            )),
+            started_at_epoch_ms: 0,
+            finished_at_epoch_ms: now_epoch_ms(),
+        }),
     };
     let Some(result) = check_result else {
         return;
     };
     state.ai_connectivity_checking = false;
     *ai_connectivity_check = None;
-    match result {
-        Ok(()) => {
+    let started_at_epoch_ms = result.started_at_epoch_ms;
+    let finished_at_epoch_ms = result.finished_at_epoch_ms;
+    let duration_ms = finished_at_epoch_ms.saturating_sub(started_at_epoch_ms);
+    let request_body = pretty_debug_json(&build_ai_connectivity_request_payload_preview());
+    match result.response {
+        Ok(response_text) => {
+            state.ai_connectivity_debug_snapshot = Some(AiConnectivityDebugSnapshot {
+                transport: state.ai_connectivity_transport.clone(),
+                request_url: state.ai_connectivity_request_url.clone(),
+                request_body,
+                response_body: clamp_raw_debug_text(
+                    response_text.as_str(),
+                    HOVER_RAW_DEBUG_FIELD_MAX_CHARS,
+                ),
+                started_at_epoch_ms,
+                finished_at_epoch_ms,
+                duration_ms,
+                success: Some(true),
+                error: String::new(),
+            });
             state.push(UiRole::System, ui_text_status_ai_connectivity_ok());
             if state.status == ui_text_status_ai_connectivity() {
                 state.status = ui_text_ready().to_string();
             }
         }
         Err(err) => {
+            state.ai_connectivity_debug_snapshot = Some(AiConnectivityDebugSnapshot {
+                transport: state.ai_connectivity_transport.clone(),
+                request_url: state.ai_connectivity_request_url.clone(),
+                request_body,
+                response_body: String::new(),
+                started_at_epoch_ms,
+                finished_at_epoch_ms,
+                duration_ms,
+                success: Some(false),
+                error: clamp_raw_debug_text(i18n::localize_error(&err).as_str(), 800),
+            });
             state.push(
                 UiRole::System,
                 format!(
@@ -2315,6 +2430,9 @@ fn handle_key_event(
     }
     if state.pending_tool_result_modal.is_some() {
         return handle_tool_result_modal_key(key, state);
+    }
+    if state.pending_raw_data_modal.is_some() {
+        return handle_raw_data_modal_key(key, state);
     }
     if state.pending_thread_rename.is_some() {
         return handle_thread_rename_modal_key(key, services, state);
@@ -3013,6 +3131,10 @@ fn handle_mouse_event(
         handle_tool_result_modal_mouse(mouse, state, layout)?;
         return Ok(());
     }
+    if state.pending_raw_data_modal.is_some() {
+        handle_raw_data_modal_mouse(mouse, state, layout)?;
+        return Ok(());
+    }
     if matches!(
         mouse.kind,
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
@@ -3072,41 +3194,37 @@ fn handle_mouse_event(
         state.inspect_menu_open = false;
     }
     if state.mode == UiMode::Chat && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-        if let Some(button) = conversation_copy_button_data(state, layout)
-            && rect_contains(button.rect, mouse.column, mouse.row)
-        {
-            if let Some(message) = state.messages.get(button.message_index) {
-                match copy_text_to_clipboard(&message.text) {
-                    Ok(()) => {
-                        state.status = ui_text_message_copy_success().to_string();
-                    }
-                    Err(err) => {
-                        state.status = format!(
-                            "{}: {}",
-                            ui_text_message_copy_failed(),
-                            trim_ui_text(&i18n::localize_error(&err), 84)
-                        );
+        refresh_hovered_message_from_mouse(state, layout, mouse);
+        if let Some(action) = conversation_hover_action_at(state, layout, mouse.column, mouse.row) {
+            match action.kind {
+                ConversationHoverActionKind::Copy => {
+                    if let Some(message) = state.messages.get(action.message_index) {
+                        match copy_text_to_clipboard(&message.text) {
+                            Ok(()) => {
+                                state.status = ui_text_message_copy_success().to_string();
+                            }
+                            Err(err) => {
+                                state.status = format!(
+                                    "{}: {}",
+                                    ui_text_message_copy_failed(),
+                                    trim_ui_text(&i18n::localize_error(&err), 84)
+                                );
+                            }
+                        }
+                    } else {
+                        state.status = ui_text_message_copy_failed().to_string();
                     }
                 }
-            } else {
-                state.status = ui_text_message_copy_failed().to_string();
+                ConversationHoverActionKind::Delete => {
+                    open_delete_message_confirm(state, action.message_index);
+                }
+                ConversationHoverActionKind::ToolResult => {
+                    open_tool_result_modal(state, action.message_index);
+                }
+                ConversationHoverActionKind::RawData => {
+                    open_raw_data_modal(state, action.message_index);
+                }
             }
-            return Ok(());
-        }
-        if let Some(button) = conversation_delete_button_data(state, layout)
-            && rect_contains(button.rect, mouse.column, mouse.row)
-        {
-            state.pending_delete_confirm = Some(DeleteMessageConfirmState {
-                message_index: button.message_index,
-                selected: 1,
-            });
-            state.status = ui_text_message_delete_confirm_prompt().to_string();
-            return Ok(());
-        }
-        if let Some(button) = conversation_tool_result_button_data(state, layout)
-            && rect_contains(button.rect, mouse.column, mouse.row)
-        {
-            open_tool_result_modal(state, button.message_index);
             return Ok(());
         }
     }
@@ -3202,12 +3320,12 @@ fn handle_mouse_event(
                         .constraints([Constraint::Min(1), Constraint::Length(1)])
                         .split(layout.input_body);
                     let mut clicked_action = false;
-                    for button in chat_input_action_buttons(state, layout, rows[1]) {
-                        if !rect_contains(button.rect, mouse.column, mouse.row) {
-                            continue;
-                        }
+                    let buttons = chat_input_action_buttons(state, layout, rows[1]);
+                    if let Some(kind) =
+                        chat_input_action_button_at(&buttons, mouse.column, mouse.row)
+                    {
                         clicked_action = true;
-                        match button.kind {
+                        match kind {
                             ChatInputActionKind::ModeToggle => {
                                 state.chat_mode = state.chat_mode.toggle();
                                 state.status =
@@ -3230,12 +3348,14 @@ fn handle_mouse_event(
                                 state.input.clear();
                                 state.status = ui_text_chat_input_cleared().to_string();
                             }
+                            ChatInputActionKind::StopAnswer => {
+                                state.status = ui_text_status_ai_stop_not_running().to_string();
+                            }
                             ChatInputActionKind::JumpToLatest => {
                                 state.jump_to_latest(layout.conversation_body.height.max(1), false);
                                 state.status = ui_text_jump_to_latest_done().to_string();
                             }
                         }
-                        break;
                     }
                     if clicked_action {
                         return Ok(());
@@ -3471,6 +3591,123 @@ fn handle_tool_result_modal_key(key: KeyEvent, state: &mut ChatUiState) -> Resul
     Ok(false)
 }
 
+fn handle_raw_data_modal_mouse(
+    mouse: MouseEvent,
+    state: &mut ChatUiState,
+    layout: UiLayout,
+) -> Result<(), AppError> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if let Some(modal) = state.pending_raw_data_modal.as_mut() {
+                modal.scroll = modal.scroll.saturating_sub(1);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some(modal) = state.pending_raw_data_modal.as_mut() {
+                let max_scroll = raw_data_modal_scroll_max(modal, layout);
+                modal.scroll = modal.scroll.saturating_add(1).min(max_scroll);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !rect_contains(raw_data_modal_rect(layout), mouse.column, mouse.row) {
+                state.pending_raw_data_modal = None;
+                state.suppress_mouse_scroll_after_modal_close();
+                state.status = ui_text_message_raw_data_modal_closed().to_string();
+                return Ok(());
+            }
+            if let Some(button) = raw_data_modal_copy_button_data(layout)
+                && rect_contains(button.rect, mouse.column, mouse.row)
+            {
+                let text = state
+                    .pending_raw_data_modal
+                    .as_ref()
+                    .map(|item| item.content.clone())
+                    .unwrap_or_default();
+                match copy_text_to_clipboard(text.as_str()) {
+                    Ok(()) => state.status = ui_text_message_raw_data_copy_success().to_string(),
+                    Err(err) => {
+                        state.status = format!(
+                            "{}: {}",
+                            ui_text_message_raw_data_copy_failed(),
+                            trim_ui_text(&i18n::localize_error(&err), 84)
+                        );
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_raw_data_modal_key(key: KeyEvent, state: &mut ChatUiState) -> Result<bool, AppError> {
+    let Some(modal) = state.pending_raw_data_modal.as_mut() else {
+        return Ok(false);
+    };
+    match key.code {
+        KeyCode::Esc => {
+            state.pending_raw_data_modal = None;
+            state.suppress_mouse_scroll_after_modal_close();
+            state.status = ui_text_message_raw_data_modal_closed().to_string();
+        }
+        KeyCode::Up => modal.scroll = modal.scroll.saturating_sub(1),
+        KeyCode::Down => modal.scroll = modal.scroll.saturating_add(1),
+        KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(8),
+        KeyCode::PageDown => modal.scroll = modal.scroll.saturating_add(8),
+        KeyCode::Home => modal.scroll = 0,
+        KeyCode::End => modal.scroll = u16::MAX,
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            match copy_text_to_clipboard(modal.content.as_str()) {
+                Ok(()) => state.status = ui_text_message_raw_data_copy_success().to_string(),
+                Err(err) => {
+                    state.status = format!(
+                        "{}: {}",
+                        ui_text_message_raw_data_copy_failed(),
+                        trim_ui_text(&i18n::localize_error(&err), 84)
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn clear_message_action_modals(state: &mut ChatUiState) {
+    state.pending_delete_confirm = None;
+    state.pending_tool_result_modal = None;
+    state.pending_raw_data_modal = None;
+}
+
+fn open_delete_message_confirm(state: &mut ChatUiState, message_index: usize) {
+    clear_message_action_modals(state);
+    state.pending_delete_confirm = Some(DeleteMessageConfirmState {
+        message_index,
+        selected: 1,
+    });
+    state.status = ui_text_message_delete_confirm_prompt().to_string();
+}
+
+fn open_raw_data_modal(state: &mut ChatUiState, message_index: usize) {
+    if !state.ai_debug_enabled {
+        state.status = ui_text_message_raw_data_unavailable().to_string();
+        return;
+    }
+    let Some((title, content)) = build_raw_data_modal_content(state, message_index) else {
+        state.status = ui_text_message_raw_data_unavailable().to_string();
+        return;
+    };
+    clear_message_action_modals(state);
+    state.pending_raw_data_modal = Some(RawDataModalState {
+        message_index,
+        title,
+        content,
+        scroll: 0,
+        wrap_cache: None,
+    });
+    state.status = ui_text_message_raw_data_modal_opened().to_string();
+}
+
 fn open_tool_result_modal(state: &mut ChatUiState, message_index: usize) {
     let Some(message) = state.messages.get(message_index) else {
         state.status = ui_text_message_tool_result_unavailable().to_string();
@@ -3596,6 +3833,7 @@ fn open_tool_result_modal(state: &mut ChatUiState, message_index: usize) {
     } else {
         detail.result_payload
     });
+    clear_message_action_modals(state);
     state.pending_tool_result_modal = Some(ToolResultModalState {
         message_index,
         content: lines.join("\n"),
@@ -4314,6 +4552,7 @@ fn activate_nav_item(
     state.pending_thread_delete_confirm = None;
     state.pending_thread_metadata_modal = None;
     state.pending_tool_result_modal = None;
+    state.pending_raw_data_modal = None;
     match state.nav_selected {
         0 => {
             state.mode = UiMode::Chat;
@@ -4621,9 +4860,14 @@ fn submit_chat_message(
             *last_assistant_reply = reply;
         }
         Err(err) => {
+            let user_cancelled = is_user_cancelled_ai_error(err.as_str());
             state.push(UiRole::System, err);
             state.reset_live_token_estimate();
-            state.status = ui_text_ai_failed().to_string();
+            state.status = if user_cancelled {
+                ui_text_ready().to_string()
+            } else {
+                ui_text_ai_failed().to_string()
+            };
         }
     }
     state.set_threads(services.session.list_sessions().unwrap_or_default());
@@ -4728,10 +4972,18 @@ fn wait_chat_worker_result(
     let mut saw_stream_events = false;
     let mut last_idle_draw = Instant::now();
     while finished.is_none() {
+        if let Some(cancel_result) = pending_ai_cancel_result(cancel_requested) {
+            finished = Some(cancel_result);
+            break;
+        }
         poll_session_auto_title_workers(services, state);
         let mut ui_dirty = false;
         let mut stream_draw_happened = false;
         loop {
+            if let Some(cancel_result) = pending_ai_cancel_result(cancel_requested) {
+                finished = Some(cancel_result);
+                break;
+            }
             match event_rx.try_recv() {
                 Ok(PendingAiEvent::Round(event)) => {
                     ui_dirty = true;
@@ -4836,6 +5088,11 @@ fn wait_chat_worker_result(
             draw_once(terminal, services, state)?;
             last_idle_draw = Instant::now();
         }
+        if finished.is_none()
+            && let Some(cancel_result) = pending_ai_cancel_result(cancel_requested)
+        {
+            finished = Some(cancel_result);
+        }
         if finished.is_some() {
             break;
         }
@@ -4856,7 +5113,13 @@ fn wait_chat_worker_result(
             }
             Event::Mouse(mouse) => {
                 redraw_after_input = true;
-                handle_pending_ai_mouse_event(mouse, terminal, services, state)?
+                handle_pending_ai_mouse_event(
+                    mouse,
+                    terminal,
+                    services,
+                    state,
+                    cancel_requested,
+                )?
             }
             Event::Resize(width, height) => {
                 handle_tui_resize_redraw(terminal, services, state, Some((width, height)))?;
@@ -4867,6 +5130,11 @@ fn wait_chat_worker_result(
         if redraw_after_input {
             draw_once(terminal, services, state)?;
             last_idle_draw = Instant::now();
+        }
+        if finished.is_none()
+            && let Some(cancel_result) = pending_ai_cancel_result(cancel_requested)
+        {
+            finished = Some(cancel_result);
         }
     }
     if streamed_thinking_dirty {
@@ -4881,8 +5149,21 @@ fn wait_chat_worker_result(
     })
 }
 
+fn is_user_cancelled_ai_error(err: &str) -> bool {
+    let normalized = err.trim();
+    normalized == i18n::chat_ai_cancel_requested()
+        || normalized == i18n::chat_ai_cancelled_by_shortcut()
+}
+
 fn should_append_final_thinking(final_thinking: &str, thinking_rendered_in_ui: bool) -> bool {
     !final_thinking.trim().is_empty() && !thinking_rendered_in_ui
+}
+
+fn pending_ai_cancel_result(cancel_requested: &AtomicBool) -> Option<Result<ChatToolResponse, String>> {
+    if cancel_requested.load(Ordering::SeqCst) {
+        return Some(Err(i18n::chat_ai_cancel_requested().to_string()));
+    }
+    None
 }
 
 fn render_stream_event_typewriter(
@@ -4963,7 +5244,13 @@ fn pump_pending_ai_input_events(
                 let _ =
                     handle_pending_ai_key_event(key, terminal, services, state, cancel_requested)?;
             }
-            Event::Mouse(mouse) => handle_pending_ai_mouse_event(mouse, terminal, services, state)?,
+            Event::Mouse(mouse) => handle_pending_ai_mouse_event(
+                mouse,
+                terminal,
+                services,
+                state,
+                cancel_requested,
+            )?,
             Event::Resize(width, height) => {
                 handle_tui_resize_redraw(terminal, services, state, Some((width, height)))?
             }
@@ -4976,12 +5263,53 @@ fn pump_pending_ai_input_events(
     Ok(())
 }
 
+fn try_handle_pending_ai_stop_button_click(
+    state: &mut ChatUiState,
+    layout: UiLayout,
+    mouse: MouseEvent,
+    cancel_requested: &AtomicBool,
+) -> bool {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        || !rect_contains(layout.input, mouse.column, mouse.row)
+        || layout.input_body.height < 2
+    {
+        return false;
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(layout.input_body);
+    let buttons = chat_input_action_buttons(state, layout, rows[1]);
+    if chat_input_action_button_at(&buttons, mouse.column, mouse.row)
+        == Some(ChatInputActionKind::StopAnswer)
+    {
+        request_pending_ai_stop(state, cancel_requested);
+        return true;
+    }
+    false
+}
+
+fn request_pending_ai_stop(state: &mut ChatUiState, cancel_requested: &AtomicBool) {
+    let Some(live) = state.ai_live.as_mut() else {
+        state.status = ui_text_status_ai_stop_not_running().to_string();
+        return;
+    };
+    if live.cancel_requested || cancel_requested.load(Ordering::SeqCst) {
+        state.status = ui_text_status_ai_cancelling().to_string();
+        return;
+    }
+    live.cancel_requested = true;
+    cancel_requested.store(true, Ordering::SeqCst);
+    crate::shell::ShellExecutor::request_interrupt();
+    state.status = ui_text_status_ai_cancelling().to_string();
+}
+
 fn handle_pending_ai_key_event(
     key: KeyEvent,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     services: &mut ActionServices<'_>,
     state: &mut ChatUiState,
-    cancel_requested: &AtomicBool,
+    _cancel_requested: &AtomicBool,
 ) -> Result<bool, AppError> {
     if state.pending_delete_confirm.is_some() {
         return handle_delete_message_confirm_key(key, services, state);
@@ -4995,23 +5323,20 @@ fn handle_pending_ai_key_event(
     if state.pending_tool_result_modal.is_some() {
         return handle_tool_result_modal_key(key, state);
     }
+    if state.pending_raw_data_modal.is_some() {
+        return handle_raw_data_modal_key(key, state);
+    }
     if state.pending_thread_export_html.is_some() {
         return handle_thread_export_html_modal_key(key, services, state);
     }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-        cancel_requested.store(true, Ordering::SeqCst);
-        if let Some(live) = state.ai_live.as_mut() {
-            live.cancel_requested = true;
-        }
-        state.status = ui_text_status_ai_cancelling().to_string();
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c' | 'z'))
+    {
+        state.status = ui_text_status_ai_stop_button_hint().to_string();
         return Ok(false);
     }
     if key.code == KeyCode::Esc {
-        cancel_requested.store(true, Ordering::SeqCst);
-        if let Some(live) = state.ai_live.as_mut() {
-            live.cancel_requested = true;
-        }
-        state.status = ui_text_status_ai_cancelling().to_string();
+        state.status = ui_text_status_ai_stop_button_hint().to_string();
         return Ok(false);
     }
     if key.code == KeyCode::F(2) {
@@ -5045,6 +5370,7 @@ fn handle_pending_ai_mouse_event(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     services: &mut ActionServices<'_>,
     state: &mut ChatUiState,
+    cancel_requested: &AtomicBool,
 ) -> Result<(), AppError> {
     let area = terminal
         .size()
@@ -5067,6 +5393,10 @@ fn handle_pending_ai_mouse_event(
         handle_tool_result_modal_mouse(mouse, state, layout)?;
         return Ok(());
     }
+    if state.pending_raw_data_modal.is_some() {
+        handle_raw_data_modal_mouse(mouse, state, layout)?;
+        return Ok(());
+    }
     if state.pending_thread_export_html.is_some() {
         handle_thread_export_html_modal_mouse(mouse, services, state, layout)?;
         return Ok(());
@@ -5076,6 +5406,9 @@ fn handle_pending_ai_mouse_event(
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
     ) && state.should_suppress_mouse_scroll()
     {
+        return Ok(());
+    }
+    if try_handle_pending_ai_stop_button_click(state, layout, mouse, cancel_requested) {
         return Ok(());
     }
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -6525,6 +6858,74 @@ fn draw_tool_result_modal(
     );
 }
 
+fn draw_raw_data_modal(
+    frame: &mut Frame<'_>,
+    state: &mut ChatUiState,
+    layout: UiLayout,
+    palette: ThemePalette,
+) {
+    let Some(modal_state) = state.pending_raw_data_modal.as_mut() else {
+        return;
+    };
+    draw_modal_overlay(frame, palette);
+    let modal = raw_data_modal_rect(layout);
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(modal_state.title.as_str())
+            .style(Style::default().bg(palette.panel_bg))
+            .border_style(Style::default().fg(palette.border_focus)),
+        modal,
+    );
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(1), Constraint::Length(1)])
+        .margin(1)
+        .split(modal);
+    let max_scroll = raw_data_modal_scroll_max(modal_state, layout);
+    let scroll = modal_state.scroll.min(max_scroll);
+    modal_state.scroll = scroll;
+    frame.render_widget(
+        Paragraph::new(modal_state.content.as_str())
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .style(Style::default().fg(palette.text))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(palette.border)),
+            ),
+        body[0],
+    );
+    if let Some(copy_button) = raw_data_modal_copy_button_data(layout) {
+        frame.render_widget(
+            Paragraph::new(copy_button.label).style(
+                Style::default()
+                    .fg(Color::Rgb(255, 210, 122))
+                    .bg(palette.panel_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            copy_button.rect,
+        );
+    }
+    let hint = if max_scroll == 0 {
+        ui_text_message_raw_data_modal_hint().to_string()
+    } else {
+        format!(
+            "{} · {}/{}",
+            ui_text_message_raw_data_modal_hint(),
+            scroll + 1,
+            max_scroll + 1
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(trim_ui_text(hint.as_str(), body[2].width.max(1) as usize))
+            .style(Style::default().fg(palette.muted)),
+        body[2],
+    );
+}
+
 fn draw_thread_action_menu_modal(
     frame: &mut Frame<'_>,
     state: &ChatUiState,
@@ -7511,6 +7912,9 @@ fn draw_ui(frame: &mut Frame<'_>, services: &ActionServices<'_>, state: &mut Cha
     if state.pending_tool_result_modal.is_some() {
         draw_tool_result_modal(frame, state, layout, palette);
     }
+    if state.pending_raw_data_modal.is_some() {
+        draw_raw_data_modal(frame, state, layout, palette);
+    }
 }
 
 fn draw_sidebar(
@@ -7670,6 +8074,10 @@ fn draw_main_panel(
                 ))),
         );
     frame.render_widget(Clear, layout.conversation);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.panel_bg)),
+        layout.conversation,
+    );
     frame.render_widget(conversation, layout.conversation);
     draw_conversation_hover_copy_button(frame, state, layout, palette);
 
@@ -7786,16 +8194,20 @@ fn draw_main_header(
     let current = current_thread_overview(state, services);
     let summary = if let Some(item) = current {
         format!(
-            "{}  msg:{}  user:{}  ai:{}",
+            "{}  {}:{}  {}:{}  {}:{}",
             short_session_id(item.session_id.as_str()),
+            ui_text_session_card_messages_short(),
             item.message_count,
+            ui_text_session_card_user_short(),
             item.user_count,
+            ui_text_session_card_ai_short(),
             item.assistant_count
         )
     } else {
         format!(
-            "{}  msg:{}",
+            "{}  {}:{}",
             short_session_id(services.session.session_id()),
+            ui_text_session_card_messages_short(),
             services.session.message_count()
         )
     };
@@ -8172,7 +8584,6 @@ fn draw_conversation_hover_copy_button(
         Paragraph::new(copy_label).style(
             Style::default()
                 .fg(palette.text)
-                .bg(palette.panel_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         buttons.copy_rect,
@@ -8183,7 +8594,6 @@ fn draw_conversation_hover_copy_button(
             Paragraph::new(result_label).style(
                 Style::default()
                     .fg(Color::Rgb(130, 205, 255))
-                    .bg(palette.panel_bg)
                     .add_modifier(Modifier::BOLD),
             ),
             result_rect,
@@ -8194,44 +8604,112 @@ fn draw_conversation_hover_copy_button(
         Paragraph::new(delete_label).style(
             Style::default()
                 .fg(Color::Rgb(255, 148, 148))
-                .bg(palette.panel_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         buttons.delete_rect,
     );
+    if let Some(raw_data_rect) = buttons.raw_data_rect {
+        let raw_data_label = ui_text_message_raw_data_button();
+        frame.render_widget(
+            Paragraph::new(raw_data_label).style(
+                Style::default()
+                    .fg(Color::Rgb(255, 210, 122))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            raw_data_rect,
+        );
+    }
 }
 
-fn conversation_copy_button_data(
-    state: &ChatUiState,
-    layout: UiLayout,
-) -> Option<ConversationCopyButton> {
-    let buttons = conversation_hover_buttons_data(state, layout)?;
-    Some(ConversationCopyButton {
-        message_index: buttons.message_index,
-        rect: buttons.copy_rect,
-    })
+fn hover_button_label_width(label: &str) -> u16 {
+    UnicodeWidthStr::width(label).max(1).min(u16::MAX as usize) as u16
 }
 
-fn conversation_delete_button_data(
-    state: &ChatUiState,
-    layout: UiLayout,
-) -> Option<ConversationDeleteButton> {
-    let buttons = conversation_hover_buttons_data(state, layout)?;
-    Some(ConversationDeleteButton {
-        message_index: buttons.message_index,
-        rect: buttons.delete_rect,
-    })
+fn hover_button_hit_width(label: &str) -> u16 {
+    label.chars().count().max(1).min(u16::MAX as usize) as u16
 }
 
-fn conversation_tool_result_button_data(
+fn conversation_hover_action_hit_rects(
+    buttons: &ConversationHoverButtons,
+) -> (Rect, Option<Rect>, Rect, Option<Rect>) {
+    let copy_width = hover_button_hit_width(ui_text_message_copy_button());
+    let result_width = hover_button_hit_width(ui_text_message_tool_result_button());
+    let delete_width = hover_button_hit_width(ui_text_message_delete_button());
+    let raw_width = hover_button_hit_width(ui_text_message_raw_data_button());
+    let copy_rect = Rect {
+        x: buttons.copy_rect.x,
+        y: buttons.copy_rect.y,
+        width: copy_width,
+        height: 1,
+    };
+    let result_rect = if buttons.result_rect.is_some() {
+        Some(Rect {
+            x: copy_rect.x.saturating_add(copy_rect.width),
+            y: copy_rect.y,
+            width: result_width,
+            height: 1,
+        })
+    } else {
+        None
+    };
+    let delete_rect = Rect {
+        x: result_rect
+            .map(|rect| rect.x.saturating_add(rect.width))
+            .unwrap_or_else(|| copy_rect.x.saturating_add(copy_rect.width)),
+        y: copy_rect.y,
+        width: delete_width,
+        height: 1,
+    };
+    let raw_rect = if buttons.raw_data_rect.is_some() {
+        Some(Rect {
+            x: delete_rect.x.saturating_add(delete_rect.width),
+            y: copy_rect.y,
+            width: raw_width,
+            height: 1,
+        })
+    } else {
+        None
+    };
+    (copy_rect, result_rect, delete_rect, raw_rect)
+}
+
+fn conversation_hover_action_match(
+    buttons: &ConversationHoverButtons,
+    x: u16,
+    y: u16,
+) -> Option<(ConversationHoverActionKind, Rect)> {
+    let (copy_rect, result_rect, delete_rect, raw_rect) =
+        conversation_hover_action_hit_rects(buttons);
+    if let Some(raw_rect) = raw_rect
+        && rect_contains(raw_rect, x, y)
+    {
+        return Some((ConversationHoverActionKind::RawData, raw_rect));
+    }
+    if rect_contains(delete_rect, x, y) {
+        return Some((ConversationHoverActionKind::Delete, delete_rect));
+    }
+    if let Some(result_rect) = result_rect
+        && rect_contains(result_rect, x, y)
+    {
+        return Some((ConversationHoverActionKind::ToolResult, result_rect));
+    }
+    if rect_contains(copy_rect, x, y) {
+        return Some((ConversationHoverActionKind::Copy, copy_rect));
+    }
+    None
+}
+
+fn conversation_hover_action_at(
     state: &ChatUiState,
     layout: UiLayout,
-) -> Option<ConversationToolResultButton> {
+    x: u16,
+    y: u16,
+) -> Option<ConversationHoverAction> {
     let buttons = conversation_hover_buttons_data(state, layout)?;
-    let result_rect = buttons.result_rect?;
-    Some(ConversationToolResultButton {
+    let (kind, _) = conversation_hover_action_match(&buttons, x, y)?;
+    Some(ConversationHoverAction {
         message_index: buttons.message_index,
-        rect: result_rect,
+        kind,
     })
 }
 
@@ -8287,6 +8765,16 @@ fn chat_input_action_buttons(
         button_area.y,
         max_x,
     );
+    if state.ai_live.is_some() {
+        append_chat_input_action_button(
+            &mut buttons,
+            ChatInputActionKind::StopAnswer,
+            format!("[ {} ]", ui_text_chat_stop_answer()),
+            &mut cursor_x,
+            button_area.y,
+            max_x,
+        );
+    }
     if !conversation_is_at_bottom(state, layout.conversation_body.height.max(1)) {
         append_chat_input_action_button(
             &mut buttons,
@@ -8329,6 +8817,45 @@ fn append_chat_input_action_button(
     *cursor_x = (*cursor_x).saturating_add(width.saturating_add(1));
 }
 
+fn chat_input_action_button_hit_rects(buttons: &[ChatInputActionButton]) -> Vec<(ChatInputActionKind, Rect)> {
+    let Some(first) = buttons.first() else {
+        return Vec::new();
+    };
+    let mut x = first.rect.x;
+    let mut rects = Vec::with_capacity(buttons.len());
+    for button in buttons {
+        let rect = Rect {
+            x,
+            y: button.rect.y,
+            width: hover_button_hit_width(&button.label),
+            height: button.rect.height.max(1),
+        };
+        rects.push((button.kind, rect));
+        x = x.saturating_add(rect.width).saturating_add(1);
+    }
+    rects
+}
+
+#[cfg(test)]
+fn chat_input_action_button_hit_rect(
+    buttons: &[ChatInputActionButton],
+    kind: ChatInputActionKind,
+) -> Option<Rect> {
+    chat_input_action_button_hit_rects(buttons)
+        .into_iter()
+        .find_map(|(button_kind, rect)| if button_kind == kind { Some(rect) } else { None })
+}
+
+fn chat_input_action_button_at(
+    buttons: &[ChatInputActionButton],
+    x: u16,
+    y: u16,
+) -> Option<ChatInputActionKind> {
+    chat_input_action_button_hit_rects(buttons)
+        .into_iter()
+        .find_map(|(kind, rect)| if rect_contains(rect, x, y) { Some(kind) } else { None })
+}
+
 fn conversation_is_at_bottom(state: &ChatUiState, viewport_height: u16) -> bool {
     let visible = viewport_height.max(1) as usize;
     let max = state
@@ -8362,31 +8889,38 @@ fn conversation_hover_buttons_data(
     if button_line_idx < visible_start || button_line_idx >= visible_end {
         return None;
     }
-    let copy_label = ui_text_message_copy_button();
-    let result_label = ui_text_message_tool_result_button();
-    let delete_label = ui_text_message_delete_button();
-    let copy_width = text_display_width(copy_label) as u16;
-    let result_width = text_display_width(result_label) as u16;
-    let delete_width = text_display_width(delete_label) as u16;
-    let has_result = state
+    let copy_width = hover_button_label_width(ui_text_message_copy_button());
+    let result_width = hover_button_label_width(ui_text_message_tool_result_button());
+    let delete_width = hover_button_label_width(ui_text_message_delete_button());
+    let raw_data_width = hover_button_label_width(ui_text_message_raw_data_button());
+    let mut has_result = state
         .messages
         .get(hovered)
         .and_then(tool_result_detail_from_message)
         .is_some();
-    let total_width = if has_result {
-        copy_width
-            .saturating_add(1)
-            .saturating_add(result_width)
-            .saturating_add(1)
-            .saturating_add(delete_width)
-            .max(1)
-    } else {
-        copy_width
-            .saturating_add(1)
-            .saturating_add(delete_width)
-            .max(1)
+    let mut has_raw_data = state.ai_debug_enabled && state.messages.get(hovered).is_some();
+    let total_width_for = |show_result: bool, show_raw_data: bool| -> u16 {
+        let mut total = copy_width.saturating_add(delete_width);
+        if show_result {
+            total = total.saturating_add(result_width);
+        }
+        if show_raw_data {
+            total = total.saturating_add(raw_data_width);
+        }
+        total.max(1)
     };
-    if total_width > layout.conversation_body.width {
+    let mut total_width = total_width_for(has_result, has_raw_data);
+    while total_width > layout.conversation_body.width {
+        if has_raw_data {
+            has_raw_data = false;
+            total_width = total_width_for(has_result, has_raw_data);
+            continue;
+        }
+        if has_result {
+            has_result = false;
+            total_width = total_width_for(has_result, has_raw_data);
+            continue;
+        }
         return None;
     }
     let x = if role == UiRole::User {
@@ -8409,7 +8943,7 @@ fn conversation_hover_buttons_data(
     };
     let result_rect = if has_result {
         Some(Rect {
-            x: x.saturating_add(copy_rect.width).saturating_add(1),
+            x: x.saturating_add(copy_rect.width),
             y,
             width: result_width.max(1),
             height: 1,
@@ -8418,9 +8952,9 @@ fn conversation_hover_buttons_data(
         None
     };
     let delete_x = if let Some(rect) = result_rect {
-        rect.x.saturating_add(rect.width).saturating_add(1)
+        rect.x.saturating_add(rect.width)
     } else {
-        x.saturating_add(copy_rect.width).saturating_add(1)
+        x.saturating_add(copy_rect.width)
     };
     let delete_rect = Rect {
         x: delete_x,
@@ -8428,11 +8962,22 @@ fn conversation_hover_buttons_data(
         width: delete_width.max(1),
         height: 1,
     };
+    let raw_data_rect = if has_raw_data {
+        Some(Rect {
+            x: delete_rect.x.saturating_add(delete_rect.width),
+            y,
+            width: raw_data_width.max(1),
+            height: 1,
+        })
+    } else {
+        None
+    };
     Some(ConversationHoverButtons {
         message_index: hovered,
         copy_rect,
         result_rect,
         delete_rect,
+        raw_data_rect,
     })
 }
 
@@ -8452,10 +8997,20 @@ fn hovered_message_index_from_mouse(
     }
     let row_offset = mouse.row.saturating_sub(layout.conversation_body.y) as usize;
     let line_idx = state.conversation_scroll as usize + row_offset;
-    state
-        .conversation_lines
-        .get(line_idx)
-        .and_then(|line| line.message_index)
+    if line_idx == state.conversation_lines.len() {
+        return state.conversation_lines.last().and_then(|item| item.message_index);
+    }
+    let line = state.conversation_lines.get(line_idx)?;
+    if let Some(message_index) = line.message_index {
+        return Some(message_index);
+    }
+    if matches!(line.kind, ConversationLineKind::Spacer) {
+        return state.conversation_lines[..line_idx]
+            .iter()
+            .rev()
+            .find_map(|item| item.message_index);
+    }
+    None
 }
 
 fn refresh_hovered_message_from_mouse(
@@ -8467,18 +9022,7 @@ fn refresh_hovered_message_from_mouse(
         state.hovered_message_idx = Some(idx);
         return;
     }
-    if let Some(button) = conversation_copy_button_data(state, layout)
-        && rect_contains(button.rect, mouse.column, mouse.row)
-    {
-        return;
-    }
-    if let Some(button) = conversation_delete_button_data(state, layout)
-        && rect_contains(button.rect, mouse.column, mouse.row)
-    {
-        return;
-    }
-    if let Some(button) = conversation_tool_result_button_data(state, layout)
-        && rect_contains(button.rect, mouse.column, mouse.row)
+    if conversation_hover_action_at(state, layout, mouse.column, mouse.row).is_some()
     {
         return;
     }
@@ -8835,7 +9379,12 @@ fn draw_input_panel(
         draw_mcp_input_panel(frame, state, layout, palette);
         return;
     }
-    let input_title = format!("{} ({})", ui_text_panel_input(), ui_text_input_hint());
+    let hint = if state.ai_live.is_some() {
+        ui_text_input_hint_ai_live()
+    } else {
+        ui_text_input_hint()
+    };
+    let input_title = format!("{} ({})", ui_text_panel_input(), hint);
     let input_block = Block::default()
         .borders(Borders::ALL)
         .title(input_title)
@@ -8900,6 +9449,10 @@ fn draw_input_panel(
                 ChatInputActionKind::ClearInput => Style::default()
                     .fg(palette.panel_bg)
                     .bg(Color::Rgb(255, 174, 102))
+                    .add_modifier(Modifier::BOLD),
+                ChatInputActionKind::StopAnswer => Style::default()
+                    .fg(palette.panel_bg)
+                    .bg(Color::Rgb(255, 124, 124))
                     .add_modifier(Modifier::BOLD),
                 ChatInputActionKind::JumpToLatest => Style::default()
                     .fg(palette.panel_bg)
@@ -10978,6 +11531,21 @@ fn save_config_ui(
     }
     state.config_ui.dirty_count = 0;
     state.config_ui.editing = false;
+    if let Some(field) = state.config_ui.fields.iter().find(|item| item.key == "ai.debug") {
+        state.ai_debug_enabled = field.value.trim().eq_ignore_ascii_case("true");
+    }
+    if let Some(field) = state
+        .config_ui
+        .fields
+        .iter()
+        .find(|item| item.key == "ai.base-url")
+    {
+        state.ai_connectivity_request_url = field.value.trim().to_string();
+    }
+    if let Some(field) = state.config_ui.fields.iter().find(|item| item.key == "ai.type") {
+        state.ai_connectivity_transport = field.value.trim().to_string();
+    }
+    state.conversation_dirty = true;
     state.status = ui_text_config_saved().to_string();
     Ok(())
 }
@@ -11988,8 +12556,38 @@ fn thread_export_html_clear_button_data(layout: UiLayout) -> Option<ThreadRename
     })
 }
 
+fn raw_data_modal_copy_button_data(layout: UiLayout) -> Option<ThreadRenameClearButton> {
+    let modal = raw_data_modal_rect(layout);
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(1), Constraint::Length(1)])
+        .margin(1)
+        .split(modal);
+    let button_row = body[1];
+    if button_row.width < 6 {
+        return None;
+    }
+    let label = format!("[ {} ]", ui_text_message_raw_data_modal_copy_button());
+    let width = text_display_width(label.as_str())
+        .max(1)
+        .min(button_row.width as usize) as u16;
+    Some(ThreadRenameClearButton {
+        label: trim_ui_text(label.as_str(), button_row.width as usize),
+        rect: Rect {
+            x: button_row.x,
+            y: button_row.y,
+            width,
+            height: 1,
+        },
+    })
+}
+
 fn tool_result_modal_rect(layout: UiLayout) -> Rect {
     centered_rect(layout.conversation, 88, 24)
+}
+
+fn raw_data_modal_rect(layout: UiLayout) -> Rect {
+    tool_result_modal_rect(layout)
 }
 
 fn tool_result_modal_scroll_max(modal: &mut ToolResultModalState, layout: UiLayout) -> u16 {
@@ -12001,6 +12599,41 @@ fn tool_result_modal_scroll_max(modal: &mut ToolResultModalState, layout: UiLayo
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(8), Constraint::Length(1)])
+        .split(inner);
+    let text_width = rows[0].width.saturating_sub(2).max(1) as usize;
+    let viewport_height = rows[0].height.saturating_sub(2).max(1) as usize;
+    let mut wrapped_lines = modal
+        .wrap_cache
+        .as_ref()
+        .filter(|item| item.text_width == text_width)
+        .map(|item| item.wrapped_lines)
+        .unwrap_or(0);
+    if wrapped_lines == 0 {
+        wrapped_lines = modal
+            .content
+            .split('\n')
+            .map(|line| wrapped_line_count_by_display_width(line, text_width))
+            .sum::<usize>()
+            .max(1);
+        modal.wrap_cache = Some(ToolResultModalWrapCache {
+            text_width,
+            wrapped_lines,
+        });
+    }
+    wrapped_lines
+        .saturating_sub(viewport_height)
+        .min(u16::MAX as usize) as u16
+}
+
+fn raw_data_modal_scroll_max(modal: &mut RawDataModalState, layout: UiLayout) -> u16 {
+    let rect = raw_data_modal_rect(layout);
+    let inner = rect.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(1), Constraint::Length(1)])
         .split(inner);
     let text_width = rows[0].width.saturating_sub(2).max(1) as usize;
     let viewport_height = rows[0].height.saturating_sub(2).max(1) as usize;
@@ -13300,6 +13933,7 @@ fn build_session_export_html_document(payload_json: &str) -> String {
           btn_toggle_meta_collapse: "折叠元数据",
           language_label: "语言",
           filter_placeholder: "按内容搜索消息...",
+          message_stats: "已显示 {shown} / 总计 {total}",
           role_all: "全部角色",
           role_user: "用户",
           role_assistant: "助手",
@@ -13396,6 +14030,7 @@ fn build_session_export_html_document(payload_json: &str) -> String {
           btn_toggle_meta_collapse: "Collapse Metadata",
           language_label: "Language",
           filter_placeholder: "Search messages...",
+          message_stats: "Showing {shown} / Total {total}",
           role_all: "All Roles",
           role_user: "User",
           role_assistant: "Assistant",
@@ -13483,9 +14118,386 @@ fn build_session_export_html_document(payload_json: &str) -> String {
           image_messages: "Messages",
         },
       };
-      I18N.fr = I18N.en;
-      I18N.de = I18N.en;
-      I18N.ja = I18N.en;
+      const I18N_OVERRIDES = {
+        "zh-TW": {
+          doc_title: "會話匯出",
+          meta_title: "會話元資料 / 執行時",
+          messages_title: "聊天訊息",
+          btn_export_image: "匯出聊天長圖",
+          btn_toggle_meta_expand: "展開元資料",
+          btn_toggle_meta_collapse: "摺疊元資料",
+          language_label: "語言",
+          filter_placeholder: "按內容搜尋訊息...",
+          message_stats: "已顯示 {shown} / 總計 {total}",
+          role_all: "全部角色",
+          role_user: "使用者",
+          role_assistant: "助手",
+          role_thinking: "思考",
+          role_tool: "工具",
+          role_system: "系統",
+          label_file: "檔案",
+          label_exported: "匯出時間",
+          chip_summary_chars: "摘要字元",
+          chip_context_usage: "上下文佔用",
+          meta_overview: "訊息 {count} 條 · 上下文佔用 {usage}% · 匯出時間 {exported}",
+          kpi_messages: "訊息總數",
+          kpi_context_usage: "上下文佔用",
+          kpi_compression_rounds: "壓縮輪次",
+          kpi_token_stats: "Token 統計",
+          sub_recent_max: "最近視窗={recent} · 最大視窗={max}",
+          sub_truncated_dropped: "截斷 {truncated} · 丟棄分組 {dropped}",
+          sub_token_mix: "已提交 {committed} / 即時 {live} / 展示 {display}",
+          group_session_identity: "會話身份",
+          group_runtime: "執行環境",
+          group_compass: "壓縮與上下文",
+          group_recent_clues: "最近線索",
+          field_session_id: "會話ID",
+          field_session_name: "會話名",
+          field_session_file: "會話檔案",
+          field_created_at: "建立時間",
+          field_updated_at: "更新時間",
+          field_active_session: "目前會話",
+          field_model: "模型",
+          field_exported_at: "匯出時間",
+          field_cwd: "執行目錄",
+          field_os_arch: "系統/架構",
+          field_task_dir: "任務目錄",
+          field_compression_rounds: "壓縮輪次",
+          field_truncated_messages: "截斷訊息數",
+          field_dropped_groups: "丟棄分組數",
+          field_last_compaction_preview: "最近壓縮預覽",
+          field_token_mix: "Token(已提交/即時/展示)",
+          field_last_user_topic: "最近使用者主題",
+          field_last_assistant_focus: "最近助手焦點",
+          field_last_action: "最近動作",
+          field_summary: "摘要",
+          tag_account: "帳號",
+          tag_env: "環境",
+          tag_os: "系統",
+          tag_mode: "模式",
+          tag_label: "標籤",
+          tag_environment_na: "環境:N/A",
+          tool_structured_note: "工具訊息已結構化展示（含命令/參數/結果）",
+          tool_function: "函式",
+          tool_status: "狀態",
+          tool_duration: "耗時",
+          tool_status_ok: "正常",
+          tool_status_blocked: "已阻止",
+          tool_status_timeout: "逾時",
+          tool_status_interrupted: "已中斷",
+          tool_call_id: "呼叫ID",
+          tool_executed_at: "執行時間",
+          tool_account: "執行帳號",
+          tool_environment: "環境",
+          tool_os_name: "作業系統",
+          tool_cwd: "工作目錄",
+          tool_label: "標籤",
+          tool_flags: "標記",
+          tool_exit_code: "退出碼",
+          tool_section_command: "命令",
+          tool_section_arguments: "參數",
+          tool_section_result: "結果",
+          tool_section_raw: "原始訊息",
+          tool_flag_format: "逾時={timeout} 中斷={interrupted} 阻止={blocked}",
+          empty_filtered_messages: "目前篩選條件下沒有訊息。",
+          status_data_parse_failed: "會話資料解析失敗",
+          status_generating_image: "正在生成長圖...",
+          status_image_done: "長圖匯出完成",
+          status_image_failed: "長圖匯出失敗",
+          status_loaded: "HTML 已載入，可匯出聊天長圖",
+          status_language_switched: "語言已切換",
+          image_title_suffix: "聊天匯出",
+        },
+        fr: {
+          doc_title: "Export de session",
+          meta_title: "Metadonnees de session / Runtime",
+          messages_title: "Messages",
+          btn_export_image: "Exporter l'image longue du chat",
+          btn_toggle_meta_expand: "Afficher les metadonnees",
+          btn_toggle_meta_collapse: "Masquer les metadonnees",
+          language_label: "Langue",
+          filter_placeholder: "Rechercher dans les messages...",
+          message_stats: "Affiches {shown} / Total {total}",
+          role_all: "Tous les roles",
+          role_user: "Utilisateur",
+          role_assistant: "Assistant",
+          role_thinking: "Reflexion",
+          role_tool: "Outil",
+          role_system: "Systeme",
+          label_file: "Fichier",
+          label_exported: "Exporte",
+          chip_messages: "Messages",
+          chip_summary_chars: "Caracteres du resume",
+          chip_context_usage: "Utilisation du contexte",
+          meta_overview: "{count} messages · contexte {usage}% · exporte {exported}",
+          kpi_messages: "Total des messages",
+          kpi_context_usage: "Utilisation du contexte",
+          kpi_compression_rounds: "Tours de compression",
+          kpi_token_stats: "Statistiques Token",
+          sub_recent_max: "recent={recent} · max={max}",
+          sub_truncated_dropped: "tronques {truncated} · groupes supprimes {dropped}",
+          sub_token_mix: "committed {committed} / live {live} / display {display}",
+          group_session_identity: "Identite de session",
+          group_runtime: "Environnement d'execution",
+          group_compass: "Compression et Contexte",
+          group_recent_clues: "Indices recents",
+          field_session_id: "ID de session",
+          field_session_name: "Nom de session",
+          field_session_file: "Fichier de session",
+          field_created_at: "Cree le",
+          field_updated_at: "Mis a jour le",
+          field_active_session: "Session active",
+          field_model: "Modele",
+          field_exported_at: "Exporte le",
+          field_cwd: "Repertoire de travail",
+          field_os_arch: "OS / Arch",
+          field_task_dir: "Repertoire des taches",
+          field_compression_rounds: "Tours de compression",
+          field_truncated_messages: "Messages tronques",
+          field_dropped_groups: "Groupes supprimes",
+          field_last_compaction_preview: "Apercu de la derniere compaction",
+          field_token_mix: "Token(committed/live/display)",
+          field_last_user_topic: "Dernier sujet utilisateur",
+          field_last_assistant_focus: "Dernier focus assistant",
+          field_last_action: "Derniere action",
+          field_summary: "Resume",
+          yes: "Oui",
+          no: "Non",
+          tag_account: "compte",
+          tag_env: "env",
+          tag_os: "os",
+          tag_mode: "mode",
+          tag_label: "etiquette",
+          tag_environment_na: "environment:N/A",
+          tool_structured_note: "Le message outil est affiche de facon structuree (commande/arguments/resultat)",
+          tool_function: "fonction",
+          tool_status: "statut",
+          tool_duration: "duree",
+          tool_mode: "mode",
+          tool_status_ok: "ok",
+          tool_status_blocked: "bloque",
+          tool_status_timeout: "timeout",
+          tool_status_interrupted: "interrompu",
+          tool_call_id: "id_appel",
+          tool_executed_at: "execute_a",
+          tool_account: "compte",
+          tool_environment: "environnement",
+          tool_os_name: "os_name",
+          tool_cwd: "cwd",
+          tool_label: "etiquette",
+          tool_flags: "drapeaux",
+          tool_exit_code: "code_sortie",
+          tool_section_command: "commande",
+          tool_section_arguments: "arguments",
+          tool_section_result: "resultat",
+          tool_section_raw: "message_brut",
+          tool_flag_format: "timeout={timeout} interrupted={interrupted} blocked={blocked}",
+          empty_filtered_messages: "Aucun message pour les filtres actuels.",
+          group_label: "groupe",
+          status_data_parse_failed: "Echec de l'analyse des donnees de session",
+          status_generating_image: "Generation de l'image longue...",
+          status_image_done: "Image longue exportee",
+          status_image_failed: "Echec de l'export de l'image longue",
+          status_loaded: "HTML charge, pret pour l'export d'image longue",
+          status_language_switched: "Langue changee",
+          image_title_suffix: "Export du chat",
+          image_messages: "Messages",
+        },
+        de: {
+          doc_title: "Sitzungsexport",
+          meta_title: "Sitzungsmetadaten / Laufzeit",
+          messages_title: "Nachrichten",
+          btn_export_image: "Langes Chat-Bild exportieren",
+          btn_toggle_meta_expand: "Metadaten ausklappen",
+          btn_toggle_meta_collapse: "Metadaten einklappen",
+          language_label: "Sprache",
+          filter_placeholder: "Nachrichten durchsuchen...",
+          message_stats: "Angezeigt {shown} / Gesamt {total}",
+          role_all: "Alle Rollen",
+          role_user: "Benutzer",
+          role_assistant: "Assistent",
+          role_thinking: "Denken",
+          role_tool: "Tool",
+          role_system: "System",
+          label_file: "Datei",
+          label_exported: "Exportiert",
+          chip_messages: "Nachrichten",
+          chip_summary_chars: "Zusammenfassung Zeichen",
+          chip_context_usage: "Kontextnutzung",
+          meta_overview: "{count} Nachrichten · Kontextnutzung {usage}% · exportiert {exported}",
+          kpi_messages: "Nachrichten gesamt",
+          kpi_context_usage: "Kontextnutzung",
+          kpi_compression_rounds: "Komprimierungsrunden",
+          kpi_token_stats: "Token Statistiken",
+          sub_recent_max: "recent={recent} · max={max}",
+          sub_truncated_dropped: "gekuerzt {truncated} · Gruppen verworfen {dropped}",
+          sub_token_mix: "committed {committed} / live {live} / display {display}",
+          group_session_identity: "Sitzungsidentitaet",
+          group_runtime: "Laufzeitumgebung",
+          group_compass: "Komprimierung und Kontext",
+          group_recent_clues: "Aktuelle Hinweise",
+          field_session_id: "Sitzungs-ID",
+          field_session_name: "Sitzungsname",
+          field_session_file: "Sitzungsdatei",
+          field_created_at: "Erstellt am",
+          field_updated_at: "Aktualisiert am",
+          field_active_session: "Aktive Sitzung",
+          field_model: "Modell",
+          field_exported_at: "Exportiert am",
+          field_cwd: "Arbeitsverzeichnis",
+          field_os_arch: "OS / Arch",
+          field_task_dir: "Task-Verzeichnis",
+          field_compression_rounds: "Komprimierungsrunden",
+          field_truncated_messages: "Gekuerzte Nachrichten",
+          field_dropped_groups: "Verworfene Gruppen",
+          field_last_compaction_preview: "Letzte Kompaktvorschau",
+          field_token_mix: "Token(committed/live/display)",
+          field_last_user_topic: "Letztes Benutzerthema",
+          field_last_assistant_focus: "Letzter Assistentenfokus",
+          field_last_action: "Letzte Aktion",
+          field_summary: "Zusammenfassung",
+          yes: "Ja",
+          no: "Nein",
+          tag_account: "konto",
+          tag_env: "env",
+          tag_os: "os",
+          tag_mode: "modus",
+          tag_label: "label",
+          tag_environment_na: "environment:N/A",
+          tool_structured_note: "Tool-Nachricht ist strukturiert dargestellt (Befehl/Argumente/Ergebnis)",
+          tool_function: "funktion",
+          tool_status: "status",
+          tool_duration: "dauer",
+          tool_mode: "modus",
+          tool_status_ok: "ok",
+          tool_status_blocked: "blockiert",
+          tool_status_timeout: "timeout",
+          tool_status_interrupted: "unterbrochen",
+          tool_call_id: "call_id",
+          tool_executed_at: "ausgefuehrt_am",
+          tool_account: "konto",
+          tool_environment: "umgebung",
+          tool_os_name: "os_name",
+          tool_cwd: "cwd",
+          tool_label: "label",
+          tool_flags: "flags",
+          tool_exit_code: "exit_code",
+          tool_section_command: "befehl",
+          tool_section_arguments: "argumente",
+          tool_section_result: "ergebnis",
+          tool_section_raw: "roh_nachricht",
+          tool_flag_format: "timeout={timeout} interrupted={interrupted} blocked={blocked}",
+          empty_filtered_messages: "Keine Nachrichten fuer die aktuellen Filter.",
+          group_label: "gruppe",
+          status_data_parse_failed: "Sitzungsdaten konnten nicht geparst werden",
+          status_generating_image: "Langes Bild wird erzeugt...",
+          status_image_done: "Langes Bild exportiert",
+          status_image_failed: "Export des langen Bildes fehlgeschlagen",
+          status_loaded: "HTML geladen, bereit fuer den Export des langen Bildes",
+          status_language_switched: "Sprache gewechselt",
+          image_title_suffix: "Chat-Export",
+          image_messages: "Nachrichten",
+        },
+        ja: {
+          doc_title: "セッションエクスポート",
+          meta_title: "セッションメタデータ / ランタイム",
+          messages_title: "メッセージ",
+          btn_export_image: "チャット長画像をエクスポート",
+          btn_toggle_meta_expand: "メタデータを展開",
+          btn_toggle_meta_collapse: "メタデータを折りたたむ",
+          language_label: "言語",
+          filter_placeholder: "メッセージを検索...",
+          message_stats: "表示 {shown} / 合計 {total}",
+          role_all: "すべてのロール",
+          role_user: "ユーザー",
+          role_assistant: "アシスタント",
+          role_thinking: "思考",
+          role_tool: "ツール",
+          role_system: "システム",
+          label_file: "ファイル",
+          label_exported: "エクスポート時刻",
+          chip_messages: "メッセージ",
+          chip_summary_chars: "要約文字数",
+          chip_context_usage: "コンテキスト使用率",
+          meta_overview: "{count} 件のメッセージ · コンテキスト使用率 {usage}% · エクスポート {exported}",
+          kpi_messages: "メッセージ総数",
+          kpi_context_usage: "コンテキスト使用率",
+          kpi_compression_rounds: "圧縮回数",
+          kpi_token_stats: "Token 統計",
+          sub_recent_max: "recent={recent} · max={max}",
+          sub_truncated_dropped: "切り捨て {truncated} · 破棄グループ {dropped}",
+          sub_token_mix: "committed {committed} / live {live} / display {display}",
+          group_session_identity: "セッション情報",
+          group_runtime: "実行環境",
+          group_compass: "圧縮とコンテキスト",
+          group_recent_clues: "最近の手がかり",
+          field_session_id: "セッションID",
+          field_session_name: "セッション名",
+          field_session_file: "セッションファイル",
+          field_created_at: "作成時刻",
+          field_updated_at: "更新時刻",
+          field_active_session: "現在のセッション",
+          field_model: "モデル",
+          field_exported_at: "エクスポート時刻",
+          field_cwd: "作業ディレクトリ",
+          field_os_arch: "OS / Arch",
+          field_task_dir: "タスクディレクトリ",
+          field_compression_rounds: "圧縮回数",
+          field_truncated_messages: "切り捨てメッセージ数",
+          field_dropped_groups: "破棄グループ数",
+          field_last_compaction_preview: "最近の圧縮プレビュー",
+          field_token_mix: "Token(committed/live/display)",
+          field_last_user_topic: "直近ユーザートピック",
+          field_last_assistant_focus: "直近アシスタント焦点",
+          field_last_action: "直近アクション",
+          field_summary: "要約",
+          yes: "はい",
+          no: "いいえ",
+          tag_account: "account",
+          tag_env: "env",
+          tag_os: "os",
+          tag_mode: "mode",
+          tag_label: "label",
+          tag_environment_na: "environment:N/A",
+          tool_structured_note: "ツールメッセージを構造化表示しています（コマンド/引数/結果）",
+          tool_function: "function",
+          tool_status: "status",
+          tool_duration: "duration",
+          tool_mode: "mode",
+          tool_status_ok: "ok",
+          tool_status_blocked: "blocked",
+          tool_status_timeout: "timeout",
+          tool_status_interrupted: "interrupted",
+          tool_call_id: "call_id",
+          tool_executed_at: "executed_at",
+          tool_account: "account",
+          tool_environment: "environment",
+          tool_os_name: "os_name",
+          tool_cwd: "cwd",
+          tool_label: "label",
+          tool_flags: "flags",
+          tool_exit_code: "exit_code",
+          tool_section_command: "command",
+          tool_section_arguments: "arguments",
+          tool_section_result: "result",
+          tool_section_raw: "raw_message",
+          tool_flag_format: "timeout={timeout} interrupted={interrupted} blocked={blocked}",
+          empty_filtered_messages: "現在のフィルタ条件に一致するメッセージはありません。",
+          group_label: "group",
+          status_data_parse_failed: "セッションデータの解析に失敗しました",
+          status_generating_image: "長画像を生成中...",
+          status_image_done: "長画像のエクスポートが完了しました",
+          status_image_failed: "長画像のエクスポートに失敗しました",
+          status_loaded: "HTML を読み込みました。長画像をエクスポートできます",
+          status_language_switched: "言語を切り替えました",
+          image_title_suffix: "チャットエクスポート",
+          image_messages: "メッセージ",
+        },
+      };
+      Object.keys(I18N_OVERRIDES).forEach((locale) => {
+        const base = locale === "zh-TW" ? I18N.zh : I18N.en;
+        I18N[locale] = Object.assign({}, base, I18N_OVERRIDES[locale]);
+      });
       const datasetNode = document.getElementById("machineclaw-session-data");
       let data = {};
       try {
@@ -13514,7 +14526,8 @@ fn build_session_export_html_document(payload_json: &str) -> String {
       }
       function languageBucket(code) {
         const normalized = normalizeLanguageCode(code);
-        if (normalized.indexOf("zh-") === 0) return "zh";
+        if (normalized === "zh-CN") return "zh";
+        if (normalized === "zh-TW") return "zh-TW";
         if (normalized === "fr") return "fr";
         if (normalized === "de") return "de";
         if (normalized === "ja") return "ja";
@@ -13822,7 +14835,10 @@ fn build_session_export_html_document(payload_json: &str) -> String {
         messageList.innerHTML = "";
         if (!filteredMessages.length) {
           messageList.appendChild(create("div", "empty", t("empty_filtered_messages")));
-          messageStats.textContent = `0 / ${rawMessages.length}`;
+          messageStats.textContent = tf("message_stats", {
+            shown: 0,
+            total: rawMessages.length,
+          });
           return;
         }
         filteredMessages.forEach((msg, idx) => {
@@ -13849,7 +14865,10 @@ fn build_session_export_html_document(payload_json: &str) -> String {
           }
           messageList.appendChild(card);
         });
-        messageStats.textContent = `${filteredMessages.length} / ${rawMessages.length}`;
+        messageStats.textContent = tf("message_stats", {
+          shown: filteredMessages.length,
+          total: rawMessages.length,
+        });
       }
 
       function applyFilters() {
@@ -14459,6 +15478,278 @@ fn render_conversation_item_text(item: &UiMessage, streaming_inflight: bool) -> 
         return normalize_conversation_markdown_for_bubble(source);
     }
     render_conversation_markdown(source, streaming_inflight)
+}
+
+fn raw_debug_payload_for_message(
+    state: &ChatUiState,
+    message_index: usize,
+    item: &UiMessage,
+    streaming_inflight: bool,
+) -> Option<String> {
+    let payload = match item.role {
+        UiRole::User | UiRole::Assistant | UiRole::Thinking => json!({
+            "type": "chat_message",
+            "message_index": message_index + 1,
+            "role": ui_role_debug_key(item.role),
+            "raw_text": clamp_raw_debug_text(item.text.as_str(), HOVER_RAW_DEBUG_FIELD_MAX_CHARS),
+            "rendered_preview": clamp_raw_debug_text(
+                render_conversation_item_text(item, streaming_inflight).as_str(),
+                HOVER_RAW_DEBUG_FIELD_MAX_CHARS
+            )
+        }),
+        UiRole::Tool => {
+            let mut value = tool_message_debug_payload(item);
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("message_index".to_string(), json!(message_index + 1));
+            }
+            value
+        }
+        UiRole::System => {
+            let mut value = system_message_debug_payload(state, item.text.as_str());
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("message_index".to_string(), json!(message_index + 1));
+            }
+            value
+        }
+    };
+    Some(clamp_raw_debug_text(
+        pretty_debug_json(&payload).as_str(),
+        HOVER_RAW_DEBUG_MAX_CHARS,
+    ))
+}
+
+fn build_raw_data_modal_content(
+    state: &ChatUiState,
+    message_index: usize,
+) -> Option<(String, String)> {
+    if !state.ai_debug_enabled {
+        return None;
+    }
+    let item = state.messages.get(message_index)?;
+    let live_streaming = state.ai_live.is_some();
+    let last_message_idx = state.messages.len().saturating_sub(1);
+    let payload = raw_debug_payload_for_message(
+        state,
+        message_index,
+        item,
+        live_streaming
+            && message_index == last_message_idx
+            && matches!(item.role, UiRole::Assistant | UiRole::Thinking),
+    )?;
+    let title = format!(
+        "{} · #{} · {}",
+        ui_text_message_raw_data_modal_title(),
+        message_index + 1,
+        role_tag(item.role)
+    );
+    Some((title, payload))
+}
+
+fn ui_role_debug_key(role: UiRole) -> &'static str {
+    match role {
+        UiRole::User => "user",
+        UiRole::Assistant => "assistant",
+        UiRole::Thinking => "thinking",
+        UiRole::System => "system",
+        UiRole::Tool => "tool",
+    }
+}
+
+fn tool_message_debug_payload(item: &UiMessage) -> serde_json::Value {
+    let fallback = json!({
+        "type": "tool_message",
+        "raw_message": clamp_raw_debug_text(item.text.as_str(), HOVER_RAW_DEBUG_FIELD_MAX_CHARS)
+    });
+    let Some(meta) = item.tool_meta.as_ref() else {
+        if let Some(parts) = parse_persisted_tool_message(item.text.as_str()) {
+            return json!({
+                "type": "tool_message",
+                "tool_call_id": parts.tool_call_id,
+                "function": parts.function,
+                "arguments": debug_json_value_from_text(parts.args),
+                "result": debug_json_value_from_text(parts.result),
+                "raw_message": clamp_raw_debug_text(item.text.as_str(), HOVER_RAW_DEBUG_FIELD_MAX_CHARS),
+            });
+        }
+        return fallback;
+    };
+    json!({
+        "type": "tool_message",
+        "tool_call_id": clamp_raw_debug_text(meta.tool_call_id.as_str(), 120),
+        "function": clamp_raw_debug_text(meta.function_name.as_str(), 160),
+        "command": clamp_raw_debug_text(meta.command.as_str(), 480),
+        "arguments": debug_json_value_from_text(meta.arguments.as_str()),
+        "result": debug_json_value_from_text(meta.result_payload.as_str()),
+        "runtime": {
+            "executed_at_epoch_ms": meta.executed_at_epoch_ms,
+            "executed_at": format_epoch_ms(meta.executed_at_epoch_ms),
+            "duration_ms": meta.duration_ms,
+            "exit_code": meta.exit_code,
+            "timed_out": meta.timed_out,
+            "interrupted": meta.interrupted,
+            "blocked": meta.blocked,
+            "mode": clamp_raw_debug_text(meta.mode.as_str(), 64),
+            "label": clamp_raw_debug_text(meta.label.as_str(), 160),
+            "account": clamp_raw_debug_text(meta.account.as_str(), 120),
+            "environment": clamp_raw_debug_text(meta.environment.as_str(), 120),
+            "os_name": clamp_raw_debug_text(meta.os_name.as_str(), 120),
+            "cwd": clamp_raw_debug_text(meta.cwd.as_str(), 480),
+        },
+        "raw_message": clamp_raw_debug_text(item.text.as_str(), HOVER_RAW_DEBUG_FIELD_MAX_CHARS),
+    })
+}
+
+fn system_message_debug_payload(state: &ChatUiState, message_text: &str) -> serde_json::Value {
+    let text = message_text.trim();
+    if let Some(stage) = startup_preflight_stage_name(text) {
+        return json!({
+            "type": "system_startup_preflight",
+            "stage": stage,
+            "started_at_epoch_ms": state.startup_preflight_started_epoch_ms,
+            "started_at": format_epoch_ms(state.startup_preflight_started_epoch_ms),
+            "finished_at_epoch_ms": state.startup_preflight_finished_epoch_ms,
+            "finished_at": format_epoch_ms(state.startup_preflight_finished_epoch_ms),
+            "duration_ms": state.startup_preflight_duration_ms,
+            "duration": i18n::human_duration_ms(state.startup_preflight_duration_ms),
+            "raw_message": clamp_raw_debug_text(text, HOVER_RAW_DEBUG_FIELD_MAX_CHARS),
+        });
+    }
+    if let Some(connectivity_kind) = ai_connectivity_message_kind(text) {
+        let snapshot = state
+            .ai_connectivity_debug_snapshot
+            .clone()
+            .unwrap_or_default();
+        let transport = if snapshot.transport.trim().is_empty() {
+            state.ai_connectivity_transport.as_str()
+        } else {
+            snapshot.transport.as_str()
+        };
+        let request_url = if snapshot.request_url.trim().is_empty() {
+            state.ai_connectivity_request_url.as_str()
+        } else {
+            snapshot.request_url.as_str()
+        };
+        let request_body = if snapshot.request_body.trim().is_empty() {
+            debug_json_value_from_text(
+                pretty_debug_json(&build_ai_connectivity_request_payload_preview()).as_str(),
+            )
+        } else {
+            debug_json_value_from_text(snapshot.request_body.as_str())
+        };
+        let response_body = if snapshot.response_body.trim().is_empty() {
+            serde_json::Value::String(ui_text_na().to_string())
+        } else {
+            debug_json_value_from_text(snapshot.response_body.as_str())
+        };
+        return json!({
+            "type": "system_ai_connectivity",
+            "kind": connectivity_kind,
+            "transport": clamp_raw_debug_text(transport, 80),
+            "request_url": clamp_raw_debug_text(request_url, 480),
+            "request_body": request_body,
+            "response_body": response_body,
+            "started_at_epoch_ms": snapshot.started_at_epoch_ms,
+            "started_at": format_epoch_ms(snapshot.started_at_epoch_ms),
+            "finished_at_epoch_ms": snapshot.finished_at_epoch_ms,
+            "finished_at": format_epoch_ms(snapshot.finished_at_epoch_ms),
+            "duration_ms": snapshot.duration_ms,
+            "success": snapshot.success,
+            "error": clamp_raw_debug_text(snapshot.error.as_str(), HOVER_RAW_DEBUG_FIELD_MAX_CHARS),
+            "raw_message": clamp_raw_debug_text(text, HOVER_RAW_DEBUG_FIELD_MAX_CHARS),
+        });
+    }
+    json!({
+        "type": "system_message",
+        "raw_message": clamp_raw_debug_text(text, HOVER_RAW_DEBUG_FIELD_MAX_CHARS),
+    })
+}
+
+fn startup_preflight_stage_name(text: &str) -> Option<&'static str> {
+    if text == i18n::preflight_notice_start() {
+        return Some("start");
+    }
+    if text == i18n::preflight_notice_config_check() {
+        return Some("config_check");
+    }
+    if text == i18n::preflight_notice_permission_check() {
+        return Some("permission_check");
+    }
+    if text == i18n::preflight_notice_permission_check_skipped() {
+        return Some("permission_skipped");
+    }
+    if is_preflight_done_message(text) {
+        return Some("done");
+    }
+    None
+}
+
+fn is_preflight_done_message(text: &str) -> bool {
+    let normalized = text.trim();
+    [
+        "启动前检查完成",
+        "啟動前檢查完成",
+        "Startup preflight completed",
+        "Pré-vérification terminée",
+        "Vorabprüfung abgeschlossen",
+        "起動前チェック完了",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn ai_connectivity_message_kind(text: &str) -> Option<&'static str> {
+    let normalized = text.trim();
+    if normalized == ui_text_status_ai_connectivity_background_started() {
+        return Some("background_started");
+    }
+    if normalized == ui_text_status_ai_connectivity_ok() {
+        return Some("passed");
+    }
+    if normalized == ui_text_status_ai_connectivity_pending_send_blocked() {
+        return Some("pending_send_blocked");
+    }
+    if normalized == ui_text_status_ai_connectivity_failed()
+        || normalized.starts_with(format!("{}:", ui_text_status_ai_connectivity_failed()).as_str())
+    {
+        return Some("failed");
+    }
+    None
+}
+
+fn build_ai_connectivity_request_payload_preview() -> serde_json::Value {
+    json!({
+        "stream": false,
+        "temperature": 0.2,
+        "messages": [
+            {
+                "role": "system",
+                "content": AI_CONNECTIVITY_SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": AI_CONNECTIVITY_USER_PROMPT
+            }
+        ]
+    })
+}
+
+fn debug_json_value_from_text(raw: &str) -> serde_json::Value {
+    let clipped = clamp_raw_debug_text(raw, HOVER_RAW_DEBUG_FIELD_MAX_CHARS);
+    if clipped.trim().is_empty() {
+        return serde_json::Value::String(String::new());
+    }
+    match serde_json::from_str::<serde_json::Value>(clipped.as_str()) {
+        Ok(value) => value,
+        Err(_) => serde_json::Value::String(clipped),
+    }
+}
+
+fn pretty_debug_json(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn clamp_raw_debug_text(raw: &str, max_chars: usize) -> String {
+    trim_ui_text(mask_ui_sensitive(raw).as_str(), max_chars)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -15434,6 +16725,36 @@ fn ui_text_session_card_updated() -> &'static str {
 fn ui_text_session_card_tokens() -> &'static str {
     zh_or_en("Token消耗", "Token Usage")
 }
+fn ui_text_session_card_messages_short() -> &'static str {
+    match i18n::current_language() {
+        i18n::Language::ZhCn => "消息",
+        i18n::Language::ZhTw => "訊息",
+        i18n::Language::Fr => "msg",
+        i18n::Language::De => "msg",
+        i18n::Language::Ja => "メッセ",
+        i18n::Language::En => "msg",
+    }
+}
+fn ui_text_session_card_user_short() -> &'static str {
+    match i18n::current_language() {
+        i18n::Language::ZhCn => "用户",
+        i18n::Language::ZhTw => "使用者",
+        i18n::Language::Fr => "util.",
+        i18n::Language::De => "nutzer",
+        i18n::Language::Ja => "ユーザー",
+        i18n::Language::En => "user",
+    }
+}
+fn ui_text_session_card_ai_short() -> &'static str {
+    match i18n::current_language() {
+        i18n::Language::ZhCn => "AI",
+        i18n::Language::ZhTw => "AI",
+        i18n::Language::Fr => "IA",
+        i18n::Language::De => "KI",
+        i18n::Language::Ja => "AI",
+        i18n::Language::En => "AI",
+    }
+}
 fn ui_text_model_label() -> &'static str {
     zh_or_en("模型", "Model")
 }
@@ -15444,6 +16765,12 @@ fn ui_text_input_hint() -> &'static str {
     zh_or_en(
         "Enter发送, Tab切换面板, Ctrl+C/Ctrl+Z退出",
         "Enter send, Tab switch panel, Ctrl+C/Ctrl+Z exit",
+    )
+}
+fn ui_text_input_hint_ai_live() -> &'static str {
+    zh_or_en(
+        "AI回答中：可编辑输入，点击【停止回答】终止",
+        "AI answering: you can edit input and click [Stop Answer] to terminate",
     )
 }
 fn ui_text_chat_mode_label() -> &'static str {
@@ -15502,6 +16829,18 @@ fn ui_text_chat_input_clear() -> &'static str {
 }
 fn ui_text_chat_input_cleared() -> &'static str {
     zh_or_en("输入框已清空", "Input cleared")
+}
+fn ui_text_chat_stop_answer() -> &'static str {
+    zh_or_en("停止回答", "Stop Answer")
+}
+fn ui_text_status_ai_stop_button_hint() -> &'static str {
+    zh_or_en(
+        "AI 回答中，请点击底部【停止回答】按钮终止",
+        "AI is answering. Click [Stop Answer] to terminate",
+    )
+}
+fn ui_text_status_ai_stop_not_running() -> &'static str {
+    zh_or_en("当前没有可停止的 AI 回答", "No active AI response to stop")
 }
 fn ui_text_clear_button() -> &'static str {
     zh_or_en("清空", "Clear")
@@ -15764,6 +17103,36 @@ fn ui_text_message_tool_result_button() -> &'static str {
 }
 fn ui_text_message_delete_button() -> &'static str {
     zh_or_en("[删除]", "[Delete]")
+}
+fn ui_text_message_raw_data_button() -> &'static str {
+    zh_or_en("[原始数据]", "[Raw Data]")
+}
+fn ui_text_message_raw_data_modal_title() -> &'static str {
+    zh_or_en("原始数据", "Raw Data")
+}
+fn ui_text_message_raw_data_modal_hint() -> &'static str {
+    zh_or_en(
+        "方向键/PageUp/PageDown滚动，Esc关闭，C复制",
+        "Use arrows/PageUp/PageDown to scroll, Esc to close, C to copy",
+    )
+}
+fn ui_text_message_raw_data_modal_copy_button() -> &'static str {
+    zh_or_en("复制原始数据", "Copy Raw Data")
+}
+fn ui_text_message_raw_data_modal_opened() -> &'static str {
+    zh_or_en("已打开原始数据弹窗", "Raw data modal opened")
+}
+fn ui_text_message_raw_data_modal_closed() -> &'static str {
+    zh_or_en("已关闭原始数据弹窗", "Raw data modal closed")
+}
+fn ui_text_message_raw_data_copy_success() -> &'static str {
+    zh_or_en("原始数据已复制到剪贴板", "Raw data copied to clipboard")
+}
+fn ui_text_message_raw_data_copy_failed() -> &'static str {
+    zh_or_en("复制原始数据失败", "Failed to copy raw data")
+}
+fn ui_text_message_raw_data_unavailable() -> &'static str {
+    zh_or_en("原始数据暂不可用", "Raw data is unavailable")
 }
 fn ui_text_message_copy_success() -> &'static str {
     zh_or_en("消息内容已复制到剪贴板", "Message copied to clipboard")
@@ -16034,6 +17403,7 @@ mod tests {
     use crate::context::MessageKind;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn test_cfg() -> AppConfig {
         toml::from_str(
@@ -16143,6 +17513,157 @@ model = "test-model"
                 .iter()
                 .any(|item| item.kind == ChatInputActionKind::ClearInput)
         );
+    }
+
+    #[test]
+    fn stop_answer_button_only_shows_when_ai_is_responding() {
+        let mut state = new_state();
+        let layout = compute_layout(Rect::new(0, 0, 160, 42));
+        let no_live = chat_input_action_buttons(&state, layout, mode_button_area(layout));
+        assert!(
+            !no_live
+                .iter()
+                .any(|item| item.kind == ChatInputActionKind::StopAnswer)
+        );
+        state.ai_live = Some(AiLiveState {
+            started_at: Instant::now(),
+            tool_calls: 0,
+            last_tool_label: String::new(),
+            cancel_requested: false,
+        });
+        let with_live = chat_input_action_buttons(&state, layout, mode_button_area(layout));
+        let clear_idx = with_live
+            .iter()
+            .position(|item| item.kind == ChatInputActionKind::ClearInput)
+            .expect("clear button should exist");
+        let stop_idx = with_live
+            .iter()
+            .position(|item| item.kind == ChatInputActionKind::StopAnswer)
+            .expect("stop button should exist");
+        assert_eq!(stop_idx, clear_idx + 1);
+    }
+
+    #[test]
+    fn request_pending_ai_stop_is_idempotent() {
+        let mut state = new_state();
+        state.ai_live = Some(AiLiveState {
+            started_at: Instant::now(),
+            tool_calls: 1,
+            last_tool_label: "run_shell".to_string(),
+            cancel_requested: false,
+        });
+        let flag = AtomicBool::new(false);
+        request_pending_ai_stop(&mut state, &flag);
+        request_pending_ai_stop(&mut state, &flag);
+        assert!(flag.load(Ordering::SeqCst));
+        let live = state.ai_live.as_ref().expect("live should exist");
+        assert!(live.cancel_requested);
+        assert_eq!(state.status, ui_text_status_ai_cancelling());
+    }
+
+    #[test]
+    fn zh_stop_answer_button_prefix_cells_map_to_stop_action() {
+        let previous_language = i18n::current_language();
+        i18n::set_language(i18n::Language::ZhCn);
+
+        let mut state = new_state();
+        state.ai_live = Some(AiLiveState {
+            started_at: Instant::now(),
+            tool_calls: 0,
+            last_tool_label: String::new(),
+            cancel_requested: false,
+        });
+        let layout = compute_layout(Rect::new(0, 0, 160, 42));
+        let buttons = chat_input_action_buttons(&state, layout, mode_button_area(layout));
+        let hit_rect = chat_input_action_button_hit_rect(&buttons, ChatInputActionKind::StopAnswer)
+            .expect("stop hit rect should exist");
+
+        for x in hit_rect.x.saturating_add(2)..hit_rect.x.saturating_add(6) {
+            let kind = chat_input_action_button_at(&buttons, x, hit_rect.y)
+                .expect("stop action should resolve");
+            assert_eq!(kind, ChatInputActionKind::StopAnswer);
+        }
+
+        i18n::set_language(previous_language);
+    }
+
+    #[test]
+    fn zh_stop_answer_button_click_requests_cancel() {
+        let previous_language = i18n::current_language();
+        i18n::set_language(i18n::Language::ZhCn);
+
+        let mut state = new_state();
+        state.ai_live = Some(AiLiveState {
+            started_at: Instant::now(),
+            tool_calls: 0,
+            last_tool_label: String::new(),
+            cancel_requested: false,
+        });
+        let flag = AtomicBool::new(false);
+        let layout = compute_layout(Rect::new(0, 0, 160, 42));
+        let buttons = chat_input_action_buttons(&state, layout, mode_button_area(layout));
+        let hit_rect = chat_input_action_button_hit_rect(&buttons, ChatInputActionKind::StopAnswer)
+            .expect("stop hit rect should exist");
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit_rect.x.saturating_add(3),
+            row: hit_rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(try_handle_pending_ai_stop_button_click(
+            &mut state,
+            layout,
+            mouse,
+            &flag,
+        ));
+        assert!(flag.load(Ordering::SeqCst));
+        assert!(state.ai_live.as_ref().is_some_and(|live| live.cancel_requested));
+        assert_eq!(state.status, ui_text_status_ai_cancelling());
+
+        i18n::set_language(previous_language);
+    }
+
+    #[test]
+    fn zh_chat_input_buttons_keep_distinct_hitboxes_across_row() {
+        let previous_language = i18n::current_language();
+        i18n::set_language(i18n::Language::ZhCn);
+
+        let state = new_state();
+        let layout = compute_layout(Rect::new(0, 0, 160, 42));
+        let buttons = chat_input_action_buttons(&state, layout, mode_button_area(layout));
+        let mode_rect = chat_input_action_button_hit_rect(&buttons, ChatInputActionKind::ModeToggle)
+            .expect("mode hit rect should exist");
+        let tracking_rect = chat_input_action_button_hit_rect(&buttons, ChatInputActionKind::TrackingToggle)
+            .expect("tracking hit rect should exist");
+        let clear_rect = chat_input_action_button_hit_rect(&buttons, ChatInputActionKind::ClearInput)
+            .expect("clear hit rect should exist");
+
+        let mode_kind = chat_input_action_button_at(
+            &buttons,
+            mode_rect.x.saturating_add(mode_rect.width.saturating_sub(2)),
+            mode_rect.y,
+        )
+        .expect("mode hit should resolve");
+        assert_eq!(mode_kind, ChatInputActionKind::ModeToggle);
+
+        let tracking_kind = chat_input_action_button_at(
+            &buttons,
+            tracking_rect.x.saturating_add(tracking_rect.width.saturating_sub(2)),
+            tracking_rect.y,
+        )
+        .expect("tracking hit should resolve");
+        assert_eq!(tracking_kind, ChatInputActionKind::TrackingToggle);
+
+        let clear_kind = chat_input_action_button_at(
+            &buttons,
+            clear_rect.x.saturating_add(clear_rect.width.saturating_sub(2)),
+            clear_rect.y,
+        )
+        .expect("clear hit should resolve");
+        assert_eq!(clear_kind, ChatInputActionKind::ClearInput);
+
+        i18n::set_language(previous_language);
     }
 
     #[test]
@@ -16300,8 +17821,13 @@ model = "test-model"
         let mut state = new_state();
         state.ai_connectivity_checking = true;
         state.status = ui_text_status_ai_connectivity().to_string();
-        let (tx, rx) = mpsc::channel::<Result<(), AppError>>();
-        tx.send(Ok(())).expect("send check result");
+        let (tx, rx) = mpsc::channel::<AiConnectivityCheckOutcome>();
+        tx.send(AiConnectivityCheckOutcome {
+            response: Ok("OK".to_string()),
+            started_at_epoch_ms: 100,
+            finished_at_epoch_ms: 180,
+        })
+        .expect("send check result");
         let mut handle = Some(AiConnectivityCheckHandle { rx });
 
         poll_ai_connectivity_check(&mut handle, &mut state);
@@ -16315,6 +17841,13 @@ model = "test-model"
                 .back()
                 .is_some_and(|item| item.text.contains(ui_text_status_ai_connectivity_ok()))
         );
+        let snapshot = state
+            .ai_connectivity_debug_snapshot
+            .as_ref()
+            .expect("connectivity snapshot");
+        assert_eq!(snapshot.success, Some(true));
+        assert_eq!(snapshot.duration_ms, 80);
+        assert_eq!(snapshot.response_body, "OK");
     }
 
     #[test]
@@ -16322,8 +17855,12 @@ model = "test-model"
         let mut state = new_state();
         state.ai_connectivity_checking = true;
         state.status = ui_text_status_ai_connectivity().to_string();
-        let (tx, rx) = mpsc::channel::<Result<(), AppError>>();
-        tx.send(Err(AppError::Ai("network down".to_string())))
+        let (tx, rx) = mpsc::channel::<AiConnectivityCheckOutcome>();
+        tx.send(AiConnectivityCheckOutcome {
+            response: Err(AppError::Ai("network down".to_string())),
+            started_at_epoch_ms: 50,
+            finished_at_epoch_ms: 90,
+        })
             .expect("send check result");
         let mut handle = Some(AiConnectivityCheckHandle { rx });
 
@@ -16338,6 +17875,54 @@ model = "test-model"
                 .back()
                 .is_some_and(|item| item.text.contains(ui_text_status_ai_connectivity_failed()))
         );
+        let snapshot = state
+            .ai_connectivity_debug_snapshot
+            .as_ref()
+            .expect("connectivity snapshot");
+        assert_eq!(snapshot.success, Some(false));
+        assert_eq!(snapshot.duration_ms, 40);
+        assert!(snapshot.error.contains("network down"));
+    }
+
+    #[test]
+    fn raw_data_modal_opens_for_message_when_ai_debug_enabled() {
+        let mut state = new_state();
+        state.ai_debug_enabled = true;
+        state.push(UiRole::User, "hello **world**");
+        open_raw_data_modal(&mut state, 0);
+        let modal = state
+            .pending_raw_data_modal
+            .as_ref()
+            .expect("raw data modal should open");
+        assert!(modal.title.contains(ui_text_message_raw_data_modal_title()));
+        assert!(modal.content.contains("\"type\": \"chat_message\""));
+        assert!(modal.content.contains("\"raw_text\": \"hello **world**\""));
+    }
+
+    #[test]
+    fn system_connectivity_raw_payload_includes_request_and_response() {
+        let mut state = new_state();
+        state.ai_connectivity_debug_snapshot = Some(AiConnectivityDebugSnapshot {
+            transport: "openai".to_string(),
+            request_url: "https://example.invalid/v1/chat/completions".to_string(),
+            request_body: "{\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}".to_string(),
+            response_body: "{\"choices\":[{\"message\":{\"content\":\"OK\"}}]}".to_string(),
+            started_at_epoch_ms: 10,
+            finished_at_epoch_ms: 30,
+            duration_ms: 20,
+            success: Some(true),
+            error: String::new(),
+        });
+        let payload = system_message_debug_payload(&state, ui_text_status_ai_connectivity_ok());
+        assert_eq!(
+            payload.get("type").and_then(|v| v.as_str()),
+            Some("system_ai_connectivity")
+        );
+        assert_eq!(
+            payload.get("request_url").and_then(|v| v.as_str()),
+            Some("https://example.invalid/v1/chat/completions")
+        );
+        assert_eq!(payload.get("duration_ms").and_then(|v| v.as_u64()), Some(20));
     }
 
     #[test]
@@ -16867,17 +18452,15 @@ model = "test-model"
         state.clamp_scroll(layout.conversation_body.height.max(1));
         state.hovered_message_idx = Some(0);
 
-        let button = conversation_copy_button_data(&state, layout).expect("button should exist");
-        let delete_button =
-            conversation_delete_button_data(&state, layout).expect("delete button should exist");
-        assert_eq!(button.message_index, 0);
-        assert_eq!(delete_button.message_index, 0);
-        assert!(button.rect.x < delete_button.rect.x);
+        let buttons =
+            conversation_hover_buttons_data(&state, layout).expect("buttons should exist");
+        assert_eq!(buttons.message_index, 0);
+        assert!(buttons.copy_rect.x < buttons.delete_rect.x);
         assert_eq!(
-            delete_button
-                .rect
+            buttons
+                .delete_rect
                 .x
-                .saturating_add(delete_button.rect.width),
+                .saturating_add(buttons.delete_rect.width),
             layout
                 .conversation_body
                 .x
@@ -16895,13 +18478,11 @@ model = "test-model"
         state.clamp_scroll(layout.conversation_body.height.max(1));
         state.hovered_message_idx = Some(0);
 
-        let copy = conversation_copy_button_data(&state, layout).expect("copy button should exist");
-        let delete =
-            conversation_delete_button_data(&state, layout).expect("delete button should exist");
-        assert_eq!(copy.message_index, 0);
-        assert_eq!(delete.message_index, 0);
-        assert_eq!(delete.rect.y, copy.rect.y);
-        assert!(delete.rect.x > copy.rect.x);
+        let buttons =
+            conversation_hover_buttons_data(&state, layout).expect("buttons should exist");
+        assert_eq!(buttons.message_index, 0);
+        assert_eq!(buttons.delete_rect.y, buttons.copy_rect.y);
+        assert!(buttons.delete_rect.x > buttons.copy_rect.x);
     }
 
     #[test]
@@ -16940,15 +18521,315 @@ model = "test-model"
         state.clamp_scroll(layout.conversation_body.height.max(1));
         state.hovered_message_idx = Some(0);
 
-        let copy = conversation_copy_button_data(&state, layout).expect("copy button should exist");
-        let result = conversation_tool_result_button_data(&state, layout)
-            .expect("result button should exist");
-        let delete =
-            conversation_delete_button_data(&state, layout).expect("delete button should exist");
-        assert_eq!(copy.rect.y, result.rect.y);
-        assert_eq!(result.rect.y, delete.rect.y);
-        assert!(copy.rect.x < result.rect.x);
-        assert!(result.rect.x < delete.rect.x);
+        let buttons =
+            conversation_hover_buttons_data(&state, layout).expect("buttons should exist");
+        let result_rect = buttons.result_rect.expect("result button should exist");
+        assert_eq!(buttons.copy_rect.y, result_rect.y);
+        assert_eq!(result_rect.y, buttons.delete_rect.y);
+        assert!(buttons.copy_rect.x < result_rect.x);
+        assert!(result_rect.x < buttons.delete_rect.x);
+    }
+
+    #[test]
+    fn raw_data_button_is_rendered_after_delete_when_debug_enabled() {
+        let mut state = new_state();
+        state.ai_debug_enabled = true;
+        state.push(UiRole::Assistant, "hello");
+        let layout = compute_layout(Rect::new(0, 0, 120, 40));
+        state.set_conversation_wrap_width(layout.conversation_body.width.max(1));
+        state.ensure_conversation_cache();
+        state.clamp_scroll(layout.conversation_body.height.max(1));
+        state.hovered_message_idx = Some(0);
+
+        let buttons =
+            conversation_hover_buttons_data(&state, layout).expect("buttons should exist");
+        let raw_rect = buttons.raw_data_rect.expect("raw button should exist");
+        assert_eq!(buttons.delete_rect.y, raw_rect.y);
+        assert_eq!(
+            buttons.delete_rect.x.saturating_add(buttons.delete_rect.width),
+            raw_rect.x
+        );
+    }
+
+    #[test]
+    fn hover_message_index_uses_previous_message_on_spacer_line() {
+        let mut state = new_state();
+        state.push(UiRole::Assistant, "first");
+        state.push(UiRole::Assistant, "second");
+        let layout = compute_layout(Rect::new(0, 0, 120, 40));
+        state.set_conversation_wrap_width(layout.conversation_body.width.max(1));
+        state.ensure_conversation_cache();
+        state.clamp_scroll(layout.conversation_body.height.max(1));
+        let spacer_idx = state
+            .conversation_lines
+            .iter()
+            .position(|item| matches!(item.kind, ConversationLineKind::Spacer))
+            .expect("spacer should exist");
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: layout.conversation_body.x,
+            row: layout.conversation_body.y.saturating_add(spacer_idx as u16),
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(hovered_message_index_from_mouse(&state, layout, mouse), Some(0));
+    }
+
+    #[test]
+    fn hover_actions_map_to_exact_button_centers() {
+        let mut state = new_state();
+        state.ai_debug_enabled = true;
+        state.push(UiRole::Assistant, "hello");
+        let layout = compute_layout(Rect::new(0, 0, 120, 40));
+        state.set_conversation_wrap_width(layout.conversation_body.width.max(1));
+        state.ensure_conversation_cache();
+        state.clamp_scroll(layout.conversation_body.height.max(1));
+        state.hovered_message_idx = Some(0);
+        let buttons =
+            conversation_hover_buttons_data(&state, layout).expect("hover buttons should exist");
+        let raw_rect = buttons.raw_data_rect.expect("raw data button should exist");
+        let copy_center_x = buttons.copy_rect.x.saturating_add(buttons.copy_rect.width / 2);
+        let delete_center_x = buttons
+            .delete_rect
+            .x
+            .saturating_add(buttons.delete_rect.width / 2);
+        let raw_center_x = raw_rect.x.saturating_add(raw_rect.width / 2);
+        let copy_action = conversation_hover_action_at(&state, layout, copy_center_x, buttons.copy_rect.y)
+            .expect("copy center should map to copy button");
+        assert_eq!(copy_action.kind, ConversationHoverActionKind::Copy);
+        let delete_action = conversation_hover_action_at(&state, layout, delete_center_x, buttons.delete_rect.y)
+            .expect("delete center should map to delete button");
+        assert_eq!(delete_action.kind, ConversationHoverActionKind::Delete);
+        let raw_action = conversation_hover_action_at(&state, layout, raw_center_x, raw_rect.y)
+            .expect("raw center should map to raw button");
+        assert_eq!(raw_action.kind, ConversationHoverActionKind::RawData);
+    }
+
+    #[test]
+    fn hover_buttons_use_tight_adjacent_layout_with_tool_result() {
+        let mut state = new_state();
+        state.ai_debug_enabled = true;
+        state.messages.push_back(UiMessage {
+            role: UiRole::Tool,
+            text: format!(
+                "{} [bash:run_shell_command]: ok=true exit=Some(0) timeout=false blocked=false duration=12ms",
+                ui_text_tool_finished()
+            ),
+            tool_meta: Some(ToolExecutionMeta {
+                tool_call_id: "call_1".to_string(),
+                function_name: "run_shell_command".to_string(),
+                command: "pwd".to_string(),
+                arguments: "{\"command\":\"pwd\"}".to_string(),
+                result_payload: "{\"ok\":true,\"stdout\":\"/tmp\"}".to_string(),
+                executed_at_epoch_ms: 1,
+                account: "tester".to_string(),
+                environment: "dev".to_string(),
+                os_name: "macOS".to_string(),
+                cwd: "/tmp".to_string(),
+                mode: "read".to_string(),
+                label: "chat_tool".to_string(),
+                exit_code: Some(0),
+                duration_ms: 12,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            }),
+        });
+        state.message_persisted.push_back(false);
+        let layout = compute_layout(Rect::new(0, 0, 140, 40));
+        state.set_conversation_wrap_width(layout.conversation_body.width.max(1));
+        state.ensure_conversation_cache();
+        state.clamp_scroll(layout.conversation_body.height.max(1));
+        state.hovered_message_idx = Some(0);
+        let buttons =
+            conversation_hover_buttons_data(&state, layout).expect("hover buttons should exist");
+
+        let result_rect = buttons.result_rect.expect("result should exist");
+        let raw_rect = buttons.raw_data_rect.expect("raw button should exist");
+        assert_eq!(
+            buttons.copy_rect.x.saturating_add(buttons.copy_rect.width),
+            result_rect.x
+        );
+        assert_eq!(
+            result_rect.x.saturating_add(result_rect.width),
+            buttons.delete_rect.x
+        );
+        assert_eq!(
+            buttons.delete_rect.x.saturating_add(buttons.delete_rect.width),
+            raw_rect.x
+        );
+        let standard_result_x = result_rect.x.saturating_add(result_rect.width / 2);
+        let result_action = conversation_hover_action_at(&state, layout, standard_result_x, buttons.copy_rect.y)
+            .expect("standard result center should map to result");
+        assert_eq!(result_action.kind, ConversationHoverActionKind::ToolResult);
+        let delete_x = buttons.delete_rect.x.saturating_add(buttons.delete_rect.width / 2);
+        let delete_action = conversation_hover_action_at(&state, layout, delete_x, buttons.copy_rect.y)
+            .expect("delete center should map to delete");
+        assert_eq!(delete_action.kind, ConversationHoverActionKind::Delete);
+        let raw_x = raw_rect.x.saturating_add(raw_rect.width / 2);
+        let raw_action = conversation_hover_action_at(&state, layout, raw_x, buttons.copy_rect.y)
+            .expect("raw center should map to raw");
+        assert_eq!(raw_action.kind, ConversationHoverActionKind::RawData);
+    }
+
+    #[test]
+    fn hover_button_hitboxes_do_not_cross_opened_modal_targets() {
+        let mut state = new_state();
+        state.ai_debug_enabled = true;
+        state.messages.push_back(UiMessage {
+            role: UiRole::Tool,
+            text: format!(
+                "{} [builtin:WebSearch]: ok=true exit=None timeout=false blocked=false duration=12ms",
+                ui_text_tool_finished()
+            ),
+            tool_meta: Some(ToolExecutionMeta {
+                tool_call_id: "call_exact".to_string(),
+                function_name: "WebSearch".to_string(),
+                command: "query=test".to_string(),
+                arguments: "{\"query\":\"test\"}".to_string(),
+                result_payload: "{\"ok\":true}".to_string(),
+                executed_at_epoch_ms: 1,
+                account: "tester".to_string(),
+                environment: "dev".to_string(),
+                os_name: "macOS".to_string(),
+                cwd: "/tmp".to_string(),
+                mode: "read".to_string(),
+                label: "chat_tool".to_string(),
+                exit_code: None,
+                duration_ms: 12,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            }),
+        });
+        state.message_persisted.push_back(false);
+        let layout = compute_layout(Rect::new(0, 0, 140, 40));
+        state.set_conversation_wrap_width(layout.conversation_body.width.max(1));
+        state.ensure_conversation_cache();
+        state.clamp_scroll(layout.conversation_body.height.max(1));
+        state.hovered_message_idx = Some(0);
+        let buttons =
+            conversation_hover_buttons_data(&state, layout).expect("hover buttons should exist");
+        let (copy_hit_rect, result_hit_rect, delete_hit_rect, raw_hit_rect) =
+            conversation_hover_action_hit_rects(&buttons);
+        let result_hit_rect = result_hit_rect.expect("result button should exist");
+        let raw_hit_rect = raw_hit_rect.expect("raw button should exist");
+
+        for x in copy_hit_rect.x..copy_hit_rect.x.saturating_add(copy_hit_rect.width) {
+            let action = conversation_hover_action_at(&state, layout, x, copy_hit_rect.y)
+                .expect("copy hitbox should resolve");
+            assert_eq!(action.kind, ConversationHoverActionKind::Copy);
+        }
+        for x in result_hit_rect.x..result_hit_rect.x.saturating_add(result_hit_rect.width) {
+            let action = conversation_hover_action_at(&state, layout, x, result_hit_rect.y)
+                .expect("result hitbox should resolve");
+            assert_eq!(action.kind, ConversationHoverActionKind::ToolResult);
+        }
+        for x in delete_hit_rect.x..delete_hit_rect.x.saturating_add(delete_hit_rect.width) {
+            let action = conversation_hover_action_at(&state, layout, x, delete_hit_rect.y)
+                .expect("delete hitbox should resolve");
+            assert_eq!(action.kind, ConversationHoverActionKind::Delete);
+        }
+        for x in raw_hit_rect.x..raw_hit_rect.x.saturating_add(raw_hit_rect.width) {
+            let action = conversation_hover_action_at(&state, layout, x, raw_hit_rect.y)
+                .expect("raw hitbox should resolve");
+            assert_eq!(action.kind, ConversationHoverActionKind::RawData);
+        }
+    }
+
+    #[test]
+    fn zh_raw_data_button_prefix_cells_map_to_raw_action() {
+        let previous_language = i18n::current_language();
+        i18n::set_language(i18n::Language::ZhCn);
+
+        let mut state = new_state();
+        state.ai_debug_enabled = true;
+        state.messages.push_back(UiMessage {
+            role: UiRole::Tool,
+            text: format!("{} [builtin:WebSearch]: ok=true", ui_text_tool_finished()),
+            tool_meta: Some(ToolExecutionMeta {
+                tool_call_id: "call_zh".to_string(),
+                function_name: "WebSearch".to_string(),
+                command: "query=test".to_string(),
+                arguments: "{\"query\":\"test\"}".to_string(),
+                result_payload: "{\"ok\":true}".to_string(),
+                executed_at_epoch_ms: 1,
+                account: "tester".to_string(),
+                environment: "dev".to_string(),
+                os_name: "macOS".to_string(),
+                cwd: "/tmp".to_string(),
+                mode: "read".to_string(),
+                label: "chat_tool".to_string(),
+                exit_code: None,
+                duration_ms: 12,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            }),
+        });
+        state.message_persisted.push_back(false);
+        let layout = compute_layout(Rect::new(0, 0, 140, 40));
+        state.set_conversation_wrap_width(layout.conversation_body.width.max(1));
+        state.ensure_conversation_cache();
+        state.clamp_scroll(layout.conversation_body.height.max(1));
+        state.hovered_message_idx = Some(0);
+
+        let buttons =
+            conversation_hover_buttons_data(&state, layout).expect("hover buttons should exist");
+        let (_, _, _, raw_rect) = conversation_hover_action_hit_rects(&buttons);
+        let raw_rect = raw_rect.expect("raw hit rect should exist");
+
+        for x in raw_rect.x.saturating_add(1)..raw_rect.x.saturating_add(5) {
+            let action = conversation_hover_action_at(&state, layout, x, raw_rect.y)
+                .expect("raw prefix should resolve");
+            assert_eq!(action.kind, ConversationHoverActionKind::RawData);
+        }
+
+        i18n::set_language(previous_language);
+    }
+
+    #[test]
+    fn message_action_modals_are_mutually_exclusive() {
+        let mut state = new_state();
+        state.ai_debug_enabled = true;
+        state.messages.push_back(UiMessage {
+            role: UiRole::Tool,
+            text: format!("{} [builtin:WebSearch]: ok=true", ui_text_tool_finished()),
+            tool_meta: Some(ToolExecutionMeta {
+                tool_call_id: "call_modal".to_string(),
+                function_name: "WebSearch".to_string(),
+                command: "query=test".to_string(),
+                arguments: "{\"query\":\"test\"}".to_string(),
+                result_payload: "{\"ok\":true}".to_string(),
+                executed_at_epoch_ms: 1,
+                account: "tester".to_string(),
+                environment: "dev".to_string(),
+                os_name: "macOS".to_string(),
+                cwd: "/tmp".to_string(),
+                mode: "read".to_string(),
+                label: "chat_tool".to_string(),
+                exit_code: None,
+                duration_ms: 12,
+                timed_out: false,
+                interrupted: false,
+                blocked: false,
+            }),
+        });
+        state.message_persisted.push_back(false);
+
+        open_raw_data_modal(&mut state, 0);
+        assert!(state.pending_raw_data_modal.is_some());
+        assert!(state.pending_tool_result_modal.is_none());
+        assert!(state.pending_delete_confirm.is_none());
+
+        open_delete_message_confirm(&mut state, 0);
+        assert!(state.pending_delete_confirm.is_some());
+        assert!(state.pending_tool_result_modal.is_none());
+        assert!(state.pending_raw_data_modal.is_none());
+
+        open_tool_result_modal(&mut state, 0);
+        assert!(state.pending_tool_result_modal.is_some());
+        assert!(state.pending_delete_confirm.is_none());
+        assert!(state.pending_raw_data_modal.is_none());
     }
 
     #[test]
@@ -17821,6 +19702,60 @@ model = "test-model"
         assert!(should_append_final_thinking("step-1 -> step-2", false));
         assert!(!should_append_final_thinking("step-1 -> step-2", true));
         assert!(!should_append_final_thinking("   ", false));
+    }
+
+    #[test]
+    fn pending_ai_cancel_result_returns_cancelled_error_when_flag_is_set() {
+        let flag = AtomicBool::new(false);
+        assert!(pending_ai_cancel_result(&flag).is_none());
+        flag.store(true, Ordering::SeqCst);
+        let result = pending_ai_cancel_result(&flag).expect("cancel result should exist");
+        assert!(result.is_err());
+        assert_eq!(
+            result.expect_err("cancel result should be err"),
+            i18n::chat_ai_cancel_requested()
+        );
+    }
+
+    #[test]
+    fn user_cancelled_ai_error_detection_matches_i18n_texts() {
+        assert!(is_user_cancelled_ai_error(i18n::chat_ai_cancel_requested()));
+        assert!(is_user_cancelled_ai_error(i18n::chat_ai_cancelled_by_shortcut()));
+        assert!(is_user_cancelled_ai_error(
+            format!("  {}  ", i18n::chat_ai_cancel_requested()).as_str()
+        ));
+        assert!(!is_user_cancelled_ai_error("network timeout"));
+    }
+
+    #[test]
+    fn session_card_short_labels_follow_current_language() {
+        i18n::set_language(i18n::Language::ZhCn);
+        assert_eq!(ui_text_session_card_messages_short(), "消息");
+        assert_eq!(ui_text_session_card_user_short(), "用户");
+        assert_eq!(ui_text_session_card_ai_short(), "AI");
+
+        i18n::set_language(i18n::Language::Fr);
+        assert_eq!(ui_text_session_card_messages_short(), "msg");
+        assert_eq!(ui_text_session_card_user_short(), "util.");
+        assert_eq!(ui_text_session_card_ai_short(), "IA");
+
+        i18n::set_language(i18n::Language::En);
+        assert_eq!(ui_text_session_card_messages_short(), "msg");
+        assert_eq!(ui_text_session_card_user_short(), "user");
+        assert_eq!(ui_text_session_card_ai_short(), "AI");
+    }
+
+    #[test]
+    fn session_export_html_i18n_covers_all_supported_languages() {
+        let html = build_session_export_html_document("{}");
+        assert!(html.contains("\"zh-TW\": {"));
+        assert!(html.contains("fr: {"));
+        assert!(html.contains("de: {"));
+        assert!(html.contains("ja: {"));
+        assert!(html.contains("message_stats: \"已显示 {shown} / 总计 {total}\""));
+        assert!(html.contains("message_stats: \"Showing {shown} / Total {total}\""));
+        assert!(html.contains("if (normalized === \"zh-TW\") return \"zh-TW\";"));
+        assert!(!html.contains("I18N.fr = I18N.en;"));
     }
 
     #[test]
