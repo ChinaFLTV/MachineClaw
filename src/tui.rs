@@ -9,7 +9,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -82,6 +82,9 @@ const STARTUP_SPLASH_FRAME_INTERVAL_MS: u64 = 56;
 const STARTUP_SPLASH_EVENT_POLL_MS: u64 = 8;
 const STREAM_RENDER_BATCH_CHARS: usize = 24;
 const THINKING_STREAM_PERSIST_INTERVAL_MS: u64 = 500;
+const TOOL_WORKER_EVENT_POLL_MS: u64 = 60;
+const TOOL_WORKER_IDLE_REDRAW_MS: u64 = 120;
+const TOOL_WORKER_MAX_CONCURRENT: usize = 2;
 const MODAL_CLOSE_SCROLL_SUPPRESS_MS: u128 = 220;
 const SESSION_AUTO_TITLE_MAX_UNITS: usize = 15;
 const SESSION_AUTO_TITLE_SOURCE_MAX_CHARS: usize = 1200;
@@ -91,6 +94,7 @@ const HOVER_RAW_DEBUG_FIELD_MAX_CHARS: usize = 4_000;
 const AI_CONNECTIVITY_SYSTEM_PROMPT: &str =
     "You are a connectivity checker. Reply with one word: OK.";
 const AI_CONNECTIVITY_USER_PROMPT: &str = "Respond with OK only.";
+static TOOL_WORKER_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(all(unix, not(target_os = "macos")))]
 const OSC52_MAX_COPY_BYTES: usize = 100_000;
 
@@ -5057,7 +5061,7 @@ fn wait_chat_worker_result(
                         live.last_tool_label = format_live_tool_label(&request.name);
                     }
                     let payload =
-                        execute_tool_call_tui(terminal, services, group_id, &request, state);
+                        execute_tool_call_tui(terminal, services, group_id, &request, state, cancel_requested);
                     let _ = reply_tx.send(payload);
                 }
                 Ok(PendingAiEvent::Finished(result)) => {
@@ -5770,12 +5774,170 @@ fn execute_builtin_command(
     Ok(false)
 }
 
+fn try_acquire_tool_worker_slot() -> bool {
+    loop {
+        let current = TOOL_WORKER_IN_FLIGHT.load(Ordering::SeqCst);
+        if current >= TOOL_WORKER_MAX_CONCURRENT {
+            return false;
+        }
+        if TOOL_WORKER_IN_FLIGHT
+            .compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+fn release_tool_worker_slot() {
+    let previous = TOOL_WORKER_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    if previous == 0 {
+        TOOL_WORKER_IN_FLIGHT.store(0, Ordering::SeqCst);
+    }
+}
+
+fn spawn_tool_worker<T, F>(task: F) -> Option<mpsc::Receiver<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if !try_acquire_tool_worker_slot() {
+        return None;
+    }
+    let (tx, rx) = mpsc::channel::<T>();
+    thread::spawn(move || {
+        struct ToolWorkerSlotGuard;
+        impl Drop for ToolWorkerSlotGuard {
+            fn drop(&mut self) {
+                release_tool_worker_slot();
+            }
+        }
+        let _slot_guard = ToolWorkerSlotGuard;
+        let result = task();
+        let _ = tx.send(result);
+    });
+    Some(rx)
+}
+
+fn wait_tool_worker_with_ui<T>(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+    cancel_requested: &AtomicBool,
+    worker_rx: mpsc::Receiver<T>,
+) -> Result<T, AppError> {
+    let mut last_idle_draw = Instant::now();
+    loop {
+        match worker_rx.try_recv() {
+            Ok(result) => return Ok(result),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(AppError::Command(
+                    "tool execution worker channel disconnected".to_string(),
+                ));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        poll_session_auto_title_workers(services, state);
+
+        let mut redraw_after_input = false;
+        if event::poll(Duration::from_millis(TOOL_WORKER_EVENT_POLL_MS))
+            .map_err(|err| AppError::Command(format!("failed to poll tool event: {err}")))?
+        {
+            match event::read()
+                .map_err(|err| AppError::Command(format!("failed to read tool event: {err}")))?
+            {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    redraw_after_input = true;
+                    let _ = handle_pending_ai_key_event(
+                        key,
+                        terminal,
+                        services,
+                        state,
+                        cancel_requested,
+                    )?;
+                }
+                Event::Mouse(mouse) => {
+                    redraw_after_input = true;
+                    handle_pending_ai_mouse_event(
+                        mouse,
+                        terminal,
+                        services,
+                        state,
+                        cancel_requested,
+                    )?;
+                }
+                Event::Resize(width, height) => {
+                    handle_tui_resize_redraw(terminal, services, state, Some((width, height)))?;
+                    last_idle_draw = Instant::now();
+                }
+                _ => {}
+            }
+        }
+
+        if redraw_after_input
+            || last_idle_draw.elapsed() >= Duration::from_millis(TOOL_WORKER_IDLE_REDRAW_MS)
+        {
+            draw_once(terminal, services, state)?;
+            last_idle_draw = Instant::now();
+        }
+    }
+}
+
+fn run_shell_tool_call_nonblocking_tui(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+    cancel_requested: &AtomicBool,
+    spec: &CommandSpec,
+    timeout: Duration,
+) -> Result<CommandResult, AppError> {
+    let Some(worker_rx) = spawn_tool_worker({
+        let shell = services.shell.clone();
+        let spec = spec.clone();
+        move || shell.run_with_timeout_skip_write_confirm(&spec, timeout)
+    }) else {
+        return services
+            .shell
+            .run_with_timeout_skip_write_confirm(spec, timeout);
+    };
+    wait_tool_worker_with_ui(terminal, services, state, cancel_requested, worker_rx)?
+}
+
+fn run_builtin_tool_call_nonblocking_tui(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+    cancel_requested: &AtomicBool,
+    tool_name: &str,
+    raw_arguments: &str,
+) -> Result<String, String> {
+    let Some(worker_rx) = spawn_tool_worker({
+        let cfg = services.cfg.ai.tools.builtin.clone();
+        let tool_name = tool_name.to_string();
+        let raw_arguments = raw_arguments.to_string();
+        move || builtin_tools::execute_tool(&tool_name, &raw_arguments, &cfg)
+    }) else {
+        return builtin_tools::execute_tool(tool_name, raw_arguments, &services.cfg.ai.tools.builtin);
+    };
+    match wait_tool_worker_with_ui(terminal, services, state, cancel_requested, worker_rx) {
+        Ok(result) => result,
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 fn execute_tool_call_tui(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     services: &mut ActionServices<'_>,
     group_id: &str,
     tool_call: &ToolCallRequest,
     state: &mut ChatUiState,
+    cancel_requested: &AtomicBool,
 ) -> String {
     if tool_call.name != "run_shell_command" {
         if builtin_tools::is_builtin_tool(&tool_call.name) {
@@ -5799,10 +5961,13 @@ fn execute_tool_call_tui(
                 );
             }
             let started = Instant::now();
-            let raw_payload = match builtin_tools::execute_tool(
+            let raw_payload = match run_builtin_tool_call_nonblocking_tui(
+                terminal,
+                services,
+                state,
+                cancel_requested,
                 &tool_call.name,
                 &tool_call.arguments,
-                &services.cfg.ai.tools.builtin,
             ) {
                 Ok(text) => {
                     if !silent_tool {
@@ -6195,9 +6360,14 @@ fn execute_tool_call_tui(
         report_tool_session_persist_failure(state, &err, ui_text_tool_running());
     }
     let timeout = Duration::from_secs(services.cfg.ai.chat.cmd_run_timout);
-    let run_result = services
-        .shell
-        .run_with_timeout_skip_write_confirm(&spec, timeout);
+    let run_result = run_shell_tool_call_nonblocking_tui(
+        terminal,
+        services,
+        state,
+        cancel_requested,
+        &spec,
+        timeout,
+    );
     match run_result {
         Ok(result) => {
             let payload = format_tool_result_payload(&result);
@@ -12759,7 +12929,7 @@ fn estimate_tokens_from_text_delta(text: &str) -> u64 {
     if meaningful == 0 {
         0
     } else {
-        meaningful.div_ceil(3).clamp(1, 512)
+        meaningful.div_ceil(3)
     }
 }
 
@@ -19695,6 +19865,7 @@ model = "test-model"
         assert_eq!(estimate_tokens_from_text_delta(""), 0);
         assert_eq!(estimate_tokens_from_text_delta("abc"), 1);
         assert!(estimate_tokens_from_text_delta("abcdefghijkl") >= 4);
+        assert_eq!(estimate_tokens_from_text_delta(&"x".repeat(3_000)), 1_000);
         assert_eq!(format_u64_compact(0), "0");
         assert_eq!(format_u64_compact(999), "999");
         assert_eq!(format_u64_compact(12_345_678), "12,345,678");

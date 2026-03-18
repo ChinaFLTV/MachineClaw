@@ -104,6 +104,7 @@ pub struct CommandResult {
     pub block_reason: String,
 }
 
+#[derive(Clone)]
 pub struct ShellExecutor {
     timeout: Duration,
     kill_after: Duration,
