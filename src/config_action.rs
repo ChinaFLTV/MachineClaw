@@ -319,6 +319,7 @@ fn is_required_key(key: &str) -> bool {
 
 pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
     match key {
+        "app.theme" => Some("\"default\""),
         "app.env-mode" => Some("\"prod\""),
         "ai.type" => Some("\"openai\""),
         "ai.debug" => Some("false"),
@@ -384,6 +385,7 @@ pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
 pub(crate) fn known_config_keys() -> &'static [&'static str] {
     &[
         "app.language",
+        "app.theme",
         "app.env-mode",
         "ai.type",
         "ai.base-url",
@@ -618,6 +620,7 @@ mod tests {
         assert!(is_known_config_key("ai.tools.mcp.enabled"));
         assert!(is_known_config_key("ai.tools.mcp.dir"));
         assert!(is_known_config_key("ai.chat.mode"));
+        assert!(is_known_config_key("app.theme"));
     }
 
     #[test]

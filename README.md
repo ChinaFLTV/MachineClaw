@@ -168,7 +168,7 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 
 主要配置段：
 
-- `[app]`：语言、环境模式（`prod/test/dev`）
+- `[app]`：语言、主题、环境模式（`prod/test/dev`）
 - `[ai]`：协议类型（`type`）、API 地址、Token、模型、重试
 - `[ai.chat]`：chat 行为、交互模式（`chat/task`）、工具显示、压缩、超时、轮次上限
 - `[ai.tools.builtin]`：Claude 风格内置工具（View/LS/GlobTool/GrepTool/WebSearch/Think/Task/Architect）及写入型工具开关
@@ -214,6 +214,17 @@ mode = "chat" # chat | task，默认 chat
 - TUI 输入区底部可临时切换 Chat/Task；该切换仅对当前运行有效，不会写回配置文件。
 - TUI 输入区底部提供“消息跟踪”与“下滑至底部”按钮：关闭跟踪后不会因新消息自动拉到底部，可随时一键回到底部；开启跟踪后会持续跟随最新消息。
 - TUI 会话区会显示 Task List（状态、进度）并在会话元数据弹窗展示任务目录/统计/最近任务。
+
+### App 主题配置建议
+
+```toml
+[app]
+theme = "default" # optional
+```
+
+- `app.theme` 可选值：`light`、`dark`（等同 `default`）、`pink`、`green`、`blud`、`red`、`purple`、`cyan`、`yellow`、`default`。
+- 若配置为非法值或无效值，运行时会自动回退到 `default`。
+- 兼容旧名称映射：`graphite -> default`、`ocean -> cyan`、`paper -> light`、`blue -> blud`。
 
 ### MCP 配置建议
 

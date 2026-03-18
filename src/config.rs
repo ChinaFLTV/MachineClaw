@@ -53,6 +53,7 @@ const DEFAULT_LOG_MAX_SAVE_TIME: &str = "7d";
 const DEFAULT_CONTEXT_RECENT_MESSAGES: usize = 40;
 const MAX_CONTEXT_MESSAGES: usize = 80;
 const DEFAULT_APP_ENV_MODE: &str = "prod";
+const DEFAULT_APP_THEME: &str = "default";
 const DEFAULT_MCP_AVAILABILITY_CHECK_MODE: &str = "rsync";
 const DEFAULT_MCP_DIR: &str = "~/.machineclaw/mcp";
 const DEFAULT_BUILTIN_TOOLS_ENABLED: bool = true;
@@ -81,6 +82,8 @@ pub struct AppConfig {
 pub struct AppSection {
     #[serde(default)]
     pub language: Option<String>,
+    #[serde(default)]
+    pub theme: Option<String>,
     #[serde(rename = "env-mode", default = "default_app_env_mode")]
     pub env_mode: String,
 }
@@ -89,6 +92,7 @@ impl Default for AppSection {
     fn default() -> Self {
         Self {
             language: None,
+            theme: None,
             env_mode: default_app_env_mode(),
         }
     }
@@ -595,6 +599,7 @@ pub fn config_template_example() -> &'static str {
 ```toml
 [app]
 # language = "zh-CN" # optional: zh-CN, zh-TW, en, fr, de, ja
+# theme = "default" # optional: default, dark(=default), light, pink, green, blud, red, purple, cyan, yellow
 env-mode = "prod" # optional: prod, test, dev
 
 [ai]
@@ -1231,6 +1236,10 @@ fn default_app_env_mode() -> String {
     DEFAULT_APP_ENV_MODE.to_string()
 }
 
+fn default_app_theme() -> &'static str {
+    DEFAULT_APP_THEME
+}
+
 pub(crate) fn normalize_ai_provider_type(raw: &str) -> &str {
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "openai" | "deepseek" | "qwen" | "ollama" | "openrouter" | "zhipu" | "moonshot"
@@ -1258,6 +1267,28 @@ pub(crate) fn normalize_chat_interaction_mode(raw: &str) -> &str {
     }
 }
 
+pub(crate) fn normalize_app_theme(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "dark" => "default",
+        "light" => "light",
+        "pink" => "pink",
+        "green" => "green",
+        "blud" | "blue" => "blud",
+        "red" => "red",
+        "purple" => "purple",
+        "cyan" => "cyan",
+        "yellow" => "yellow",
+        _ => "__invalid__",
+    }
+}
+
+pub(crate) fn resolve_app_theme(raw: Option<&str>) -> &'static str {
+    match normalize_app_theme(raw.unwrap_or_default()) {
+        "__invalid__" => default_app_theme(),
+        normalized => normalized,
+    }
+}
+
 pub(crate) fn normalize_mcp_availability_check_mode(raw: &str) -> &str {
     match raw.trim().to_ascii_lowercase().as_str() {
         "async" => "async",
@@ -1280,9 +1311,10 @@ fn has_file_extension(file_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        McpServerConfig, normalize_ai_provider_type, normalize_chat_interaction_mode,
+        McpServerConfig, normalize_ai_provider_type, normalize_app_theme,
+        normalize_chat_interaction_mode,
         normalize_chat_model_price_check_mode, normalize_mcp_availability_check_mode,
-        parse_config_text, resolve_config_path,
+        parse_config_text, resolve_app_theme, resolve_config_path,
     };
 
     #[test]
@@ -1325,6 +1357,32 @@ mod tests {
             normalize_mcp_availability_check_mode("invalid"),
             "__invalid__"
         );
+    }
+
+    #[test]
+    fn normalize_app_theme_accepts_supported_values_and_aliases() {
+        assert_eq!(normalize_app_theme(""), "default");
+        assert_eq!(normalize_app_theme("default"), "default");
+        assert_eq!(normalize_app_theme("dark"), "default");
+        assert_eq!(normalize_app_theme("light"), "light");
+        assert_eq!(normalize_app_theme("pink"), "pink");
+        assert_eq!(normalize_app_theme("green"), "green");
+        assert_eq!(normalize_app_theme("blud"), "blud");
+        assert_eq!(normalize_app_theme("blue"), "blud");
+        assert_eq!(normalize_app_theme("red"), "red");
+        assert_eq!(normalize_app_theme("purple"), "purple");
+        assert_eq!(normalize_app_theme("cyan"), "cyan");
+        assert_eq!(normalize_app_theme("yellow"), "yellow");
+        assert_eq!(normalize_app_theme("invalid"), "__invalid__");
+    }
+
+    #[test]
+    fn resolve_app_theme_falls_back_to_default_for_invalid_input() {
+        assert_eq!(resolve_app_theme(None), "default");
+        assert_eq!(resolve_app_theme(Some("")), "default");
+        assert_eq!(resolve_app_theme(Some("dark")), "default");
+        assert_eq!(resolve_app_theme(Some("invalid")), "default");
+        assert_eq!(resolve_app_theme(Some("pink")), "pink");
     }
 
     #[test]

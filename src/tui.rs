@@ -57,7 +57,7 @@ use crate::{
     },
     builtin_tools,
     cli::InspectTarget,
-    config::{AppConfig, McpServerConfig, expand_tilde},
+    config::{AppConfig, McpServerConfig, expand_tilde, resolve_app_theme},
     context::{MessageKind, SessionMessage, SessionOverview, SessionState, ToolExecutionMeta},
     error::{AppError, ExitCode},
     i18n, mask,
@@ -494,7 +494,7 @@ struct UiPreferences {
 impl Default for UiPreferences {
     fn default() -> Self {
         Self {
-            theme: "graphite".to_string(),
+            theme: "default".to_string(),
         }
     }
 }
@@ -1454,7 +1454,9 @@ pub fn run_chat_tui(services: &mut ActionServices<'_>) -> Result<ActionOutcome, 
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(AppError::Command(i18n::chat_requires_interactive_terminal()));
     }
-    let (theme_idx, prefs_path) = load_theme_preferences()?;
+    let (_saved_theme_idx, prefs_path) = load_theme_preferences()?;
+    let configured_theme = resolve_app_theme(services.cfg.app.theme.as_deref());
+    let theme_idx = palette_index_by_name(configured_theme).unwrap_or(0);
     let base_system_prompt = render::load_prompt_template(services.assets_dir, "chat_system.md")?;
     let recent_messages = services
         .session
@@ -10835,6 +10837,17 @@ fn config_seed_fields() -> Vec<ConfigFieldSeed> {
             options: &["prod", "test", "dev"],
         },
         ConfigFieldSeed {
+            key: "app.theme",
+            label: "theme",
+            category: "app",
+            kind: ConfigFieldKind::OptionalString,
+            required: false,
+            options: &[
+                "default", "dark", "light", "pink", "green", "blud", "red", "purple", "cyan",
+                "yellow",
+            ],
+        },
+        ConfigFieldSeed {
             key: "ai.type",
             label: "type",
             category: "ai",
@@ -11320,6 +11333,7 @@ fn config_seed_fields() -> Vec<ConfigFieldSeed> {
 fn config_value_from_cfg(cfg: &AppConfig, key: &str) -> Option<String> {
     Some(match key {
         "app.language" => cfg.app.language.clone().unwrap_or_default(),
+        "app.theme" => resolve_app_theme(cfg.app.theme.as_deref()).to_string(),
         "app.env-mode" => cfg.app.env_mode.clone(),
         "ai.type" => cfg.ai.r#type.clone(),
         "ai.base-url" => cfg.ai.base_url.clone(),
@@ -11714,6 +11728,16 @@ fn save_config_ui(
     }
     if let Some(field) = state.config_ui.fields.iter().find(|item| item.key == "ai.type") {
         state.ai_connectivity_transport = field.value.trim().to_string();
+    }
+    if let Some(field) = state
+        .config_ui
+        .fields
+        .iter()
+        .find(|item| item.key == "app.theme")
+    {
+        let theme_key = resolve_app_theme(Some(field.value.trim()));
+        state.theme_idx = palette_index_by_name(theme_key).unwrap_or(0);
+        let _ = save_theme_preferences(state.theme_idx, &state.prefs_path);
     }
     state.conversation_dirty = true;
     state.status = ui_text_config_saved().to_string();
@@ -15571,10 +15595,10 @@ fn ui_preferences_file_path() -> Result<PathBuf, AppError> {
     Ok(cwd.join(".machineclaw").join(UI_PREFS_FILE_NAME))
 }
 
-fn palettes() -> [ThemePalette; 3] {
+fn palettes() -> [ThemePalette; 9] {
     [
         ThemePalette {
-            name: "graphite",
+            name: "default",
             app_bg: Color::Rgb(14, 16, 19),
             sidebar_bg: Color::Rgb(24, 27, 33),
             panel_bg: Color::Rgb(19, 22, 29),
@@ -15586,7 +15610,79 @@ fn palettes() -> [ThemePalette; 3] {
             status: Color::Rgb(162, 172, 187),
         },
         ThemePalette {
-            name: "ocean",
+            name: "light",
+            app_bg: Color::Rgb(246, 248, 252),
+            sidebar_bg: Color::Rgb(238, 242, 248),
+            panel_bg: Color::Rgb(252, 253, 255),
+            border: Color::Rgb(182, 192, 209),
+            border_focus: Color::Rgb(56, 108, 214),
+            text: Color::Rgb(31, 42, 56),
+            muted: Color::Rgb(95, 112, 133),
+            accent: Color::Rgb(54, 102, 196),
+            status: Color::Rgb(91, 108, 129),
+        },
+        ThemePalette {
+            name: "pink",
+            app_bg: Color::Rgb(17, 14, 19),
+            sidebar_bg: Color::Rgb(29, 22, 33),
+            panel_bg: Color::Rgb(22, 17, 28),
+            border: Color::Rgb(66, 49, 73),
+            border_focus: Color::Rgb(255, 142, 208),
+            text: Color::Rgb(242, 235, 245),
+            muted: Color::Rgb(171, 152, 178),
+            accent: Color::Rgb(246, 124, 196),
+            status: Color::Rgb(189, 163, 197),
+        },
+        ThemePalette {
+            name: "green",
+            app_bg: Color::Rgb(13, 19, 15),
+            sidebar_bg: Color::Rgb(21, 31, 24),
+            panel_bg: Color::Rgb(17, 25, 19),
+            border: Color::Rgb(49, 71, 55),
+            border_focus: Color::Rgb(122, 224, 151),
+            text: Color::Rgb(232, 244, 236),
+            muted: Color::Rgb(152, 176, 160),
+            accent: Color::Rgb(110, 210, 140),
+            status: Color::Rgb(163, 188, 171),
+        },
+        ThemePalette {
+            name: "blud",
+            app_bg: Color::Rgb(13, 16, 22),
+            sidebar_bg: Color::Rgb(20, 25, 35),
+            panel_bg: Color::Rgb(16, 20, 29),
+            border: Color::Rgb(48, 58, 79),
+            border_focus: Color::Rgb(120, 184, 255),
+            text: Color::Rgb(232, 239, 248),
+            muted: Color::Rgb(149, 165, 187),
+            accent: Color::Rgb(102, 171, 252),
+            status: Color::Rgb(162, 176, 198),
+        },
+        ThemePalette {
+            name: "red",
+            app_bg: Color::Rgb(22, 14, 15),
+            sidebar_bg: Color::Rgb(35, 21, 24),
+            panel_bg: Color::Rgb(29, 17, 19),
+            border: Color::Rgb(82, 49, 56),
+            border_focus: Color::Rgb(255, 136, 136),
+            text: Color::Rgb(246, 233, 233),
+            muted: Color::Rgb(186, 154, 154),
+            accent: Color::Rgb(242, 116, 116),
+            status: Color::Rgb(198, 164, 164),
+        },
+        ThemePalette {
+            name: "purple",
+            app_bg: Color::Rgb(18, 14, 23),
+            sidebar_bg: Color::Rgb(28, 22, 36),
+            panel_bg: Color::Rgb(22, 17, 31),
+            border: Color::Rgb(66, 52, 85),
+            border_focus: Color::Rgb(197, 154, 255),
+            text: Color::Rgb(238, 234, 247),
+            muted: Color::Rgb(170, 158, 190),
+            accent: Color::Rgb(179, 134, 246),
+            status: Color::Rgb(186, 174, 207),
+        },
+        ThemePalette {
+            name: "cyan",
             app_bg: Color::Rgb(9, 20, 30),
             sidebar_bg: Color::Rgb(14, 30, 45),
             panel_bg: Color::Rgb(10, 24, 37),
@@ -15598,16 +15694,16 @@ fn palettes() -> [ThemePalette; 3] {
             status: Color::Rgb(140, 182, 210),
         },
         ThemePalette {
-            name: "paper",
-            app_bg: Color::Rgb(246, 248, 252),
-            sidebar_bg: Color::Rgb(238, 242, 248),
-            panel_bg: Color::Rgb(252, 253, 255),
-            border: Color::Rgb(182, 192, 209),
-            border_focus: Color::Rgb(56, 108, 214),
-            text: Color::Rgb(31, 42, 56),
-            muted: Color::Rgb(95, 112, 133),
-            accent: Color::Rgb(54, 102, 196),
-            status: Color::Rgb(91, 108, 129),
+            name: "yellow",
+            app_bg: Color::Rgb(25, 22, 14),
+            sidebar_bg: Color::Rgb(37, 33, 22),
+            panel_bg: Color::Rgb(30, 26, 17),
+            border: Color::Rgb(84, 74, 47),
+            border_focus: Color::Rgb(252, 218, 117),
+            text: Color::Rgb(247, 241, 224),
+            muted: Color::Rgb(190, 178, 145),
+            accent: Color::Rgb(240, 206, 92),
+            status: Color::Rgb(199, 187, 155),
         },
     ]
 }
@@ -15618,7 +15714,14 @@ fn palette_by_index(index: usize) -> ThemePalette {
 }
 
 fn palette_index_by_name(name: &str) -> Option<usize> {
-    palettes().iter().position(|item| item.name == name)
+    match name.trim().to_ascii_lowercase().as_str() {
+        "graphite" => palettes().iter().position(|item| item.name == "default"),
+        "ocean" => palettes().iter().position(|item| item.name == "cyan"),
+        "paper" => palettes().iter().position(|item| item.name == "light"),
+        "dark" => palettes().iter().position(|item| item.name == "default"),
+        "blue" => palettes().iter().position(|item| item.name == "blud"),
+        other => palettes().iter().position(|item| item.name == other),
+    }
 }
 
 fn recent_messages_to_ui_messages(items: &[SessionMessage]) -> Vec<UiMessage> {
@@ -19783,6 +19886,22 @@ model = "test-model"
         assert_eq!(state.config_ui.fields[field_idx].value, "zh-CN");
         assert!(state.config_ui.fields[field_idx].dirty);
         assert!(!state.config_ui.editing);
+    }
+
+    #[test]
+    fn config_theme_field_cycles_with_selector_options() {
+        let mut state = new_state();
+        let field_idx = state
+            .config_ui
+            .fields
+            .iter()
+            .position(|item| item.key == "app.theme")
+            .expect("theme field should exist");
+        assert_eq!(state.config_ui.fields[field_idx].value, "default");
+
+        config_cycle_field_option(&mut state, field_idx, 1);
+        assert_eq!(state.config_ui.fields[field_idx].value, "dark");
+        assert!(state.config_ui.fields[field_idx].dirty);
     }
 
     #[test]
