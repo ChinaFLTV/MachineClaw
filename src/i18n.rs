@@ -2286,6 +2286,14 @@ fn chat_tool_guard_reason_text(reason_code: &str) -> &'static str {
             Language::Ja => "ツール呼び出しのタイムアウト回数が多すぎます",
             Language::En => "too many tool timeouts",
         },
+        "task_decomposition_required" => match current_language() {
+            Language::ZhCn => "任务尚未完成拆分，请先创建并更新子任务步骤",
+            Language::ZhTw => "任務尚未完成拆分，請先建立並更新子任務步驟",
+            Language::Fr => "la décomposition des tâches est requise avant l'exécution",
+            Language::De => "vor der Ausführung ist eine Aufgabenaufteilung erforderlich",
+            Language::Ja => "実行前にタスク分解（サブタスク作成）が必要です",
+            Language::En => "task decomposition is required before execution",
+        },
         "max_tool_rounds_reached" => match current_language() {
             Language::ZhCn => "工具调用轮次达到上限",
             Language::ZhTw => "工具呼叫輪次達到上限",

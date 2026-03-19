@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
@@ -979,6 +979,91 @@ fn trim_tool_argument_preview(arguments: &str) -> String {
     mask_sensitive(&trim_text(arguments.trim(), 400))
 }
 
+const TASK_MODE_MIN_PLAN_STEPS: usize = 2;
+const TASK_MODE_RECENT_MESSAGE_SCAN_LIMIT: usize = 260;
+
+fn task_mode_allows_direct_tool_call(tool_name: &str) -> bool {
+    tool_name.eq_ignore_ascii_case("task") || tool_name.eq_ignore_ascii_case("architect")
+}
+
+fn extract_tool_trace_field<'a>(content: &'a str, key: &str, terminator: &str) -> Option<&'a str> {
+    let marker = format!("{key}=");
+    let start = content.find(marker.as_str())?;
+    let value_start = start + marker.len();
+    if terminator.is_empty() {
+        return Some(content[value_start..].trim());
+    }
+    let tail = &content[value_start..];
+    let end = tail.find(terminator)?;
+    Some(tail[..end].trim())
+}
+
+fn task_description_from_tool_trace(content: &str) -> Option<String> {
+    let function_name = extract_tool_trace_field(content, "function", " args=")?;
+    if !function_name.eq_ignore_ascii_case("task") {
+        return None;
+    }
+    let args_raw = extract_tool_trace_field(content, "args", " result=")?;
+    let args = task_store::extract_task_call_args(args_raw)?;
+    let description = args.description.trim();
+    if description.is_empty() {
+        None
+    } else {
+        Some(description.to_string())
+    }
+}
+
+fn count_task_plan_steps_in_group(messages: &[SessionMessage], group_id: &str) -> usize {
+    if group_id.trim().is_empty() {
+        return 0;
+    }
+    let mut unique_descriptions = HashSet::<String>::new();
+    for message in messages {
+        if message.role != "tool" {
+            continue;
+        }
+        if message.group_id.as_deref() != Some(group_id) {
+            continue;
+        }
+        if let Some(description) = task_description_from_tool_trace(message.content.as_str()) {
+            unique_descriptions.insert(description);
+        }
+    }
+    unique_descriptions.len()
+}
+
+fn task_mode_plan_guard_payload(
+    services: &ActionServices<'_>,
+    group_id: &str,
+    tool_call: &ToolCallRequest,
+) -> Option<String> {
+    if resolve_chat_mode(services.cfg.ai.chat.mode.as_str()) != "task" {
+        return None;
+    }
+    if task_mode_allows_direct_tool_call(tool_call.name.as_str()) {
+        return None;
+    }
+    let recent = services
+        .session
+        .recent_messages_for_display(TASK_MODE_RECENT_MESSAGE_SCAN_LIMIT);
+    let planned_steps = count_task_plan_steps_in_group(recent.as_slice(), group_id);
+    if planned_steps >= TASK_MODE_MIN_PLAN_STEPS {
+        return None;
+    }
+    Some(
+        json!({
+            "ok": false,
+            "blocked": true,
+            "reason": "task_decomposition_required",
+            "error": format!("task decomposition is required before executing `{}`", tool_call.name),
+            "required_plan_steps": TASK_MODE_MIN_PLAN_STEPS,
+            "current_plan_steps": planned_steps,
+            "next_action": "Call Task at least twice with different sub-step descriptions, then execute tools and update each task status with stable task_id."
+        })
+        .to_string(),
+    )
+}
+
 fn execute_tool_call(
     services: &mut ActionServices<'_>,
     group_id: &str,
@@ -987,6 +1072,22 @@ fn execute_tool_call(
     cache: &mut HashMap<String, ToolCallCacheItem>,
     cache_ttl_ms: u128,
 ) -> String {
+    if let Some(payload) = task_mode_plan_guard_payload(services, group_id, tool_call) {
+        stats.tool_calls += 1;
+        stats.blocked_count += 1;
+        services.session.add_tool_message(
+            format!(
+                "tool_call_id={} function={} args={} result={}",
+                tool_call.id,
+                tool_call.name,
+                trim_tool_argument_preview(&tool_call.arguments),
+                trim_text(&payload, 2400)
+            ),
+            Some(group_id.to_string()),
+        );
+        let _ = services.session.persist();
+        return payload;
+    }
     if tool_call.name != "run_shell_command" {
         if builtin_tools::is_builtin_tool(&tool_call.name) {
             let silent_tool = builtin_tools::is_silent_tool(&tool_call.name);
@@ -3355,7 +3456,7 @@ pub(crate) fn build_chat_system_prompt(
     ));
     let chat_mode = resolve_chat_mode(chat_mode_raw);
     if chat_mode == "task" {
-        prompt.push_str("\n[Interaction Mode]\n- mode=task\n- This request must be executed in task orchestration mode.\n- Before major execution, produce a concise step plan with acceptance criteria.\n- For complex or ambiguous tasks, call `Architect` first to compare options and risks.\n- Use `Task` to track sub-task objective/status/evidence, then run tools to collect verifiable results.\n- `Task` supports `task_id`; reuse the same `task_id` when updating the same task and set `status` to running/done/failed/blocked.\n- Final response must include: overall status, completed steps, failed/blocked steps, and next actionable step.\n");
+        prompt.push_str("\n[Interaction Mode]\n- mode=task\n- This request must be executed in task orchestration mode.\n- Planning is mandatory before execution: first create a task list using `Task` with at least 2 concrete sub-steps.\n- Never use one broad task to represent the whole user request; split by execution boundary (analysis/change/verification/delivery).\n- Before any non-planning tool call, register plan steps via `Task` (status=running) and define acceptance_criteria.\n- For complex or ambiguous tasks, call `Architect` first to compare options and risks, then decompose with `Task`.\n- During execution, whenever a sub-step changes phase, update the same `task_id` with `Task` status running/done/failed/blocked plus evidence.\n- Final response must include: overall status, completed steps, failed/blocked steps, and next actionable step.\n");
     } else {
         prompt.push_str("\n[Interaction Mode]\n- mode=chat\n- Keep direct conversational workflow. Use tools only when they improve correctness or are explicitly required.\n");
     }
@@ -4463,6 +4564,7 @@ fn read_cmd(label: &str, command: &str) -> CommandSpec {
 mod tests {
     use super::{
         ChatAutosaveSnapshot, display_width, flush_chat_autosave_snapshot,
+        count_task_plan_steps_in_group,
         format_chat_mcps_markdown, format_chat_session_list_markdown, format_chat_skills_markdown,
         format_fixed_table_with_options, is_cancel_shortcut_csi_sequence,
         is_cancel_shortcut_escape_sequence, is_chat_cancel_shortcut_bytes,
@@ -4471,6 +4573,7 @@ mod tests {
         strip_ansi_escape_sequences,
     };
     use crate::ai::ToolUsePolicy;
+    use crate::context::{MessageKind, SessionMessage};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -4520,6 +4623,54 @@ mod tests {
     fn task_mode_requires_tool_policy_for_any_message() {
         let policy = super::chat_tool_use_policy_for_message("just answer directly", "task");
         assert!(matches!(policy, ToolUsePolicy::RequireAtLeastOne));
+    }
+
+    #[test]
+    fn count_task_plan_steps_in_group_uses_unique_descriptions() {
+        let group_id = "group-a";
+        let messages = vec![
+            SessionMessage {
+                role: "tool".to_string(),
+                content: "tool_call_id=1 function=Task args={\"description\":\"读取代码\"} result={\"ok\":true}".to_string(),
+                kind: MessageKind::Tool,
+                group_id: Some(group_id.to_string()),
+                created_at_epoch_ms: 1,
+                tool_meta: None,
+            },
+            SessionMessage {
+                role: "tool".to_string(),
+                content: "tool_call_id=2 function=Task args={\"description\":\"读取代码\"} result={\"ok\":true}".to_string(),
+                kind: MessageKind::Tool,
+                group_id: Some(group_id.to_string()),
+                created_at_epoch_ms: 2,
+                tool_meta: None,
+            },
+            SessionMessage {
+                role: "tool".to_string(),
+                content: "tool_call_id=3 function=Task args={\"description\":\"修改实现\"} result={\"ok\":true}".to_string(),
+                kind: MessageKind::Tool,
+                group_id: Some(group_id.to_string()),
+                created_at_epoch_ms: 3,
+                tool_meta: None,
+            },
+            SessionMessage {
+                role: "tool".to_string(),
+                content: "tool_call_id=4 function=LS args={\"path\":\".\"} result={\"ok\":true}".to_string(),
+                kind: MessageKind::Tool,
+                group_id: Some(group_id.to_string()),
+                created_at_epoch_ms: 4,
+                tool_meta: None,
+            },
+            SessionMessage {
+                role: "tool".to_string(),
+                content: "tool_call_id=5 function=Task args={\"description\":\"别的组\"} result={\"ok\":true}".to_string(),
+                kind: MessageKind::Tool,
+                group_id: Some("group-b".to_string()),
+                created_at_epoch_ms: 5,
+                tool_meta: None,
+            },
+        ];
+        assert_eq!(count_task_plan_steps_in_group(messages.as_slice(), group_id), 2);
     }
 
     #[test]

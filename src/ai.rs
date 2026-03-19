@@ -81,6 +81,7 @@ pub enum ChatStopReason {
     RepeatedSameToolCall,
     RepeatedToolTimeout,
     TooManyToolTimeouts,
+    TaskDecompositionRequired,
     MaxToolRoundsReached,
     RateLimited,
 }
@@ -92,6 +93,7 @@ impl ChatStopReason {
             ChatStopReason::RepeatedSameToolCall => "repeated_same_tool_call",
             ChatStopReason::RepeatedToolTimeout => "repeated_tool_timeout",
             ChatStopReason::TooManyToolTimeouts => "too_many_tool_timeouts",
+            ChatStopReason::TaskDecompositionRequired => "task_decomposition_required",
             ChatStopReason::MaxToolRoundsReached => "max_tool_rounds_reached",
             ChatStopReason::RateLimited => "rate_limited",
         }
@@ -700,6 +702,7 @@ impl AiClient {
         const MAX_REPEAT_SAME_TOOL: usize = 3;
         const MAX_TIMEOUT_TOOL_CALLS_TOTAL: usize = 2;
         const MAX_TIMEOUT_SAME_TOOL_CALL: usize = 1;
+        const MAX_REPEAT_TASK_DECOMPOSITION_GUARD: usize = 1;
         const MAX_FORCE_CONTINUE_HINT_ROUNDS: usize = 2;
 
         let mut messages = build_base_messages(history, system_prompt, user_prompt);
@@ -714,6 +717,7 @@ impl AiClient {
         let mut total_tool_calls: usize = 0;
         let mut tool_result_cache: HashMap<String, String> = HashMap::new();
         let mut same_tool_counter: HashMap<String, usize> = HashMap::new();
+        let mut task_decomposition_guard_counter: HashMap<String, usize> = HashMap::new();
         let mut timeout_tool_counter: HashMap<String, usize> = HashMap::new();
         let mut timeout_total: usize = 0;
         let mut thinking_chunks: Vec<String> = Vec::new();
@@ -892,62 +896,78 @@ impl AiClient {
                         finalize_reason = Some(ChatStopReason::ToolCallLimitExceeded);
                         build_guard_tool_result("tool_call_limit_exceeded")
                     } else {
-                        let count_entry = same_tool_counter.entry(signature.clone()).or_insert(0);
-                        *count_entry += 1;
-                        if *count_entry > MAX_REPEAT_SAME_TOOL {
-                            finalize_reason = Some(ChatStopReason::RepeatedSameToolCall);
-                            build_guard_tool_result("repeated_same_tool_call")
-                        } else {
-                            let cacheable_request = is_cacheable_tool_request(&request);
-                            if cacheable_request {
-                                if let Some(cached) = tool_result_cache.get(&signature) {
-                                    if tool_result_timed_out(cached) {
-                                        timeout_total += 1;
-                                        let timeout_count = timeout_tool_counter
-                                            .entry(signature.clone())
-                                            .or_insert(0);
-                                        *timeout_count += 1;
-                                        if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
-                                            finalize_reason =
-                                                Some(ChatStopReason::RepeatedToolTimeout);
-                                        } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
-                                            finalize_reason =
-                                                Some(ChatStopReason::TooManyToolTimeouts);
-                                        }
+                        let cacheable_request = is_cacheable_tool_request(&request);
+                        let result = if cacheable_request {
+                            if let Some(cached) = tool_result_cache.get(&signature) {
+                                if tool_result_timed_out(cached) {
+                                    timeout_total += 1;
+                                    let timeout_count = timeout_tool_counter
+                                        .entry(signature.clone())
+                                        .or_insert(0);
+                                    *timeout_count += 1;
+                                    if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
+                                        finalize_reason =
+                                            Some(ChatStopReason::RepeatedToolTimeout);
+                                    } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
+                                        finalize_reason =
+                                            Some(ChatStopReason::TooManyToolTimeouts);
                                     }
-                                    cached.clone()
-                                } else {
-                                    let result = execute_tool(&request);
-                                    if tool_result_timed_out(&result) {
-                                        timeout_total += 1;
-                                        let timeout_count = timeout_tool_counter
-                                            .entry(signature.clone())
-                                            .or_insert(0);
-                                        *timeout_count += 1;
-                                        if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
-                                            finalize_reason =
-                                                Some(ChatStopReason::RepeatedToolTimeout);
-                                        } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
-                                            finalize_reason =
-                                                Some(ChatStopReason::TooManyToolTimeouts);
-                                        }
-                                    }
-                                    tool_result_cache.insert(signature, result.clone());
-                                    result
                                 }
+                                cached.clone()
                             } else {
                                 let result = execute_tool(&request);
                                 if tool_result_timed_out(&result) {
                                     timeout_total += 1;
-                                    let timeout_count =
-                                        timeout_tool_counter.entry(signature.clone()).or_insert(0);
+                                    let timeout_count = timeout_tool_counter
+                                        .entry(signature.clone())
+                                        .or_insert(0);
                                     *timeout_count += 1;
                                     if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
-                                        finalize_reason = Some(ChatStopReason::RepeatedToolTimeout);
+                                        finalize_reason =
+                                            Some(ChatStopReason::RepeatedToolTimeout);
                                     } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
-                                        finalize_reason = Some(ChatStopReason::TooManyToolTimeouts);
+                                        finalize_reason =
+                                            Some(ChatStopReason::TooManyToolTimeouts);
                                     }
                                 }
+                                tool_result_cache.insert(signature.clone(), result.clone());
+                                result
+                            }
+                        } else {
+                            let result = execute_tool(&request);
+                            if tool_result_timed_out(&result) {
+                                timeout_total += 1;
+                                let timeout_count =
+                                    timeout_tool_counter.entry(signature.clone()).or_insert(0);
+                                *timeout_count += 1;
+                                if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
+                                    finalize_reason = Some(ChatStopReason::RepeatedToolTimeout);
+                                } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
+                                    finalize_reason = Some(ChatStopReason::TooManyToolTimeouts);
+                                }
+                            }
+                            result
+                        };
+                        if tool_result_requires_task_decomposition(result.as_str()) {
+                            same_tool_counter.remove(&signature);
+                            let guard_count = task_decomposition_guard_counter
+                                .entry(signature.clone())
+                                .or_insert(0);
+                            *guard_count += 1;
+                            if *guard_count > MAX_REPEAT_TASK_DECOMPOSITION_GUARD {
+                                finalize_reason = Some(ChatStopReason::TaskDecompositionRequired);
+                                build_guard_tool_result("task_decomposition_required")
+                            } else {
+                                result
+                            }
+                        } else {
+                            task_decomposition_guard_counter.remove(&signature);
+                            let count_entry = same_tool_counter.entry(signature.clone()).or_insert(0);
+                            *count_entry += 1;
+                            if *count_entry > MAX_REPEAT_SAME_TOOL {
+                                finalize_reason = Some(ChatStopReason::RepeatedSameToolCall);
+                                build_guard_tool_result("repeated_same_tool_call")
+                            } else {
                                 result
                             }
                         }
@@ -2284,18 +2304,25 @@ fn format_reqwest_error(err: &reqwest::Error) -> String {
 }
 
 static DSML_FUNCTION_CALLS_BLOCK_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?is)<[|｜]dsml[|｜]function_calls>.*?</[|｜]dsml[|｜]function_calls>"#)
-        .expect("valid dsml function call block regex")
+    Regex::new(
+        r#"(?is)<\s*[|｜]\s*dsml\s*[|｜]\s*function_calls\s*>.*?<\s*/\s*[|｜]\s*dsml\s*[|｜]\s*function_calls\s*>"#,
+    )
+    .expect("valid dsml function call block regex")
 });
 static DSML_INVOKE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?is)<[|｜]dsml[|｜]invoke\s+name="([^"]+)"[^>]*>(.*?)</[|｜]dsml[|｜]invoke>"#)
-        .expect("valid dsml invoke regex")
+    Regex::new(
+        r#"(?is)<\s*[|｜]\s*dsml\s*[|｜]\s*invoke\b[^>]*\bname\s*=\s*["']([^"']+)["'][^>]*>(.*?)<\s*/\s*[|｜]\s*dsml\s*[|｜]\s*invoke\s*>"#,
+    )
+    .expect("valid dsml invoke regex")
 });
 static DSML_PARAMETER_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"(?is)<[|｜]dsml[|｜]parameter\s+name="([^"]+)"[^>]*>(.*?)</[|｜]dsml[|｜]parameter>"#,
+        r#"(?is)<\s*[|｜]\s*dsml\s*[|｜]\s*parameter\b[^>]*\bname\s*=\s*["']([^"']+)["'][^>]*>(.*?)<\s*/\s*[|｜]\s*dsml\s*[|｜]\s*parameter\s*>"#,
     )
     .expect("valid dsml parameter regex")
+});
+static ANSI_ESCAPE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("valid ansi escape regex")
 });
 static AI_REQUEST_TRACE_FILE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -3118,6 +3145,23 @@ fn tool_result_timed_out(payload: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn tool_result_requires_task_decomposition(payload: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    if value
+        .get("reason")
+        .and_then(|item| item.as_str())
+        .is_some_and(|item| item.eq_ignore_ascii_case("task_decomposition_required"))
+    {
+        return true;
+    }
+    value
+        .get("error")
+        .and_then(|item| item.as_str())
+        .is_some_and(|item| item.to_ascii_lowercase().contains("task decomposition is required"))
+}
+
 fn build_base_messages(
     history: &[ChatMessage],
     system_prompt: &str,
@@ -3600,17 +3644,31 @@ fn optional_content(content: String) -> Option<String> {
     Some(content)
 }
 
+fn strip_ansi_escape_sequences(raw: &str) -> String {
+    ANSI_ESCAPE_RE.replace_all(raw, "").to_string()
+}
+
+fn normalize_dsml_markup(raw: &str) -> String {
+    raw.replace(['“', '”'], "\"").replace(['‘', '’'], "'")
+}
+
 fn sanitize_assistant_content(raw: &str) -> String {
-    let cleaned = DSML_FUNCTION_CALLS_BLOCK_RE.replace_all(raw, "");
-    cleaned.replace("\r\n", "\n").replace('\r', "\n")
+    let no_ansi = strip_ansi_escape_sequences(raw);
+    let normalized = normalize_dsml_markup(no_ansi.as_str());
+    let cleaned = DSML_FUNCTION_CALLS_BLOCK_RE.replace_all(normalized.as_str(), "");
+    cleaned
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
 }
 
 fn parse_dsml_tool_calls(raw: &str, round: usize) -> Vec<ToolCallRequest> {
-    if !raw.to_ascii_lowercase().contains("dsml") {
+    let raw_no_ansi = strip_ansi_escape_sequences(raw);
+    let normalized = normalize_dsml_markup(raw_no_ansi.as_str());
+    if !normalized.to_ascii_lowercase().contains("dsml") {
         return Vec::new();
     }
     let mut output = Vec::new();
-    for (idx, invoke_caps) in DSML_INVOKE_RE.captures_iter(raw).enumerate() {
+    for (idx, invoke_caps) in DSML_INVOKE_RE.captures_iter(normalized.as_str()).enumerate() {
         let function_name_raw = invoke_caps
             .get(1)
             .map(|m| m.as_str().trim())
@@ -4693,13 +4751,14 @@ mod tests {
         finalize_tool_calls, fresh_model_price_catalog, is_cacheable_tool_request,
         is_rate_limited_error, merge_text_delta, merge_tool_call_delta, merge_visible_chunks,
         model_prefers_non_streaming_tool_rounds, normalize_stepfun_chat_request,
-        parse_claude_response_text, parse_gemini_response_text, parse_model_price_catalog_response,
-        parse_model_price_probe_response, parse_rate_limit_retry_delay,
-        price_probe_candidate_models, provider_protocol_from_config_type,
+        parse_claude_response_text, parse_dsml_tool_calls, parse_gemini_response_text,
+        parse_model_price_catalog_response, parse_model_price_probe_response,
+        parse_rate_limit_retry_delay, price_probe_candidate_models, provider_protocol_from_config_type,
         provider_requires_reasoning_content_omission, request_contains_reasoning_content,
         resolve_effective_model_prices, should_fallback_to_non_streaming,
         should_refresh_http_client_after_reqwest_error, should_retry_without_reasoning_content,
-        should_write_direct_stdout, strip_reasoning_content_from_request, with_cost,
+        should_write_direct_stdout, sanitize_assistant_content, strip_reasoning_content_from_request,
+        tool_result_requires_task_decomposition, with_cost,
     };
     use crate::{ai::ToolCallRequest, error::AppError, tls::ensure_rustls_crypto_provider};
 
@@ -4861,6 +4920,53 @@ mod tests {
     fn merges_visible_chunks_without_duplicates() {
         let chunks = vec!["alpha".to_string(), "beta".to_string(), "alpha".to_string()];
         assert_eq!(merge_visible_chunks(&chunks, Some("beta")), "alpha\n\nbeta");
+    }
+
+    #[test]
+    fn sanitize_assistant_content_removes_ansi_escape_sequences() {
+        let raw = "before \u{1b}[2m</parameter>\u{1b}[0m after";
+        let cleaned = sanitize_assistant_content(raw);
+        assert_eq!(cleaned, "before </parameter> after");
+    }
+
+    #[test]
+    fn parse_dsml_tool_calls_tolerates_ansi_wrapped_tags() {
+        let raw = "<|dsml|invoke name=\"LS\">\u{1b}[2m<|dsml|parameter name=\"path\">.\u{1b}[0m</|dsml|parameter></|dsml|invoke>";
+        let calls = parse_dsml_tool_calls(raw, 1);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "LS");
+        assert!(calls[0].arguments.contains("\"path\":\".\""));
+    }
+
+    #[test]
+    fn parse_dsml_tool_calls_tolerates_spaced_delimiters_and_smart_quotes() {
+        let raw = "< | DSML | function_calls>< | DSML | invoke name=“Task”>< | DSML | parameter name=“task_id” string=“true”>compression< / | DSML | parameter>< / | DSML | invoke>< / | DSML | function_calls>";
+        let calls = parse_dsml_tool_calls(raw, 1);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Task");
+        assert!(calls[0].arguments.contains("\"task_id\":\"compression\""));
+    }
+
+    #[test]
+    fn sanitize_assistant_content_removes_spaced_dsml_function_block() {
+        let raw = "prefix< | DSML | function_calls>< | DSML | invoke name=\"Task\">< | DSML | parameter name=\"task_id\">x< / | DSML | parameter>< / | DSML | invoke>< / | DSML | function_calls>suffix";
+        let cleaned = sanitize_assistant_content(raw);
+        assert_eq!(cleaned, "prefixsuffix");
+    }
+
+    #[test]
+    fn task_decomposition_guard_payload_is_detected() {
+        let payload = json!({
+            "ok": false,
+            "blocked": true,
+            "reason": "task_decomposition_required",
+            "error": "task decomposition is required before executing `LS`"
+        })
+        .to_string();
+        assert!(tool_result_requires_task_decomposition(payload.as_str()));
+        assert!(!tool_result_requires_task_decomposition(
+            r#"{"ok":false,"reason":"repeated_same_tool_call"}"#
+        ));
     }
 
     #[test]

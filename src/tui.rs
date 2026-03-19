@@ -89,6 +89,8 @@ const MODAL_CLOSE_SCROLL_SUPPRESS_MS: u128 = 220;
 const SESSION_AUTO_TITLE_MAX_UNITS: usize = 15;
 const SESSION_AUTO_TITLE_SOURCE_MAX_CHARS: usize = 1200;
 const TASK_BOARD_MAX_ITEMS: usize = 6;
+const TASK_MODE_MIN_PLAN_STEPS: usize = 2;
+const TASK_MODE_RECENT_MESSAGE_SCAN_LIMIT: usize = 260;
 const HOVER_RAW_DEBUG_MAX_CHARS: usize = 10_000;
 const HOVER_RAW_DEBUG_FIELD_MAX_CHARS: usize = 4_000;
 const AI_CONNECTIVITY_SYSTEM_PROMPT: &str =
@@ -1310,13 +1312,6 @@ impl ChatUiState {
                     message_index: None,
                 });
             }
-        }
-        if self.chat_mode == ChatInteractionMode::Task {
-            prepend_task_board_lines(
-                &mut lines,
-                collect_task_board_items_for_state(self, TASK_BOARD_MAX_ITEMS),
-                conversation_width,
-            );
         }
         if lines.is_empty() {
             lines.push(ConversationLine {
@@ -5933,6 +5928,89 @@ fn run_builtin_tool_call_nonblocking_tui(
     }
 }
 
+fn task_mode_allows_direct_tool_call_tui(tool_name: &str) -> bool {
+    tool_name.eq_ignore_ascii_case("task") || tool_name.eq_ignore_ascii_case("architect")
+}
+
+fn extract_tool_trace_field_tui<'a>(content: &'a str, key: &str, terminator: &str) -> Option<&'a str> {
+    let marker = format!("{key}=");
+    let start = content.find(marker.as_str())?;
+    let value_start = start + marker.len();
+    if terminator.is_empty() {
+        return Some(content[value_start..].trim());
+    }
+    let tail = &content[value_start..];
+    let end = tail.find(terminator)?;
+    Some(tail[..end].trim())
+}
+
+fn task_description_from_tool_trace_tui(content: &str) -> Option<String> {
+    let function_name = extract_tool_trace_field_tui(content, "function", " args=")?;
+    if !function_name.eq_ignore_ascii_case("task") {
+        return None;
+    }
+    let args_raw = extract_tool_trace_field_tui(content, "args", " result=")?;
+    let args = task_store::extract_task_call_args(args_raw)?;
+    let description = args.description.trim();
+    if description.is_empty() {
+        None
+    } else {
+        Some(description.to_string())
+    }
+}
+
+fn count_task_plan_steps_in_group_tui(messages: &[SessionMessage], group_id: &str) -> usize {
+    if group_id.trim().is_empty() {
+        return 0;
+    }
+    let mut unique_descriptions = HashSet::<String>::new();
+    for message in messages {
+        if message.role != "tool" {
+            continue;
+        }
+        if message.group_id.as_deref() != Some(group_id) {
+            continue;
+        }
+        if let Some(description) = task_description_from_tool_trace_tui(message.content.as_str()) {
+            unique_descriptions.insert(description);
+        }
+    }
+    unique_descriptions.len()
+}
+
+fn task_mode_plan_guard_payload_in_tui(
+    services: &ActionServices<'_>,
+    state: &ChatUiState,
+    group_id: &str,
+    tool_call: &ToolCallRequest,
+) -> Option<String> {
+    if state.chat_mode != ChatInteractionMode::Task {
+        return None;
+    }
+    if task_mode_allows_direct_tool_call_tui(tool_call.name.as_str()) {
+        return None;
+    }
+    let recent = services
+        .session
+        .recent_messages_for_display(TASK_MODE_RECENT_MESSAGE_SCAN_LIMIT);
+    let planned_steps = count_task_plan_steps_in_group_tui(recent.as_slice(), group_id);
+    if planned_steps >= TASK_MODE_MIN_PLAN_STEPS {
+        return None;
+    }
+    Some(
+        json!({
+            "ok": false,
+            "blocked": true,
+            "reason": "task_decomposition_required",
+            "error": format!("task decomposition is required before executing `{}`", tool_call.name),
+            "required_plan_steps": TASK_MODE_MIN_PLAN_STEPS,
+            "current_plan_steps": planned_steps,
+            "next_action": "Call Task at least twice with different sub-step descriptions, then execute tools and update each task status with stable task_id."
+        })
+        .to_string(),
+    )
+}
+
 fn execute_tool_call_tui(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     services: &mut ActionServices<'_>,
@@ -5941,6 +6019,44 @@ fn execute_tool_call_tui(
     state: &mut ChatUiState,
     cancel_requested: &AtomicBool,
 ) -> String {
+    if let Some(payload) = task_mode_plan_guard_payload_in_tui(services, state, group_id, tool_call) {
+        let guard_message = format!("{}: {}", ui_text_tool_error(), tool_call.name);
+        let should_push = state
+            .messages
+            .back()
+            .map_or(true, |item| item.role != UiRole::Tool || item.text != guard_message);
+        if should_push {
+            state.push(UiRole::Tool, guard_message);
+        }
+        let tool_meta = build_tool_execution_meta(
+            services,
+            ToolExecutionMetaInput {
+                tool_call_id: tool_call.id.as_str(),
+                function_name: tool_call.name.as_str(),
+                command: "",
+                arguments: tool_call.arguments.as_str(),
+                result_payload: payload.as_str(),
+                mode: "task_guard",
+                label: tool_call.name.as_str(),
+                exit_code: None,
+                duration_ms: 0,
+                timed_out: false,
+                interrupted: false,
+                blocked: true,
+            },
+        );
+        persist_tool_call_record(
+            services,
+            state,
+            group_id,
+            tool_call,
+            &tool_call.arguments,
+            payload.as_str(),
+            tool_meta.clone(),
+        );
+        attach_tool_meta_to_last_tool_message(state, &tool_meta);
+        return payload;
+    }
     if tool_call.name != "run_shell_command" {
         if builtin_tools::is_builtin_tool(&tool_call.name) {
             let silent_tool = builtin_tools::is_silent_tool(&tool_call.name);
@@ -8271,15 +8387,26 @@ fn draw_main_header(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let cols = if state.mode == UiMode::Chat {
+    let task_items = if state.mode == UiMode::Chat && state.chat_mode == ChatInteractionMode::Task {
+        collect_task_board_items_for_state(state, TASK_BOARD_MAX_ITEMS)
+    } else {
+        Vec::new()
+    };
+    let show_task_board = state.mode == UiMode::Chat && task_board_should_show_header(task_items.as_slice());
+    let cols = if state.mode != UiMode::Chat {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(61), Constraint::Percentage(39)])
+            .constraints([Constraint::Percentage(100)])
+            .split(inner)
+    } else if show_task_board {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(46), Constraint::Percentage(24), Constraint::Percentage(30)])
             .split(inner)
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(100)])
+            .constraints([Constraint::Percentage(61), Constraint::Percentage(39)])
             .split(inner)
     };
 
@@ -8360,8 +8487,63 @@ fn draw_main_header(
     if state.mode != UiMode::Chat {
         return;
     }
-    if cols.len() < 2 || cols[1].width < 18 {
+    let right_col_idx = if show_task_board { 2 } else { 1 };
+    if cols.len() <= right_col_idx || cols[right_col_idx].width < 18 {
         return;
+    }
+    if show_task_board && cols.len() > 1 && cols[1].width >= 16 {
+        let task_width = cols[1].width.saturating_sub(2) as usize;
+        let (running, done, failed, blocked) = task_board_counts(task_items.as_slice());
+        let progress_width = task_width.saturating_sub(14).clamp(8, 14);
+        let progress = task_board_progress_bar(done, task_items.len(), progress_width);
+        let task_lines = vec![
+            Line::from(Span::styled(
+                trim_ui_text(
+                    format!(
+                        "✦ {} {}:{}",
+                        ui_text_task_list_title(),
+                        ui_text_task_status_label(TaskBoardStatus::Running),
+                        running
+                    )
+                    .as_str(),
+                    task_width,
+                ),
+                Style::default()
+                    .fg(Color::Rgb(255, 212, 127))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                trim_ui_text(
+                    format!(
+                        "●{}:{}  ◆{}:{}  ■{}:{}",
+                        ui_text_task_status_label(TaskBoardStatus::Done),
+                        done,
+                        ui_text_task_status_label(TaskBoardStatus::Failed),
+                        failed,
+                        ui_text_task_status_label(TaskBoardStatus::Blocked),
+                        blocked
+                    )
+                    .as_str(),
+                    task_width,
+                ),
+                Style::default().fg(palette.text),
+            )),
+            Line::from(Span::styled(
+                trim_ui_text(
+                    format!("{} {}", ui_text_task_progress(), progress).as_str(),
+                    task_width,
+                ),
+                Style::default().fg(Color::Rgb(122, 212, 255)),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(task_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(255, 212, 127))),
+            ),
+            cols[1],
+        );
     }
     let current = current_thread_overview(state, services);
     let summary = if let Some(item) = current {
@@ -8396,11 +8578,6 @@ fn draw_main_header(
         .as_ref()
         .map(|live| format!("{} ", spinner_frame(live.started_at)))
         .unwrap_or_default();
-    let task_items = if state.chat_mode == ChatInteractionMode::Task {
-        collect_task_board_items_for_state(state, TASK_BOARD_MAX_ITEMS)
-    } else {
-        Vec::new()
-    };
     let mut token_line = format!(
         "{}{}: {}{}",
         token_prefix,
@@ -8418,7 +8595,7 @@ fn draw_main_header(
             .as_str(),
         );
     }
-    let right_width = cols[1].width.saturating_sub(2) as usize;
+    let right_width = cols[right_col_idx].width.saturating_sub(2) as usize;
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
@@ -8455,89 +8632,12 @@ fn draw_main_header(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(palette.accent)),
         ),
-        cols[1],
+        cols[right_col_idx],
     );
 }
 
-fn prepend_task_board_lines(
-    lines: &mut Vec<ConversationLine>,
-    tasks: Vec<TaskBoardItem>,
-    width: usize,
-) {
-    if tasks.is_empty() {
-        return;
-    }
-    let content_width = width.max(1);
-    let mut prefixed = Vec::<ConversationLine>::new();
-    let pulse = if status_pulse_on() { "✦" } else { "✧" };
-    let (running, done, failed, blocked) = task_board_counts(tasks.as_slice());
-    let progress = task_board_progress_bar(done, tasks.len(), 14);
-    prefixed.push(ConversationLine {
-        kind: ConversationLineKind::Body,
-        role: UiRole::System,
-        text: trim_ui_text(
-            format!("{pulse} {} ({})", ui_text_task_list_title(), tasks.len()).as_str(),
-            content_width,
-        ),
-        message_index: None,
-    });
-    prefixed.push(ConversationLine {
-        kind: ConversationLineKind::Body,
-        role: UiRole::System,
-        text: trim_ui_text(
-            format!(
-                "  ◌{}:{}  ●{}:{}  ◆{}:{}  ■{}:{}",
-                ui_text_task_status_label(TaskBoardStatus::Running),
-                running,
-                ui_text_task_status_label(TaskBoardStatus::Done),
-                done,
-                ui_text_task_status_label(TaskBoardStatus::Failed),
-                failed,
-                ui_text_task_status_label(TaskBoardStatus::Blocked),
-                blocked
-            )
-            .as_str(),
-            content_width,
-        ),
-        message_index: None,
-    });
-    prefixed.push(ConversationLine {
-        kind: ConversationLineKind::Body,
-        role: UiRole::Assistant,
-        text: trim_ui_text(
-            format!("  {} {}", ui_text_task_progress(), progress).as_str(),
-            content_width,
-        ),
-        message_index: None,
-    });
-    for item in tasks {
-        let (icon, role) = match item.status {
-            TaskBoardStatus::Running => ("◌", UiRole::Thinking),
-            TaskBoardStatus::Done => ("●", UiRole::Assistant),
-            TaskBoardStatus::Failed => ("◆", UiRole::System),
-            TaskBoardStatus::Blocked => ("■", UiRole::Tool),
-        };
-        let line = format!(
-            "  {} [{}] {}",
-            icon,
-            ui_text_task_status_label(item.status),
-            item.name
-        );
-        prefixed.push(ConversationLine {
-            kind: ConversationLineKind::Body,
-            role,
-            text: trim_ui_text(line.as_str(), content_width),
-            message_index: None,
-        });
-    }
-    prefixed.push(ConversationLine {
-        kind: ConversationLineKind::Spacer,
-        role: UiRole::System,
-        text: String::new(),
-        message_index: None,
-    });
-    prefixed.extend(lines.iter().cloned());
-    *lines = prefixed;
+fn task_board_should_show_header(tasks: &[TaskBoardItem]) -> bool {
+    !tasks.is_empty() && tasks.iter().any(|item| item.status != TaskBoardStatus::Done)
 }
 
 fn task_board_counts(tasks: &[TaskBoardItem]) -> (usize, usize, usize, usize) {
@@ -18036,7 +18136,71 @@ model = "test-model"
     }
 
     #[test]
-    fn task_mode_conversation_prepends_task_list_lines() {
+    fn count_task_plan_steps_in_group_tui_uses_unique_descriptions() {
+        let group_id = "group-a";
+        let messages = vec![
+            SessionMessage {
+                role: "tool".to_string(),
+                content: "tool_call_id=1 function=Task args={\"description\":\"读取代码\"} result={\"ok\":true}".to_string(),
+                kind: MessageKind::Tool,
+                group_id: Some(group_id.to_string()),
+                created_at_epoch_ms: 1,
+                tool_meta: None,
+            },
+            SessionMessage {
+                role: "tool".to_string(),
+                content: "tool_call_id=2 function=Task args={\"description\":\"读取代码\"} result={\"ok\":true}".to_string(),
+                kind: MessageKind::Tool,
+                group_id: Some(group_id.to_string()),
+                created_at_epoch_ms: 2,
+                tool_meta: None,
+            },
+            SessionMessage {
+                role: "tool".to_string(),
+                content: "tool_call_id=3 function=Task args={\"description\":\"修改实现\"} result={\"ok\":true}".to_string(),
+                kind: MessageKind::Tool,
+                group_id: Some(group_id.to_string()),
+                created_at_epoch_ms: 3,
+                tool_meta: None,
+            },
+            SessionMessage {
+                role: "tool".to_string(),
+                content: "tool_call_id=4 function=LS args={\"path\":\".\"} result={\"ok\":true}".to_string(),
+                kind: MessageKind::Tool,
+                group_id: Some(group_id.to_string()),
+                created_at_epoch_ms: 4,
+                tool_meta: None,
+            },
+        ];
+        assert_eq!(
+            count_task_plan_steps_in_group_tui(messages.as_slice(), group_id),
+            2
+        );
+    }
+
+    #[test]
+    fn task_board_header_visibility_follows_task_status() {
+        let done_only = vec![TaskBoardItem {
+            name: "a".to_string(),
+            status: TaskBoardStatus::Done,
+        }];
+        assert!(!task_board_should_show_header(done_only.as_slice()));
+
+        let mixed = vec![
+            TaskBoardItem {
+                name: "a".to_string(),
+                status: TaskBoardStatus::Done,
+            },
+            TaskBoardItem {
+                name: "b".to_string(),
+                status: TaskBoardStatus::Running,
+            },
+        ];
+        assert!(task_board_should_show_header(mixed.as_slice()));
+    }
+
+    #[test]
+    fn task_mode_conversation_does_not_prepend_task_list_lines() {
         let mut state = new_state();
         state.chat_mode = ChatInteractionMode::Task;
         state.set_conversation_wrap_width(100);
@@ -18071,8 +18235,8 @@ model = "test-model"
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains(ui_text_task_list_title()));
-        assert!(rendered.contains("同步文档"));
+        assert!(!rendered.contains(ui_text_task_list_title()));
+        assert!(!rendered.contains("同步文档"));
     }
 
     #[test]
