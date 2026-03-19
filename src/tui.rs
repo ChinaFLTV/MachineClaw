@@ -10853,7 +10853,9 @@ fn config_seed_fields() -> Vec<ConfigFieldSeed> {
             category: "ai",
             kind: ConfigFieldKind::Enum,
             required: false,
-            options: &["openai", "claude", "gemini", "deepseek", "qwen", "ollama"],
+            options: &[
+                "openai", "xiaomi", "mimo", "claude", "gemini", "deepseek", "qwen", "ollama",
+            ],
         },
         ConfigFieldSeed {
             key: "ai.base-url",

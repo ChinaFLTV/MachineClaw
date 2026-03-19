@@ -2657,7 +2657,7 @@ fn localize_detail(detail: &str) -> String {
             Language::Ja => "必須設定 ai.model が不足しています".to_string(),
             Language::En => detail.to_string(),
         },
-        "ai.type must be one of: openai, claude, gemini, anthropic, google, deepseek, qwen, ollama, openrouter, zhipu, moonshot, doubao, stepfun, siliconflow, groq, together, mistral, azure-openai" => match current_language() {
+        "ai.type must be one of: openai, claude, gemini, anthropic, google, deepseek, qwen, ollama, openrouter, zhipu, moonshot, doubao, stepfun, siliconflow, groq, together, mistral, azure-openai, xiaomi, mimo" => match current_language() {
             Language::ZhCn => "ai.type 取值不合法，请使用 openai/claude/gemini 或兼容别名".to_string(),
             Language::ZhTw => "ai.type 取值不合法，請使用 openai/claude/gemini 或相容別名".to_string(),
             Language::Fr => "Valeur ai.type invalide ; utilisez openai/claude/gemini ou un alias compatible".to_string(),

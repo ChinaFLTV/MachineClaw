@@ -603,7 +603,7 @@ pub fn config_template_example() -> &'static str {
 env-mode = "prod" # optional: prod, test, dev
 
 [ai]
-type = "openai" # optional, default openai; accepted: openai, claude(anthropic), gemini(google), deepseek, qwen, ollama, openrouter, zhipu, moonshot, doubao, stepfun, siliconflow, groq, together, mistral, azure-openai
+type = "openai" # optional, default openai; accepted: openai, claude(anthropic), gemini(google), deepseek, qwen, ollama, openrouter, zhipu, moonshot, doubao, stepfun, siliconflow, groq, together, mistral, azure-openai, xiaomi, mimo
 base-url = "https://api.deepseek.com/v1" # required
 token = "sk-xxxx" # required
 model = "deepseek-chat" # required
@@ -725,7 +725,7 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
     let ai_type = normalize_ai_provider_type(cfg.ai.r#type.as_str());
     if !matches!(ai_type, "openai" | "claude" | "gemini") {
         return Err(AppError::Config(
-            "ai.type must be one of: openai, claude, gemini, anthropic, google, deepseek, qwen, ollama, openrouter, zhipu, moonshot, doubao, stepfun, siliconflow, groq, together, mistral, azure-openai"
+            "ai.type must be one of: openai, claude, gemini, anthropic, google, deepseek, qwen, ollama, openrouter, zhipu, moonshot, doubao, stepfun, siliconflow, groq, together, mistral, azure-openai, xiaomi, mimo"
                 .to_string(),
         ));
     }
@@ -1244,7 +1244,7 @@ pub(crate) fn normalize_ai_provider_type(raw: &str) -> &str {
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "openai" | "deepseek" | "qwen" | "ollama" | "openrouter" | "zhipu" | "moonshot"
         | "doubao" | "stepfun" | "siliconflow" | "groq" | "together" | "mistral"
-        | "azure-openai" | "azure" => "openai",
+        | "azure-openai" | "azure" | "xiaomi" | "mimo" => "openai",
         "claude" | "anthropic" => "claude",
         "gemini" | "google" => "gemini",
         _ => "__invalid__",
@@ -1321,6 +1321,8 @@ mod tests {
     fn normalize_ai_provider_type_supports_aliases() {
         assert_eq!(normalize_ai_provider_type("openai"), "openai");
         assert_eq!(normalize_ai_provider_type("deepseek"), "openai");
+        assert_eq!(normalize_ai_provider_type("xiaomi"), "openai");
+        assert_eq!(normalize_ai_provider_type("mimo"), "openai");
         assert_eq!(normalize_ai_provider_type("claude"), "claude");
         assert_eq!(normalize_ai_provider_type("anthropic"), "claude");
         assert_eq!(normalize_ai_provider_type("gemini"), "gemini");

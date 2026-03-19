@@ -278,14 +278,15 @@ struct ApiToolFunction {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     choices: Vec<Choice>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_usage_or_default")]
     usage: Usage,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionStreamResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     choices: Vec<StreamChoice>,
     #[serde(default, deserialize_with = "deserialize_usage_or_default")]
     usage: Usage,
@@ -308,6 +309,22 @@ where
     Ok(Option::<Usage>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+fn deserialize_vec_or_default<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_struct_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: AssistantMessage,
@@ -315,7 +332,7 @@ struct Choice {
 
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_struct_or_default")]
     delta: AssistantDeltaMessage,
 }
 
@@ -326,7 +343,7 @@ struct AssistantMessage {
     reasoning_content: Option<String>,
     #[serde(default)]
     reasoning: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     tool_calls: Vec<ApiToolCall>,
 }
 
@@ -338,7 +355,7 @@ struct AssistantDeltaMessage {
     reasoning_content: Option<String>,
     #[serde(default)]
     reasoning: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     tool_calls: Vec<StreamToolCallDelta>,
 }
 
@@ -4717,6 +4734,14 @@ mod tests {
             AiProviderProtocol::OpenAiCompatible
         );
         assert_eq!(
+            provider_protocol_from_config_type("xiaomi"),
+            AiProviderProtocol::OpenAiCompatible
+        );
+        assert_eq!(
+            provider_protocol_from_config_type("mimo"),
+            AiProviderProtocol::OpenAiCompatible
+        );
+        assert_eq!(
             provider_protocol_from_config_type("anthropic"),
             AiProviderProtocol::Claude
         );
@@ -5242,6 +5267,30 @@ mod tests {
         assert_eq!(parsed.usage.prompt_tokens, 0);
         assert_eq!(parsed.usage.completion_tokens, 0);
         assert_eq!(parsed.usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn chat_completion_response_accepts_null_usage_and_tool_calls() {
+        let parsed: super::ChatCompletionResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":"hello","tool_calls":null}}],"usage":null}"#,
+        )
+        .expect("null usage and null tool_calls should deserialize");
+        assert_eq!(parsed.choices.len(), 1);
+        assert!(parsed.choices[0].message.tool_calls.is_empty());
+        assert_eq!(parsed.usage.prompt_tokens, 0);
+        assert_eq!(parsed.usage.completion_tokens, 0);
+        assert_eq!(parsed.usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn streaming_chunk_accepts_null_tool_calls_and_delta() {
+        let parsed: ChatCompletionStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"content":null,"reasoning_content":null,"tool_calls":null}},{"delta":null}]}"#,
+        )
+        .expect("null tool_calls and null delta should deserialize");
+        assert_eq!(parsed.choices.len(), 2);
+        assert!(parsed.choices[0].delta.tool_calls.is_empty());
+        assert!(parsed.choices[1].delta.tool_calls.is_empty());
     }
 
     #[test]
