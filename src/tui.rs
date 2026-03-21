@@ -62,6 +62,7 @@ use crate::{
     error::{AppError, ExitCode},
     i18n, mask,
     mcp::{self, McpServerRecord},
+    memory::{UserMemoryManager, UserMemoryRecord},
     platform::OsType,
     render,
     shell::{CommandMode, CommandResult, CommandSpec, looks_like_write_command_hint},
@@ -74,7 +75,7 @@ const UI_PREFS_FILE_NAME: &str = "ui-preferences.json";
 const INSPECT_REFRESH_INTERVAL_MS: u128 = 900;
 const INSPECT_DETAIL_REFRESH_INTERVAL_MS: u128 = 12_000;
 const INSPECT_HISTORY_MAX: usize = 80;
-const NAV_ITEMS_COUNT: usize = 5;
+const NAV_ITEMS_COUNT: usize = 6;
 const CONVERSATION_TAIL_PADDING_LINES: usize = 1;
 const THREAD_DOUBLE_CLICK_WINDOW_MS: u128 = 320;
 const STARTUP_SPLASH_MIN_DURATION_MS: u64 = 280;
@@ -371,6 +372,21 @@ struct ConfigUiState {
     config_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListViewport {
+    offset: usize,
+    visible_len: usize,
+    selected_row: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryUiState {
+    items: Vec<UserMemoryRecord>,
+    selected_row: usize,
+    file_path: PathBuf,
+    enabled: bool,
+}
+
 struct ConfigFieldSeed {
     key: &'static str,
     label: &'static str,
@@ -425,6 +441,13 @@ struct McpUiState {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MemoryEditorPayload {
+    content: String,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusPanel {
     Nav,
@@ -438,6 +461,7 @@ enum UiMode {
     Chat,
     Skills,
     Mcp,
+    Memory,
     Inspect,
     Config,
 }
@@ -747,6 +771,7 @@ struct ChatUiState {
     ai_live: Option<AiLiveState>,
     config_ui: ConfigUiState,
     mcp_ui: McpUiState,
+    memory_ui: MemoryUiState,
     threads: Vec<SessionOverview>,
     thread_selected: usize,
     input: InputBuffer,
@@ -780,6 +805,7 @@ impl ChatUiState {
         prefs_path: PathBuf,
         cfg: &AppConfig,
         config_path: &Path,
+        memory: &UserMemoryManager,
     ) -> Self {
         let initial_persisted = std::iter::repeat_n(true, messages.len()).collect::<Vec<_>>();
         let mut session_conversation_cache = BTreeMap::new();
@@ -828,6 +854,7 @@ impl ChatUiState {
             ai_live: None,
             config_ui: build_config_ui_state(cfg, config_path),
             mcp_ui: build_mcp_ui_state(cfg, config_path),
+            memory_ui: build_memory_ui_state(memory),
             threads,
             thread_selected: 0,
             input: InputBuffer::new(),
@@ -1466,6 +1493,7 @@ pub fn run_chat_tui(services: &mut ActionServices<'_>) -> Result<ActionOutcome, 
         prefs_path,
         services.cfg,
         services.config_path,
+        services.memory,
     );
     state.restore_committed_token_usage(services.session.token_usage_committed());
     state.push(
@@ -1588,7 +1616,9 @@ fn run_startup_checks_in_tui(
     state.startup_preflight_finished_epoch_ms = now_epoch_ms();
     state.push(
         UiRole::System,
-        i18n::preflight_notice_done(&i18n::human_duration_ms(state.startup_preflight_duration_ms)),
+        i18n::preflight_notice_done(&i18n::human_duration_ms(
+            state.startup_preflight_duration_ms,
+        )),
     );
     if !state.ai_connectivity_checking {
         state.status = ui_text_ready().to_string();
@@ -2513,7 +2543,7 @@ fn handle_threads_key(
 fn handle_conversation_key(
     key: KeyEvent,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    services: &ActionServices<'_>,
+    services: &mut ActionServices<'_>,
     state: &mut ChatUiState,
 ) -> Result<bool, AppError> {
     if state.mode == UiMode::Inspect {
@@ -2537,6 +2567,9 @@ fn handle_conversation_key(
     }
     if state.mode == UiMode::Mcp {
         return handle_mcp_conversation_key(key, state);
+    }
+    if state.mode == UiMode::Memory {
+        return handle_memory_conversation_key(key, terminal, services, state);
     }
     if state.mode == UiMode::Config {
         return handle_config_conversation_key(key, state);
@@ -3101,6 +3134,164 @@ fn handle_mcp_input_key(
     Ok(false)
 }
 
+fn handle_memory_conversation_key(
+    key: KeyEvent,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+) -> Result<bool, AppError> {
+    match key.code {
+        KeyCode::Up => {
+            state.memory_ui.selected_row = state.memory_ui.selected_row.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            if !state.memory_ui.items.is_empty() {
+                state.memory_ui.selected_row =
+                    (state.memory_ui.selected_row + 1).min(state.memory_ui.items.len() - 1);
+            }
+        }
+        KeyCode::PageUp => {
+            state.memory_ui.selected_row = state.memory_ui.selected_row.saturating_sub(8);
+        }
+        KeyCode::PageDown => {
+            if !state.memory_ui.items.is_empty() {
+                state.memory_ui.selected_row =
+                    (state.memory_ui.selected_row + 8).min(state.memory_ui.items.len() - 1);
+            }
+        }
+        KeyCode::Home => {
+            state.memory_ui.selected_row = 0;
+        }
+        KeyCode::End => {
+            if !state.memory_ui.items.is_empty() {
+                state.memory_ui.selected_row = state.memory_ui.items.len() - 1;
+            }
+        }
+        KeyCode::Enter | KeyCode::Char('e' | 'E') => {
+            edit_selected_memory(terminal, services, state)?;
+        }
+        KeyCode::Char('a' | 'A') => {
+            create_memory_entry(terminal, services, state)?;
+        }
+        KeyCode::Char('d' | 'D') => {
+            delete_selected_memory(services, state)?;
+        }
+        KeyCode::Char('r' | 'R') => {
+            services.memory.reload()?;
+            state.memory_ui = build_memory_ui_state(services.memory);
+            state.status = ui_text_memory_reloaded().to_string();
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn create_memory_entry(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+) -> Result<(), AppError> {
+    let payload = MemoryEditorPayload {
+        content: String::new(),
+        tags: Vec::new(),
+    };
+    let Some(next) = edit_memory_payload(terminal, &payload)? else {
+        state.status = ui_text_memory_edit_cancelled().to_string();
+        return Ok(());
+    };
+    let created = services.memory.add(next.content, next.tags)?;
+    state.memory_ui = build_memory_ui_state(services.memory);
+    if let Some(idx) = state
+        .memory_ui
+        .items
+        .iter()
+        .position(|item| item.id == created.id)
+    {
+        state.memory_ui.selected_row = idx;
+    }
+    state.status = ui_text_memory_added().to_string();
+    Ok(())
+}
+
+fn edit_selected_memory(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+) -> Result<(), AppError> {
+    let Some(current) = memory_selected_item(state).cloned() else {
+        state.status = ui_text_memory_empty().to_string();
+        return Ok(());
+    };
+    let payload = MemoryEditorPayload {
+        content: current.content.clone(),
+        tags: current.tags.clone(),
+    };
+    let Some(next) = edit_memory_payload(terminal, &payload)? else {
+        state.status = ui_text_memory_edit_cancelled().to_string();
+        return Ok(());
+    };
+    let updated = services
+        .memory
+        .update(current.id.as_str(), next.content, next.tags)?;
+    state.memory_ui = build_memory_ui_state(services.memory);
+    if let Some(idx) = state
+        .memory_ui
+        .items
+        .iter()
+        .position(|item| item.id == updated.id)
+    {
+        state.memory_ui.selected_row = idx;
+    }
+    state.status = ui_text_memory_updated().to_string();
+    Ok(())
+}
+
+fn delete_selected_memory(
+    services: &mut ActionServices<'_>,
+    state: &mut ChatUiState,
+) -> Result<(), AppError> {
+    let Some(target) = memory_selected_item(state).cloned() else {
+        state.status = ui_text_memory_empty().to_string();
+        return Ok(());
+    };
+    services.memory.delete(target.id.as_str())?;
+    let next_row = state.memory_ui.selected_row.saturating_sub(1);
+    state.memory_ui = build_memory_ui_state(services.memory);
+    if !state.memory_ui.items.is_empty() {
+        state.memory_ui.selected_row = next_row.min(state.memory_ui.items.len() - 1);
+    }
+    state.status = ui_text_memory_deleted().to_string();
+    Ok(())
+}
+
+fn edit_memory_payload(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    payload: &MemoryEditorPayload,
+) -> Result<Option<MemoryEditorPayload>, AppError> {
+    let initial = serde_json::to_string_pretty(payload)
+        .map_err(|err| AppError::Runtime(format!("failed to render memory payload: {err}")))?;
+    let Some(edited) = edit_text_with_external_editor(terminal, &initial)? else {
+        return Ok(None);
+    };
+    let parsed = serde_json::from_str::<MemoryEditorPayload>(&edited).map_err(|err| {
+        AppError::Runtime(format!("failed to parse memory editor payload: {err}"))
+    })?;
+    Ok(Some(parsed))
+}
+
+fn memory_selected_item(state: &ChatUiState) -> Option<&UserMemoryRecord> {
+    state.memory_ui.items.get(
+        state
+            .memory_ui
+            .selected_row
+            .min(state.memory_ui.items.len().saturating_sub(1)),
+    )
+}
+
+fn compact_memory_preview(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn handle_mouse_event(
     mouse: MouseEvent,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -3280,7 +3471,7 @@ fn handle_mouse_event(
                 && rect_contains(inspect_panel_rect(layout), mouse.column, mouse.row)
             {
                 state.focus = FocusPanel::Conversation;
-                if let Some(row_idx) = skill_row_index_from_mouse(layout, mouse, services) {
+                if let Some(row_idx) = skill_row_index_from_mouse(layout, mouse, services, state) {
                     state.skills_selected_row = row_idx;
                     open_selected_skill_doc_modal(services, state)?;
                 }
@@ -3409,14 +3600,14 @@ fn handle_mouse_event(
                     config_select_by_mouse(layout, mouse, state);
                 } else if state.mode == UiMode::Mcp {
                     mcp_select_by_mouse(layout, mouse, state);
+                } else if state.mode == UiMode::Memory {
+                    memory_select_by_mouse(layout, mouse, state);
                 } else if state.mode == UiMode::Chat {
                     refresh_hovered_message_from_mouse(state, layout, mouse);
                 }
             } else if rect_contains(layout.threads_body, mouse.column, mouse.row) {
                 state.focus = FocusPanel::Threads;
-                let row = mouse.row.saturating_sub(layout.threads_body.y);
-                let idx = row as usize;
-                if idx < state.threads.len() {
+                if let Some(idx) = thread_index_from_mouse(layout, mouse, state) {
                     state.thread_selected = idx;
                     let now = now_epoch_ms();
                     let is_double_click = state.last_thread_click.is_some_and(|item| {
@@ -4591,6 +4782,14 @@ fn activate_nav_item(
             state.status = ui_text_inspect_target_menu_hint().to_string();
         }
         4 => {
+            state.mode = UiMode::Memory;
+            state.inspect_menu_open = false;
+            state.skill_doc_modal = None;
+            state.memory_ui = build_memory_ui_state(services.memory);
+            state.focus = FocusPanel::Conversation;
+            state.status = ui_text_memory_panel_ready().to_string();
+        }
+        5 => {
             state.mode = UiMode::Config;
             state.inspect_menu_open = false;
             state.skill_doc_modal = None;
@@ -4775,7 +4974,7 @@ fn submit_chat_message(
         cancel_requested: false,
     });
     draw_once(terminal, services, state)?;
-    let history = services.session.build_chat_history();
+    let history = services.session.build_chat_message_history();
     let mut external_tools =
         builtin_tools::external_tool_definitions(&services.cfg.ai.tools.builtin);
     if services.cfg.ai.tools.mcp.enabled {
@@ -5057,8 +5256,14 @@ fn wait_chat_worker_result(
                         live.tool_calls = live.tool_calls.saturating_add(1);
                         live.last_tool_label = format_live_tool_label(&request.name);
                     }
-                    let payload =
-                        execute_tool_call_tui(terminal, services, group_id, &request, state, cancel_requested);
+                    let payload = execute_tool_call_tui(
+                        terminal,
+                        services,
+                        group_id,
+                        &request,
+                        state,
+                        cancel_requested,
+                    );
                     let _ = reply_tx.send(payload);
                 }
                 Ok(PendingAiEvent::Finished(result)) => {
@@ -5114,13 +5319,7 @@ fn wait_chat_worker_result(
             }
             Event::Mouse(mouse) => {
                 redraw_after_input = true;
-                handle_pending_ai_mouse_event(
-                    mouse,
-                    terminal,
-                    services,
-                    state,
-                    cancel_requested,
-                )?
+                handle_pending_ai_mouse_event(mouse, terminal, services, state, cancel_requested)?
             }
             Event::Resize(width, height) => {
                 handle_tui_resize_redraw(terminal, services, state, Some((width, height)))?;
@@ -5160,7 +5359,9 @@ fn should_append_final_thinking(final_thinking: &str, thinking_rendered_in_ui: b
     !final_thinking.trim().is_empty() && !thinking_rendered_in_ui
 }
 
-fn pending_ai_cancel_result(cancel_requested: &AtomicBool) -> Option<Result<ChatToolResponse, String>> {
+fn pending_ai_cancel_result(
+    cancel_requested: &AtomicBool,
+) -> Option<Result<ChatToolResponse, String>> {
     if cancel_requested.load(Ordering::SeqCst) {
         return Some(Err(i18n::chat_ai_cancel_requested().to_string()));
     }
@@ -5245,13 +5446,9 @@ fn pump_pending_ai_input_events(
                 let _ =
                     handle_pending_ai_key_event(key, terminal, services, state, cancel_requested)?;
             }
-            Event::Mouse(mouse) => handle_pending_ai_mouse_event(
-                mouse,
-                terminal,
-                services,
-                state,
-                cancel_requested,
-            )?,
+            Event::Mouse(mouse) => {
+                handle_pending_ai_mouse_event(mouse, terminal, services, state, cancel_requested)?
+            }
             Event::Resize(width, height) => {
                 handle_tui_resize_redraw(terminal, services, state, Some((width, height)))?
             }
@@ -5330,8 +5527,7 @@ fn handle_pending_ai_key_event(
     if state.pending_thread_export_html.is_some() {
         return handle_thread_export_html_modal_key(key, services, state);
     }
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('c' | 'z'))
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'z'))
     {
         state.status = ui_text_status_ai_stop_button_hint().to_string();
         return Ok(false);
@@ -5424,10 +5620,9 @@ fn handle_pending_ai_mouse_event(
         }
         if rect_contains(layout.threads_body, mouse.column, mouse.row) {
             state.focus = FocusPanel::Threads;
-            let row = mouse.row.saturating_sub(layout.threads_body.y) as usize;
             let mut clicked_valid_thread = false;
-            if row < state.threads.len() {
-                state.thread_selected = row;
+            if let Some(idx) = thread_index_from_mouse(layout, mouse, state) {
+                state.thread_selected = idx;
                 clicked_valid_thread = true;
             }
             if clicked_valid_thread && selected_thread_is_active_session(state) {
@@ -5778,12 +5973,7 @@ fn try_acquire_tool_worker_slot() -> bool {
             return false;
         }
         if TOOL_WORKER_IN_FLIGHT
-            .compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
+            .compare_exchange_weak(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
             return true;
@@ -5920,7 +6110,11 @@ fn run_builtin_tool_call_nonblocking_tui(
         let raw_arguments = raw_arguments.to_string();
         move || builtin_tools::execute_tool(&tool_name, &raw_arguments, &cfg)
     }) else {
-        return builtin_tools::execute_tool(tool_name, raw_arguments, &services.cfg.ai.tools.builtin);
+        return builtin_tools::execute_tool(
+            tool_name,
+            raw_arguments,
+            &services.cfg.ai.tools.builtin,
+        );
     };
     match wait_tool_worker_with_ui(terminal, services, state, cancel_requested, worker_rx) {
         Ok(result) => result,
@@ -5932,7 +6126,11 @@ fn task_mode_allows_direct_tool_call_tui(tool_name: &str) -> bool {
     tool_name.eq_ignore_ascii_case("task") || tool_name.eq_ignore_ascii_case("architect")
 }
 
-fn extract_tool_trace_field_tui<'a>(content: &'a str, key: &str, terminator: &str) -> Option<&'a str> {
+fn extract_tool_trace_field_tui<'a>(
+    content: &'a str,
+    key: &str,
+    terminator: &str,
+) -> Option<&'a str> {
     let marker = format!("{key}=");
     let start = content.find(marker.as_str())?;
     let value_start = start + marker.len();
@@ -6019,12 +6217,12 @@ fn execute_tool_call_tui(
     state: &mut ChatUiState,
     cancel_requested: &AtomicBool,
 ) -> String {
-    if let Some(payload) = task_mode_plan_guard_payload_in_tui(services, state, group_id, tool_call) {
+    if let Some(payload) = task_mode_plan_guard_payload_in_tui(services, state, group_id, tool_call)
+    {
         let guard_message = format!("{}: {}", ui_text_tool_error(), tool_call.name);
-        let should_push = state
-            .messages
-            .back()
-            .map_or(true, |item| item.role != UiRole::Tool || item.text != guard_message);
+        let should_push = state.messages.back().map_or(true, |item| {
+            item.role != UiRole::Tool || item.text != guard_message
+        });
         if should_push {
             state.push(UiRole::Tool, guard_message);
         }
@@ -7168,7 +7366,11 @@ fn draw_raw_data_modal(
     );
     let body = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(8),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .margin(1)
         .split(modal);
     let max_scroll = raw_data_modal_scroll_max(modal_state, layout);
@@ -8223,6 +8425,7 @@ fn draw_sidebar(
         ListItem::new(Line::from(format!("  {}", ui_text_nav_skills()))),
         ListItem::new(Line::from(format!("  {}", ui_text_nav_mcp()))),
         ListItem::new(Line::from(format!("  {}", ui_text_nav_inspect()))),
+        ListItem::new(Line::from(format!("  {}", ui_text_nav_memory()))),
         ListItem::new(Line::from(format!("  {}", ui_text_nav_config()))),
     ];
     let mut nav_state = ListState::default();
@@ -8256,8 +8459,13 @@ fn draw_sidebar(
     );
 
     let mut thread_state = ListState::default();
-    if !state.threads.is_empty() {
-        thread_state.select(Some(state.thread_selected.min(state.threads.len() - 1)));
+    let thread_viewport = list_viewport(
+        state.threads.len(),
+        state.thread_selected,
+        layout.threads_body.height as usize,
+    );
+    if let Some(selected_row) = thread_viewport.selected_row {
+        thread_state.select(Some(selected_row));
     }
     let thread_items = if state.threads.is_empty() {
         vec![ListItem::new(Line::from(format!(
@@ -8268,7 +8476,8 @@ fn draw_sidebar(
         state
             .threads
             .iter()
-            .take(layout.threads_body.height as usize)
+            .skip(thread_viewport.offset)
+            .take(thread_viewport.visible_len)
             .map(|item| {
                 ListItem::new(Line::from(format!(
                     "  {}",
@@ -8343,6 +8552,12 @@ fn draw_main_panel(
         draw_status_bar(frame, state, layout, palette);
         return;
     }
+    if state.mode == UiMode::Memory {
+        draw_memory_panel(frame, state, layout, palette);
+        draw_input_panel(frame, state, layout, palette);
+        draw_status_bar(frame, state, layout, palette);
+        return;
+    }
     if state.mode == UiMode::Config {
         draw_config_panel(frame, state, layout, palette);
         draw_input_panel(frame, state, layout, palette);
@@ -8392,7 +8607,8 @@ fn draw_main_header(
     } else {
         Vec::new()
     };
-    let show_task_board = state.mode == UiMode::Chat && task_board_should_show_header(task_items.as_slice());
+    let show_task_board =
+        state.mode == UiMode::Chat && task_board_should_show_header(task_items.as_slice());
     let cols = if state.mode != UiMode::Chat {
         Layout::default()
             .direction(Direction::Horizontal)
@@ -8401,7 +8617,11 @@ fn draw_main_header(
     } else if show_task_board {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(46), Constraint::Percentage(24), Constraint::Percentage(30)])
+            .constraints([
+                Constraint::Percentage(46),
+                Constraint::Percentage(24),
+                Constraint::Percentage(30),
+            ])
             .split(inner)
     } else {
         Layout::default()
@@ -8429,6 +8649,14 @@ fn draw_main_header(
                 "{}: {}",
                 ui_text_mcp_servers_count(),
                 state.mcp_ui.servers.len()
+            ),
+        ),
+        UiMode::Memory => (
+            ui_text_memory_panel_title().to_string(),
+            format!(
+                "{}: {}",
+                ui_text_memory_count(),
+                state.memory_ui.items.len()
             ),
         ),
         UiMode::Config => (
@@ -8637,7 +8865,10 @@ fn draw_main_header(
 }
 
 fn task_board_should_show_header(tasks: &[TaskBoardItem]) -> bool {
-    !tasks.is_empty() && tasks.iter().any(|item| item.status != TaskBoardStatus::Done)
+    !tasks.is_empty()
+        && tasks
+            .iter()
+            .any(|item| item.status != TaskBoardStatus::Done)
 }
 
 fn task_board_counts(tasks: &[TaskBoardItem]) -> (usize, usize, usize, usize) {
@@ -8898,7 +9129,7 @@ fn hover_button_label_width(label: &str) -> u16 {
 }
 
 fn hover_button_hit_width(label: &str) -> u16 {
-    label.chars().count().max(1).min(u16::MAX as usize) as u16
+    hover_button_label_width(label)
 }
 
 fn conversation_hover_action_hit_rects(
@@ -9089,7 +9320,9 @@ fn append_chat_input_action_button(
     *cursor_x = (*cursor_x).saturating_add(width.saturating_add(1));
 }
 
-fn chat_input_action_button_hit_rects(buttons: &[ChatInputActionButton]) -> Vec<(ChatInputActionKind, Rect)> {
+fn chat_input_action_button_hit_rects(
+    buttons: &[ChatInputActionButton],
+) -> Vec<(ChatInputActionKind, Rect)> {
     let Some(first) = buttons.first() else {
         return Vec::new();
     };
@@ -9115,7 +9348,13 @@ fn chat_input_action_button_hit_rect(
 ) -> Option<Rect> {
     chat_input_action_button_hit_rects(buttons)
         .into_iter()
-        .find_map(|(button_kind, rect)| if button_kind == kind { Some(rect) } else { None })
+        .find_map(|(button_kind, rect)| {
+            if button_kind == kind {
+                Some(rect)
+            } else {
+                None
+            }
+        })
 }
 
 fn chat_input_action_button_at(
@@ -9125,7 +9364,13 @@ fn chat_input_action_button_at(
 ) -> Option<ChatInputActionKind> {
     chat_input_action_button_hit_rects(buttons)
         .into_iter()
-        .find_map(|(kind, rect)| if rect_contains(rect, x, y) { Some(kind) } else { None })
+        .find_map(|(kind, rect)| {
+            if rect_contains(rect, x, y) {
+                Some(kind)
+            } else {
+                None
+            }
+        })
 }
 
 fn conversation_is_at_bottom(state: &ChatUiState, viewport_height: u16) -> bool {
@@ -9270,7 +9515,10 @@ fn hovered_message_index_from_mouse(
     let row_offset = mouse.row.saturating_sub(layout.conversation_body.y) as usize;
     let line_idx = state.conversation_scroll as usize + row_offset;
     if line_idx == state.conversation_lines.len() {
-        return state.conversation_lines.last().and_then(|item| item.message_index);
+        return state
+            .conversation_lines
+            .last()
+            .and_then(|item| item.message_index);
     }
     let line = state.conversation_lines.get(line_idx)?;
     if let Some(message_index) = line.message_index {
@@ -9294,8 +9542,7 @@ fn refresh_hovered_message_from_mouse(
         state.hovered_message_idx = Some(idx);
         return;
     }
-    if conversation_hover_action_at(state, layout, mouse.column, mouse.row).is_some()
-    {
+    if conversation_hover_action_at(state, layout, mouse.column, mouse.row).is_some() {
         return;
     }
     state.hovered_message_idx = None;
@@ -9415,20 +9662,22 @@ fn draw_config_panel(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(26), Constraint::Min(20)])
         .split(inner);
+    let category_viewport = list_viewport(
+        state.config_ui.categories.len(),
+        state.config_ui.selected_category,
+        config_category_viewport_rows(cols[0]),
+    );
 
     let mut cat_state = ListState::default();
-    if !state.config_ui.categories.is_empty() {
-        cat_state.select(Some(
-            state
-                .config_ui
-                .selected_category
-                .min(state.config_ui.categories.len().saturating_sub(1)),
-        ));
+    if let Some(selected_row) = category_viewport.selected_row {
+        cat_state.select(Some(selected_row));
     }
     let category_items = state
         .config_ui
         .categories
         .iter()
+        .skip(category_viewport.offset)
+        .take(category_viewport.visible_len)
         .map(|item| ListItem::new(format!(" {}", item.label)))
         .collect::<Vec<_>>();
     frame.render_stateful_widget(
@@ -9466,9 +9715,16 @@ fn draw_config_panel(
         .config_ui
         .selected_field_row
         .min(visible.len().saturating_sub(1));
+    let field_viewport = list_viewport(
+        visible.len(),
+        selected_row,
+        config_field_viewport_rows(cols[1]),
+    );
     let selected_idx = visible[selected_row];
     let table_rows = visible
         .iter()
+        .skip(field_viewport.offset)
+        .take(field_viewport.visible_len)
         .map(|idx| {
             let field = &state.config_ui.fields[*idx];
             let type_label = config_kind_label(field.kind);
@@ -9483,7 +9739,7 @@ fn draw_config_panel(
         })
         .collect::<Vec<_>>();
     let mut table_state = TableState::default();
-    table_state.select(Some(selected_row));
+    table_state.select(field_viewport.selected_row);
     let table = Table::new(
         table_rows,
         [
@@ -9651,6 +9907,10 @@ fn draw_input_panel(
         draw_mcp_input_panel(frame, state, layout, palette);
         return;
     }
+    if state.mode == UiMode::Memory {
+        draw_memory_input_panel(frame, state, layout, palette);
+        return;
+    }
     let hint = if state.ai_live.is_some() {
         ui_text_input_hint_ai_live()
     } else {
@@ -9789,8 +10049,15 @@ fn draw_skills_panel(
     state.skills_selected_row = state
         .skills_selected_row
         .min(skill_rows.len().saturating_sub(1));
+    let viewport = list_viewport(
+        skill_rows.len(),
+        state.skills_selected_row,
+        table_viewport_rows(rows[1]),
+    );
     let table_rows = skill_rows
         .iter()
+        .skip(viewport.offset)
+        .take(viewport.visible_len)
         .map(|item| {
             Row::new(vec![
                 Cell::from(item.name.as_str()).style(Style::default().fg(palette.accent)),
@@ -9834,7 +10101,7 @@ fn draw_skills_panel(
     )
     .highlight_symbol("▶ ");
     let mut table_state = TableState::default();
-    table_state.select(Some(state.skills_selected_row));
+    table_state.select(viewport.selected_row);
     frame.render_stateful_widget(table, rows[1], &mut table_state);
 }
 
@@ -9944,13 +10211,13 @@ fn draw_mcp_panel(
         .constraints([Constraint::Length(28), Constraint::Min(26)])
         .split(rows[1]);
     let mut server_state = ListState::default();
-    if !state.mcp_ui.servers.is_empty() {
-        server_state.select(Some(
-            state
-                .mcp_ui
-                .selected_server
-                .min(state.mcp_ui.servers.len().saturating_sub(1)),
-        ));
+    let server_viewport = list_viewport(
+        state.mcp_ui.servers.len(),
+        state.mcp_ui.selected_server,
+        list_viewport_rows(cols[0]),
+    );
+    if let Some(selected_row) = server_viewport.selected_row {
+        server_state.select(Some(selected_row));
     }
     let server_items = if state.mcp_ui.servers.is_empty() {
         vec![ListItem::new(Line::from(format!(
@@ -9962,6 +10229,8 @@ fn draw_mcp_panel(
             .mcp_ui
             .servers
             .iter()
+            .skip(server_viewport.offset)
+            .take(server_viewport.visible_len)
             .map(|item| {
                 let marker = if item.config.enabled { "●" } else { "○" };
                 let dirty = if item.dirty { "*" } else { "" };
@@ -9997,8 +10266,15 @@ fn draw_mcp_panel(
         .split(cols[1]);
     if let Some(server) = mcp_selected_server(state) {
         let defs = mcp_field_defs();
+        let field_viewport = list_viewport(
+            defs.len(),
+            state.mcp_ui.selected_field,
+            table_viewport_rows(right_rows[0]),
+        );
         let table_rows = defs
             .iter()
+            .skip(field_viewport.offset)
+            .take(field_viewport.visible_len)
             .map(|def| {
                 Row::new(vec![
                     Cell::from(def.label),
@@ -10011,12 +10287,7 @@ fn draw_mcp_panel(
             })
             .collect::<Vec<_>>();
         let mut table_state = TableState::default();
-        table_state.select(Some(
-            state
-                .mcp_ui
-                .selected_field
-                .min(mcp_field_defs().len().saturating_sub(1)),
-        ));
+        table_state.select(field_viewport.selected_row);
         let table = Table::new(
             table_rows,
             [
@@ -10220,6 +10491,194 @@ fn draw_mcp_input_panel(
     );
 }
 
+fn draw_memory_panel(
+    frame: &mut Frame<'_>,
+    state: &ChatUiState,
+    layout: UiLayout,
+    palette: ThemePalette,
+) {
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(ui_text_memory_panel_title())
+        .border_style(Style::default().fg(panel_border_color(
+            state.focus == FocusPanel::Conversation,
+            palette,
+        )));
+    frame.render_widget(outer, layout.conversation);
+    let inner = layout.conversation.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(8)])
+        .split(inner);
+    let meta_line = format!(
+        "{}: {}    {}: {}",
+        ui_text_memory_status(),
+        if state.memory_ui.enabled {
+            ui_text_enabled()
+        } else {
+            ui_text_disabled()
+        },
+        ui_text_memory_count(),
+        state.memory_ui.items.len()
+    );
+    frame.render_widget(
+        Paragraph::new(meta_line).style(Style::default().fg(palette.muted)),
+        rows[0],
+    );
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(30), Constraint::Min(26)])
+        .split(rows[1]);
+    let mut list_state = ListState::default();
+    let list_viewport = list_viewport(
+        state.memory_ui.items.len(),
+        state.memory_ui.selected_row,
+        list_viewport_rows(cols[0]),
+    );
+    if let Some(selected_row) = list_viewport.selected_row {
+        list_state.select(Some(selected_row));
+    }
+    let list_items = if state.memory_ui.items.is_empty() {
+        vec![ListItem::new(Line::from(format!(
+            "  {}",
+            ui_text_memory_empty()
+        )))]
+    } else {
+        state
+            .memory_ui
+            .items
+            .iter()
+            .skip(list_viewport.offset)
+            .take(list_viewport.visible_len)
+            .map(|item| {
+                let tags = if item.tags.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(" [{}]", item.tags.join(", "))
+                };
+                ListItem::new(Line::from(format!(
+                    "  {}{}",
+                    trim_ui_text(&compact_memory_preview(item.content.as_str()), 22),
+                    trim_ui_text(&tags, 18)
+                )))
+            })
+            .collect::<Vec<_>>()
+    };
+    frame.render_stateful_widget(
+        List::new(list_items)
+            .style(Style::default().fg(palette.text))
+            .highlight_style(
+                Style::default()
+                    .fg(palette.text)
+                    .bg(palette.panel_bg)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(ui_text_memory_list_title())
+                    .border_style(Style::default().fg(panel_border_color(
+                        state.focus == FocusPanel::Conversation,
+                        palette,
+                    ))),
+            ),
+        cols[0],
+        &mut list_state,
+    );
+
+    let detail_text = if let Some(item) = memory_selected_item(state) {
+        let tags = if item.tags.is_empty() {
+            "[]".to_string()
+        } else {
+            format!("[{}]", item.tags.join(", "))
+        };
+        format!(
+            "id: {}\ncreated_at: {}\ntype: {}\ntags: {}\n\n{}",
+            item.id, item.created_at, item.kind, tags, item.content
+        )
+    } else {
+        ui_text_memory_empty().to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(detail_text)
+            .style(Style::default().fg(palette.text))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(ui_text_memory_detail_title()),
+            ),
+        cols[1],
+    );
+}
+
+fn draw_memory_input_panel(
+    frame: &mut Frame<'_>,
+    state: &ChatUiState,
+    layout: UiLayout,
+    palette: ThemePalette,
+) {
+    let title = format!(
+        "{} ({})",
+        ui_text_panel_input(),
+        ui_text_memory_input_hint()
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(panel_border_color(
+            state.focus == FocusPanel::Input,
+            palette,
+        )));
+    frame.render_widget(block, layout.input);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(layout.input_body);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{}: {}",
+            ui_text_memory_status(),
+            if state.memory_ui.enabled {
+                ui_text_enabled()
+            } else {
+                ui_text_disabled()
+            }
+        ))
+        .style(Style::default().fg(palette.muted)),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(ui_text_memory_help()).style(Style::default().fg(palette.text)),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{}: {}",
+            ui_text_memory_count(),
+            state.memory_ui.items.len()
+        ))
+        .style(Style::default().fg(palette.accent)),
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new(trim_ui_text(
+            &state.memory_ui.file_path.display().to_string(),
+            rows[3].width as usize,
+        ))
+        .style(Style::default().fg(palette.muted)),
+        rows[3],
+    );
+}
+
 fn inspect_panel_rect(layout: UiLayout) -> Rect {
     Rect {
         x: layout.conversation.x,
@@ -10276,6 +10735,7 @@ fn skill_row_index_from_mouse(
     layout: UiLayout,
     mouse: MouseEvent,
     services: &ActionServices<'_>,
+    state: &ChatUiState,
 ) -> Option<usize> {
     let skills_dir = expand_tilde(&services.cfg.ai.tools.skills.dir);
     let rows = build_skill_panel_rows(skills_dir.as_path(), services.skills);
@@ -10292,25 +10752,17 @@ fn skill_row_index_from_mouse(
         .constraints([Constraint::Length(2), Constraint::Min(8)])
         .split(inner);
     let table_area = split[1];
-    if !rect_contains(table_area, mouse.column, mouse.row) {
+    let data_rect = table_data_rect(table_area);
+    if !rect_contains(data_rect, mouse.column, mouse.row) {
         return None;
     }
-    let content = table_area.inner(ratatui::layout::Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
-    if !rect_contains(content, mouse.column, mouse.row) {
-        return None;
-    }
-    let row = mouse.row.saturating_sub(content.y) as usize;
-    if row == 0 {
-        return None;
-    }
-    let idx = row.saturating_sub(1);
-    if idx >= rows.len() {
-        return None;
-    }
-    Some(idx)
+    let row = mouse.row.saturating_sub(data_rect.y) as usize;
+    visible_list_index(
+        rows.len(),
+        state.skills_selected_row,
+        data_rect.height as usize,
+        row,
+    )
 }
 
 fn draw_inspect_panel(
@@ -10918,6 +11370,15 @@ fn build_mcp_ui_state(cfg: &AppConfig, config_path: &Path) -> McpUiState {
     }
 }
 
+fn build_memory_ui_state(memory: &UserMemoryManager) -> MemoryUiState {
+    MemoryUiState {
+        items: memory.records().to_vec(),
+        selected_row: 0,
+        file_path: memory.file_path().to_path_buf(),
+        enabled: memory.enabled(),
+    }
+}
+
 fn config_seed_fields() -> Vec<ConfigFieldSeed> {
     vec![
         ConfigFieldSeed {
@@ -11198,6 +11659,22 @@ fn config_seed_fields() -> Vec<ConfigFieldSeed> {
             options: &[],
         },
         ConfigFieldSeed {
+            key: "ai.memory.enabled",
+            label: "enabled",
+            category: "ai.memory",
+            kind: ConfigFieldKind::Bool,
+            required: false,
+            options: &["false", "true"],
+        },
+        ConfigFieldSeed {
+            key: "ai.memory.user-memory-file",
+            label: "user-memory-file",
+            category: "ai.memory",
+            kind: ConfigFieldKind::String,
+            required: false,
+            options: &[],
+        },
+        ConfigFieldSeed {
             key: "ai.tools.bash.write-cmd-run-confirm",
             label: "write-cmd-run-confirm",
             category: "ai.tools.bash",
@@ -11472,6 +11949,8 @@ fn config_value_from_cfg(cfg: &AppConfig, key: &str) -> Option<String> {
         "ai.chat.compression.max-chars-count" => {
             cfg.ai.chat.compression.max_chars_count.to_string()
         }
+        "ai.memory.enabled" => bool_to_text(cfg.ai.memory.enabled),
+        "ai.memory.user-memory-file" => cfg.ai.memory.user_memory_file.clone(),
         "ai.tools.bash.write-cmd-run-confirm" => {
             bool_to_text(cfg.ai.tools.bash.write_cmd_run_confirm)
         }
@@ -11573,6 +12052,7 @@ fn config_category_label(category: &str) -> String {
         "ai.retry" => ui_text_config_category_ai_retry().to_string(),
         "ai.chat" => ui_text_config_category_ai_chat().to_string(),
         "ai.chat.compression" => ui_text_config_category_ai_compression().to_string(),
+        "ai.memory" => ui_text_config_category_ai_memory().to_string(),
         "ai.tools.bash" => ui_text_config_category_ai_tools_bash().to_string(),
         "ai.tools.builtin" => ui_text_config_category_ai_tools_builtin().to_string(),
         "ai.tools.skills" => ui_text_config_category_skills().to_string(),
@@ -11600,6 +12080,81 @@ fn config_visible_field_indices(state: &ChatUiState) -> Vec<usize> {
         .enumerate()
         .filter_map(|(idx, field)| (field.category == category).then_some(idx))
         .collect()
+}
+
+fn list_viewport(total: usize, selected: usize, viewport_rows: usize) -> ListViewport {
+    if total == 0 || viewport_rows == 0 {
+        return ListViewport {
+            offset: 0,
+            visible_len: 0,
+            selected_row: None,
+        };
+    }
+    let clamped_selected = selected.min(total.saturating_sub(1));
+    let offset = clamped_selected
+        .saturating_add(1)
+        .saturating_sub(viewport_rows);
+    let visible_len = total.saturating_sub(offset).min(viewport_rows);
+    ListViewport {
+        offset,
+        visible_len,
+        selected_row: Some(clamped_selected.saturating_sub(offset)),
+    }
+}
+
+fn visible_list_index(
+    total: usize,
+    selected: usize,
+    viewport_rows: usize,
+    visible_row: usize,
+) -> Option<usize> {
+    let viewport = list_viewport(total, selected, viewport_rows);
+    (visible_row < viewport.visible_len).then_some(viewport.offset + visible_row)
+}
+
+fn visible_table_index(
+    total: usize,
+    selected: usize,
+    viewport_rows: usize,
+    table_row: usize,
+) -> Option<usize> {
+    if table_row == 0 {
+        return None;
+    }
+    visible_list_index(total, selected, viewport_rows, table_row.saturating_sub(1))
+}
+
+fn panel_body_rect(panel_rect: Rect) -> Rect {
+    panel_rect.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    })
+}
+
+fn table_data_rect(panel_rect: Rect) -> Rect {
+    let body = panel_body_rect(panel_rect);
+    Rect {
+        x: body.x,
+        y: body.y.saturating_add(1),
+        width: body.width,
+        height: body.height.saturating_sub(1),
+    }
+}
+
+fn list_viewport_rows(panel_rect: Rect) -> usize {
+    panel_body_rect(panel_rect).height as usize
+}
+
+fn table_viewport_rows(panel_rect: Rect) -> usize {
+    table_data_rect(panel_rect).height as usize
+}
+
+fn config_category_viewport_rows(category_rect: Rect) -> usize {
+    list_viewport_rows(category_rect)
+}
+
+fn config_field_viewport_rows(fields_rect: Rect) -> usize {
+    table_viewport_rows(fields_rect)
 }
 
 fn config_selected_field_index(state: &ChatUiState) -> Option<usize> {
@@ -11817,7 +12372,12 @@ fn save_config_ui(
     }
     state.config_ui.dirty_count = 0;
     state.config_ui.editing = false;
-    if let Some(field) = state.config_ui.fields.iter().find(|item| item.key == "ai.debug") {
+    if let Some(field) = state
+        .config_ui
+        .fields
+        .iter()
+        .find(|item| item.key == "ai.debug")
+    {
         state.ai_debug_enabled = field.value.trim().eq_ignore_ascii_case("true");
     }
     if let Some(field) = state
@@ -11828,9 +12388,36 @@ fn save_config_ui(
     {
         state.ai_connectivity_request_url = field.value.trim().to_string();
     }
-    if let Some(field) = state.config_ui.fields.iter().find(|item| item.key == "ai.type") {
+    if let Some(field) = state
+        .config_ui
+        .fields
+        .iter()
+        .find(|item| item.key == "ai.type")
+    {
         state.ai_connectivity_transport = field.value.trim().to_string();
     }
+    let memory_enabled = state
+        .config_ui
+        .fields
+        .iter()
+        .find(|item| item.key == "ai.memory.enabled")
+        .map(|item| item.value.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(services.memory.enabled());
+    let memory_file = state
+        .config_ui
+        .fields
+        .iter()
+        .find(|item| item.key == "ai.memory.user-memory-file")
+        .map(|item| item.value.trim().to_string())
+        .unwrap_or_else(|| services.memory.file_path().display().to_string());
+    services.memory.reconfigure(
+        &crate::config::AiMemoryConfig {
+            enabled: memory_enabled,
+            user_memory_file: memory_file,
+        },
+        services.executable_dir,
+    )?;
+    state.memory_ui = build_memory_ui_state(services.memory);
     if let Some(field) = state
         .config_ui
         .fields
@@ -12075,12 +12662,18 @@ fn config_select_by_mouse(layout: UiLayout, mouse: MouseEvent, state: &mut ChatU
         return;
     }
     let (category_rect, fields_rect) = config_panel_regions(layout);
-    if rect_contains(category_rect, mouse.column, mouse.row) {
-        let inner = category_rect.inner(ratatui::layout::Margin {
-            horizontal: 1,
-            vertical: 1,
-        });
-        let idx = mouse.row.saturating_sub(inner.y) as usize;
+    let category_body = panel_body_rect(category_rect);
+    if rect_contains(category_body, mouse.column, mouse.row) {
+        let viewport = list_viewport(
+            state.config_ui.categories.len(),
+            state.config_ui.selected_category,
+            category_body.height as usize,
+        );
+        let row = mouse.row.saturating_sub(category_body.y) as usize;
+        if row >= viewport.visible_len {
+            return;
+        }
+        let idx = viewport.offset + row;
         if idx < state.config_ui.categories.len() {
             state.config_ui.selected_category = idx;
             state.config_ui.selected_field_row = 0;
@@ -12088,20 +12681,22 @@ fn config_select_by_mouse(layout: UiLayout, mouse: MouseEvent, state: &mut ChatU
         }
         return;
     }
-    if rect_contains(fields_rect, mouse.column, mouse.row) {
-        let inner = fields_rect.inner(ratatui::layout::Margin {
-            horizontal: 1,
-            vertical: 1,
-        });
-        if mouse.row <= inner.y {
+    let fields_data = table_data_rect(fields_rect);
+    if rect_contains(fields_data, mouse.column, mouse.row) {
+        let row = mouse.row.saturating_sub(fields_data.y) as usize;
+        let visible = config_visible_field_indices(state);
+        if visible.is_empty() {
             return;
         }
-        let row = mouse.row.saturating_sub(inner.y + 1) as usize;
-        let len = config_visible_field_indices(state).len();
-        if len == 0 {
+        let viewport = list_viewport(
+            visible.len(),
+            state.config_ui.selected_field_row,
+            fields_data.height as usize,
+        );
+        if row >= viewport.visible_len {
             return;
         }
-        state.config_ui.selected_field_row = row.min(len - 1);
+        state.config_ui.selected_field_row = viewport.offset + row;
         state.config_ui.editing = false;
     }
 }
@@ -12129,7 +12724,7 @@ fn mcp_panel_regions(layout: UiLayout) -> (Rect, Rect) {
         .split(inner);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(28), Constraint::Min(20)])
+        .constraints([Constraint::Length(28), Constraint::Min(26)])
         .split(rows[1]);
     let right_rows = Layout::default()
         .direction(Direction::Vertical)
@@ -12639,36 +13234,83 @@ fn mcp_select_by_mouse(layout: UiLayout, mouse: MouseEvent, state: &mut ChatUiSt
         return;
     }
     let (servers_rect, fields_rect) = mcp_panel_regions(layout);
-    if rect_contains(servers_rect, mouse.column, mouse.row) {
-        let inner = servers_rect.inner(ratatui::layout::Margin {
-            horizontal: 1,
-            vertical: 1,
-        });
-        let idx = mouse.row.saturating_sub(inner.y) as usize;
-        if idx < state.mcp_ui.servers.len() {
+    let servers_body = panel_body_rect(servers_rect);
+    if rect_contains(servers_body, mouse.column, mouse.row) {
+        let row = mouse.row.saturating_sub(servers_body.y) as usize;
+        if let Some(idx) = visible_list_index(
+            state.mcp_ui.servers.len(),
+            state.mcp_ui.selected_server,
+            servers_body.height as usize,
+            row,
+        ) {
             state.mcp_ui.selected_server = idx;
             state.mcp_ui.focus_servers = true;
             state.mcp_ui.editing = false;
         }
         return;
     }
-    if rect_contains(fields_rect, mouse.column, mouse.row) {
-        let inner = fields_rect.inner(ratatui::layout::Margin {
-            horizontal: 1,
-            vertical: 1,
-        });
-        if mouse.row <= inner.y {
-            return;
+    let fields_data = table_data_rect(fields_rect);
+    if rect_contains(fields_data, mouse.column, mouse.row) {
+        let row = mouse.row.saturating_sub(fields_data.y) as usize;
+        if let Some(idx) = visible_list_index(
+            mcp_field_defs().len(),
+            state.mcp_ui.selected_field,
+            fields_data.height as usize,
+            row,
+        ) {
+            state.mcp_ui.selected_field = idx;
+            state.mcp_ui.focus_servers = false;
+            state.mcp_ui.editing = false;
         }
-        let row = mouse.row.saturating_sub(inner.y + 1) as usize;
-        let len = mcp_field_defs().len();
-        if len == 0 {
-            return;
-        }
-        state.mcp_ui.selected_field = row.min(len - 1);
-        state.mcp_ui.focus_servers = false;
-        state.mcp_ui.editing = false;
     }
+}
+
+fn memory_select_by_mouse(layout: UiLayout, mouse: MouseEvent, state: &mut ChatUiState) {
+    if state.mode != UiMode::Memory {
+        return;
+    }
+    let inner = layout.conversation.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(8)])
+        .split(inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(30), Constraint::Min(26)])
+        .split(rows[1]);
+    let list_body = panel_body_rect(cols[0]);
+    if !rect_contains(list_body, mouse.column, mouse.row) {
+        return;
+    }
+    let row = mouse.row.saturating_sub(list_body.y) as usize;
+    if let Some(idx) = visible_list_index(
+        state.memory_ui.items.len(),
+        state.memory_ui.selected_row,
+        list_body.height as usize,
+        row,
+    ) {
+        state.memory_ui.selected_row = idx;
+    }
+}
+
+fn thread_index_from_mouse(
+    layout: UiLayout,
+    mouse: MouseEvent,
+    state: &ChatUiState,
+) -> Option<usize> {
+    if !rect_contains(layout.threads_body, mouse.column, mouse.row) {
+        return None;
+    }
+    let row = mouse.row.saturating_sub(layout.threads_body.y) as usize;
+    visible_list_index(
+        state.threads.len(),
+        state.thread_selected,
+        layout.threads_body.height as usize,
+        row,
+    )
 }
 
 fn mcp_scroll_by_mouse(layout: UiLayout, mouse: MouseEvent, state: &mut ChatUiState, delta: i16) {
@@ -12856,7 +13498,11 @@ fn raw_data_modal_copy_button_data(layout: UiLayout) -> Option<ThreadRenameClear
     let modal = raw_data_modal_rect(layout);
     let body = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(8),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .margin(1)
         .split(modal);
     let button_row = body[1];
@@ -12929,7 +13575,11 @@ fn raw_data_modal_scroll_max(modal: &mut RawDataModalState, layout: UiLayout) ->
     });
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(8),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
     let text_width = rows[0].width.saturating_sub(2).max(1) as usize;
     let viewport_height = rows[0].height.saturating_sub(2).max(1) as usize;
@@ -16762,6 +17412,9 @@ fn ui_text_nav_mcp() -> &'static str {
 fn ui_text_nav_inspect() -> &'static str {
     zh_or_en("巡检", "Inspect")
 }
+fn ui_text_nav_memory() -> &'static str {
+    zh_or_en("记忆", "Memory")
+}
 fn ui_text_nav_config() -> &'static str {
     zh_or_en("配置", "Config")
 }
@@ -16858,6 +17511,63 @@ fn ui_text_mcp_empty() -> &'static str {
 fn ui_text_mcp_empty_fields() -> &'static str {
     zh_or_en("请先选择 MCP 服务", "Select an MCP server first")
 }
+fn ui_text_memory_panel_title() -> &'static str {
+    zh_or_en("用户记忆", "User Memory")
+}
+fn ui_text_memory_panel_ready() -> &'static str {
+    zh_or_en("已切换到用户记忆页面", "Switched to user memory panel")
+}
+fn ui_text_memory_list_title() -> &'static str {
+    zh_or_en("记忆列表", "Memory List")
+}
+fn ui_text_memory_detail_title() -> &'static str {
+    zh_or_en("记忆详情", "Memory Detail")
+}
+fn ui_text_memory_input_hint() -> &'static str {
+    zh_or_en(
+        "Enter/E编辑, A新增, D删除, R重载",
+        "Enter/E edit, A add, D delete, R reload",
+    )
+}
+fn ui_text_memory_help() -> &'static str {
+    zh_or_en(
+        "通过外部编辑器编辑 JSON：{\"content\":\"...\",\"tags\":[\"...\"]}",
+        "Edit JSON in external editor: {\"content\":\"...\",\"tags\":[\"...\"]}",
+    )
+}
+fn ui_text_memory_status() -> &'static str {
+    zh_or_en("状态", "Status")
+}
+fn ui_text_memory_count() -> &'static str {
+    zh_or_en("数量", "Count")
+}
+fn ui_text_memory_empty() -> &'static str {
+    zh_or_en(
+        "暂无用户记忆，按 A 新增",
+        "No user memory yet, press A to add",
+    )
+}
+fn ui_text_memory_added() -> &'static str {
+    zh_or_en("用户记忆已新增", "User memory added")
+}
+fn ui_text_memory_updated() -> &'static str {
+    zh_or_en("用户记忆已更新", "User memory updated")
+}
+fn ui_text_memory_deleted() -> &'static str {
+    zh_or_en("用户记忆已删除", "User memory deleted")
+}
+fn ui_text_memory_reloaded() -> &'static str {
+    zh_or_en("用户记忆已重载", "User memory reloaded")
+}
+fn ui_text_memory_edit_cancelled() -> &'static str {
+    zh_or_en("已取消记忆编辑", "Memory edit cancelled")
+}
+fn ui_text_enabled() -> &'static str {
+    zh_or_en("已启用", "enabled")
+}
+fn ui_text_disabled() -> &'static str {
+    zh_or_en("已禁用", "disabled")
+}
 fn ui_text_config_panel_title() -> &'static str {
     zh_or_en("配置管理", "Configuration")
 }
@@ -16932,6 +17642,9 @@ fn ui_text_config_category_ai_chat() -> &'static str {
 }
 fn ui_text_config_category_ai_compression() -> &'static str {
     zh_or_en("聊天压缩", "Chat Compression")
+}
+fn ui_text_config_category_ai_memory() -> &'static str {
+    zh_or_en("用户记忆", "User Memory")
 }
 fn ui_text_config_category_ai_tools_bash() -> &'static str {
     zh_or_en("AI工具(Bash)", "AI Tools (Bash)")
@@ -17297,8 +18010,8 @@ fn ui_text_footer_help() -> &'static str {
 }
 fn ui_text_help_commands() -> &'static str {
     zh_or_en(
-        "命令: /help /stats /meta /skills /mcps /new /list /change <id|name> /name <new-name> /history [n] /clear /exit",
-        "Commands: /help /stats /meta /skills /mcps /new /list /change <id|name> /name <new-name> /history [n] /clear /exit",
+        "命令: /help /stats /meta /skills /mcps /new /list /change <id|name> /name <new-name> /history [n] /clear /exit；TUI 侧栏含记忆面板",
+        "Commands: /help /stats /meta /skills /mcps /new /list /change <id|name> /name <new-name> /history [n] /clear /exit; TUI sidebar includes Memory panel",
     )
 }
 fn ui_text_focus_hint(focus: FocusPanel) -> &'static str {
@@ -17765,6 +18478,7 @@ fn ui_mode_label(mode: UiMode) -> &'static str {
         UiMode::Chat => zh_or_en("聊天", "Chat"),
         UiMode::Skills => zh_or_en("技能", "Skills"),
         UiMode::Mcp => "MCP",
+        UiMode::Memory => zh_or_en("记忆", "Memory"),
         UiMode::Inspect => zh_or_en("巡检", "Inspect"),
         UiMode::Config => zh_or_en("配置", "Config"),
     }
@@ -17806,7 +18520,11 @@ model = "test-model"
     }
 
     fn new_state() -> ChatUiState {
-        let cfg = test_cfg();
+        let mut cfg = test_cfg();
+        cfg.ai.memory.user_memory_file =
+            format!(".machineclaw/test-memory-{}.json", uuid::Uuid::new_v4());
+        let memory = UserMemoryManager::load(&cfg.ai.memory, Path::new("/tmp"))
+            .expect("create test memory manager");
         ChatUiState::new(
             Vec::new(),
             Vec::new(),
@@ -17815,6 +18533,7 @@ model = "test-model"
             PathBuf::from("/tmp/ui-preferences.json"),
             &cfg,
             Path::new("/tmp/claw.toml"),
+            &memory,
         )
     }
 
@@ -18000,13 +18719,15 @@ model = "test-model"
         };
 
         assert!(try_handle_pending_ai_stop_button_click(
-            &mut state,
-            layout,
-            mouse,
-            &flag,
+            &mut state, layout, mouse, &flag,
         ));
         assert!(flag.load(Ordering::SeqCst));
-        assert!(state.ai_live.as_ref().is_some_and(|live| live.cancel_requested));
+        assert!(
+            state
+                .ai_live
+                .as_ref()
+                .is_some_and(|live| live.cancel_requested)
+        );
         assert_eq!(state.status, ui_text_status_ai_cancelling());
 
         i18n::set_language(previous_language);
@@ -18020,16 +18741,21 @@ model = "test-model"
         let state = new_state();
         let layout = compute_layout(Rect::new(0, 0, 160, 42));
         let buttons = chat_input_action_buttons(&state, layout, mode_button_area(layout));
-        let mode_rect = chat_input_action_button_hit_rect(&buttons, ChatInputActionKind::ModeToggle)
-            .expect("mode hit rect should exist");
-        let tracking_rect = chat_input_action_button_hit_rect(&buttons, ChatInputActionKind::TrackingToggle)
-            .expect("tracking hit rect should exist");
-        let clear_rect = chat_input_action_button_hit_rect(&buttons, ChatInputActionKind::ClearInput)
-            .expect("clear hit rect should exist");
+        let mode_rect =
+            chat_input_action_button_hit_rect(&buttons, ChatInputActionKind::ModeToggle)
+                .expect("mode hit rect should exist");
+        let tracking_rect =
+            chat_input_action_button_hit_rect(&buttons, ChatInputActionKind::TrackingToggle)
+                .expect("tracking hit rect should exist");
+        let clear_rect =
+            chat_input_action_button_hit_rect(&buttons, ChatInputActionKind::ClearInput)
+                .expect("clear hit rect should exist");
 
         let mode_kind = chat_input_action_button_at(
             &buttons,
-            mode_rect.x.saturating_add(mode_rect.width.saturating_sub(2)),
+            mode_rect
+                .x
+                .saturating_add(mode_rect.width.saturating_sub(2)),
             mode_rect.y,
         )
         .expect("mode hit should resolve");
@@ -18037,7 +18763,9 @@ model = "test-model"
 
         let tracking_kind = chat_input_action_button_at(
             &buttons,
-            tracking_rect.x.saturating_add(tracking_rect.width.saturating_sub(2)),
+            tracking_rect
+                .x
+                .saturating_add(tracking_rect.width.saturating_sub(2)),
             tracking_rect.y,
         )
         .expect("tracking hit should resolve");
@@ -18045,7 +18773,9 @@ model = "test-model"
 
         let clear_kind = chat_input_action_button_at(
             &buttons,
-            clear_rect.x.saturating_add(clear_rect.width.saturating_sub(2)),
+            clear_rect
+                .x
+                .saturating_add(clear_rect.width.saturating_sub(2)),
             clear_rect.y,
         )
         .expect("clear hit should resolve");
@@ -18313,7 +19043,7 @@ model = "test-model"
             started_at_epoch_ms: 50,
             finished_at_epoch_ms: 90,
         })
-            .expect("send check result");
+        .expect("send check result");
         let mut handle = Some(AiConnectivityCheckHandle { rx });
 
         poll_ai_connectivity_check(&mut handle, &mut state);
@@ -18374,7 +19104,10 @@ model = "test-model"
             payload.get("request_url").and_then(|v| v.as_str()),
             Some("https://example.invalid/v1/chat/completions")
         );
-        assert_eq!(payload.get("duration_ms").and_then(|v| v.as_u64()), Some(20));
+        assert_eq!(
+            payload.get("duration_ms").and_then(|v| v.as_u64()),
+            Some(20)
+        );
     }
 
     #[test]
@@ -18562,6 +19295,139 @@ model = "test-model"
         mcp_select_by_mouse(layout, mouse, &mut state);
         assert_eq!(state.mcp_ui.selected_server, 0);
         assert!(state.mcp_ui.focus_servers);
+    }
+
+    #[test]
+    fn thread_mouse_click_uses_visible_offset() {
+        let mut state = new_state();
+        state.threads = (0..18)
+            .map(|idx| mock_overview(&format!("thread-{idx}"), &format!("Thread {idx}"), idx == 0))
+            .collect();
+        state.thread_selected = state.threads.len().saturating_sub(1);
+        let layout = compute_layout(Rect::new(0, 0, 120, 24));
+        let viewport = list_viewport(
+            state.threads.len(),
+            state.thread_selected,
+            layout.threads_body.height as usize,
+        );
+        assert!(viewport.offset > 0);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: layout.threads_body.x,
+            row: layout.threads_body.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let idx =
+            thread_index_from_mouse(layout, mouse, &state).expect("thread row should resolve");
+
+        assert_eq!(idx, viewport.offset);
+    }
+
+    #[test]
+    fn skills_like_table_click_uses_visible_offset() {
+        let viewport = list_viewport(14, 13, 5);
+        assert!(viewport.offset > 0);
+        let idx = visible_table_index(14, 13, 5, 1).expect("first visible data row should resolve");
+        assert_eq!(idx, viewport.offset);
+    }
+
+    #[test]
+    fn mcp_mouse_click_uses_visible_server_offset() {
+        let mut state = new_state();
+        state.mode = UiMode::Mcp;
+        state.mcp_ui.servers = (0..16)
+            .map(|idx| McpUiServer {
+                name: format!("srv-{idx}"),
+                config: McpServerConfig::default(),
+                dirty: false,
+            })
+            .collect();
+        state.mcp_ui.selected_server = state.mcp_ui.servers.len().saturating_sub(1);
+        let layout = compute_layout(Rect::new(0, 0, 120, 24));
+        let (servers_rect, _) = mcp_panel_regions(layout);
+        let viewport = list_viewport(
+            state.mcp_ui.servers.len(),
+            state.mcp_ui.selected_server,
+            list_viewport_rows(servers_rect),
+        );
+        assert!(viewport.offset > 0);
+        let inner = servers_rect.inner(ratatui::layout::Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x,
+            row: inner.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        mcp_select_by_mouse(layout, mouse, &mut state);
+
+        assert_eq!(state.mcp_ui.selected_server, viewport.offset);
+    }
+
+    #[test]
+    fn mcp_server_border_click_does_not_change_selection() {
+        let mut state = new_state();
+        state.mode = UiMode::Mcp;
+        state.mcp_ui.servers = (0..16)
+            .map(|idx| McpUiServer {
+                name: format!("srv-{idx}"),
+                config: McpServerConfig::default(),
+                dirty: false,
+            })
+            .collect();
+        state.mcp_ui.selected_server = state.mcp_ui.servers.len().saturating_sub(1);
+        let layout = compute_layout(Rect::new(0, 0, 120, 24));
+        let (servers_rect, _) = mcp_panel_regions(layout);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: servers_rect.x,
+            row: servers_rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        mcp_select_by_mouse(layout, mouse, &mut state);
+
+        assert_eq!(state.mcp_ui.selected_server, state.mcp_ui.servers.len() - 1);
+    }
+
+    #[test]
+    fn mcp_mouse_click_uses_visible_field_offset() {
+        let mut state = new_state();
+        state.mode = UiMode::Mcp;
+        state.mcp_ui.servers = vec![McpUiServer {
+            name: "srv-a".to_string(),
+            config: McpServerConfig::default(),
+            dirty: false,
+        }];
+        state.mcp_ui.selected_server = 0;
+        state.mcp_ui.selected_field = mcp_field_defs().len().saturating_sub(1);
+        let layout = compute_layout(Rect::new(0, 0, 120, 24));
+        let (_, fields_rect) = mcp_panel_regions(layout);
+        let viewport = list_viewport(
+            mcp_field_defs().len(),
+            state.mcp_ui.selected_field,
+            table_viewport_rows(fields_rect),
+        );
+        assert!(viewport.offset > 0);
+        let inner = fields_rect.inner(ratatui::layout::Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x,
+            row: inner.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        };
+
+        mcp_select_by_mouse(layout, mouse, &mut state);
+
+        assert_eq!(state.mcp_ui.selected_field, viewport.offset);
+        assert!(!state.mcp_ui.focus_servers);
     }
 
     #[test]
@@ -18998,7 +19864,10 @@ model = "test-model"
         let raw_rect = buttons.raw_data_rect.expect("raw button should exist");
         assert_eq!(buttons.delete_rect.y, raw_rect.y);
         assert_eq!(
-            buttons.delete_rect.x.saturating_add(buttons.delete_rect.width),
+            buttons
+                .delete_rect
+                .x
+                .saturating_add(buttons.delete_rect.width),
             raw_rect.x
         );
     }
@@ -19023,7 +19892,10 @@ model = "test-model"
             row: layout.conversation_body.y.saturating_add(spacer_idx as u16),
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(hovered_message_index_from_mouse(&state, layout, mouse), Some(0));
+        assert_eq!(
+            hovered_message_index_from_mouse(&state, layout, mouse),
+            Some(0)
+        );
     }
 
     #[test]
@@ -19039,17 +19911,22 @@ model = "test-model"
         let buttons =
             conversation_hover_buttons_data(&state, layout).expect("hover buttons should exist");
         let raw_rect = buttons.raw_data_rect.expect("raw data button should exist");
-        let copy_center_x = buttons.copy_rect.x.saturating_add(buttons.copy_rect.width / 2);
+        let copy_center_x = buttons
+            .copy_rect
+            .x
+            .saturating_add(buttons.copy_rect.width / 2);
         let delete_center_x = buttons
             .delete_rect
             .x
             .saturating_add(buttons.delete_rect.width / 2);
         let raw_center_x = raw_rect.x.saturating_add(raw_rect.width / 2);
-        let copy_action = conversation_hover_action_at(&state, layout, copy_center_x, buttons.copy_rect.y)
-            .expect("copy center should map to copy button");
+        let copy_action =
+            conversation_hover_action_at(&state, layout, copy_center_x, buttons.copy_rect.y)
+                .expect("copy center should map to copy button");
         assert_eq!(copy_action.kind, ConversationHoverActionKind::Copy);
-        let delete_action = conversation_hover_action_at(&state, layout, delete_center_x, buttons.delete_rect.y)
-            .expect("delete center should map to delete button");
+        let delete_action =
+            conversation_hover_action_at(&state, layout, delete_center_x, buttons.delete_rect.y)
+                .expect("delete center should map to delete button");
         assert_eq!(delete_action.kind, ConversationHoverActionKind::Delete);
         let raw_action = conversation_hover_action_at(&state, layout, raw_center_x, raw_rect.y)
             .expect("raw center should map to raw button");
@@ -19106,16 +19983,24 @@ model = "test-model"
             buttons.delete_rect.x
         );
         assert_eq!(
-            buttons.delete_rect.x.saturating_add(buttons.delete_rect.width),
+            buttons
+                .delete_rect
+                .x
+                .saturating_add(buttons.delete_rect.width),
             raw_rect.x
         );
         let standard_result_x = result_rect.x.saturating_add(result_rect.width / 2);
-        let result_action = conversation_hover_action_at(&state, layout, standard_result_x, buttons.copy_rect.y)
-            .expect("standard result center should map to result");
+        let result_action =
+            conversation_hover_action_at(&state, layout, standard_result_x, buttons.copy_rect.y)
+                .expect("standard result center should map to result");
         assert_eq!(result_action.kind, ConversationHoverActionKind::ToolResult);
-        let delete_x = buttons.delete_rect.x.saturating_add(buttons.delete_rect.width / 2);
-        let delete_action = conversation_hover_action_at(&state, layout, delete_x, buttons.copy_rect.y)
-            .expect("delete center should map to delete");
+        let delete_x = buttons
+            .delete_rect
+            .x
+            .saturating_add(buttons.delete_rect.width / 2);
+        let delete_action =
+            conversation_hover_action_at(&state, layout, delete_x, buttons.copy_rect.y)
+                .expect("delete center should map to delete");
         assert_eq!(delete_action.kind, ConversationHoverActionKind::Delete);
         let raw_x = raw_rect.x.saturating_add(raw_rect.width / 2);
         let raw_action = conversation_hover_action_at(&state, layout, raw_x, buttons.copy_rect.y)
@@ -20071,6 +20956,102 @@ model = "test-model"
     }
 
     #[test]
+    fn config_mouse_click_uses_visible_category_offset() {
+        let mut state = new_state();
+        state.mode = UiMode::Config;
+        state.config_ui.selected_category = state.config_ui.categories.len().saturating_sub(1);
+        let layout = compute_layout(Rect::new(0, 0, 120, 24));
+        let (category_rect, _) = config_panel_regions(layout);
+        let category_inner = category_rect.inner(ratatui::layout::Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        let viewport = list_viewport(
+            state.config_ui.categories.len(),
+            state.config_ui.selected_category,
+            config_category_viewport_rows(category_rect),
+        );
+        assert!(viewport.offset > 0);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: category_inner.x,
+            row: category_inner.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        config_select_by_mouse(layout, mouse, &mut state);
+
+        assert_eq!(
+            state.config_ui.categories[state.config_ui.selected_category].id,
+            state.config_ui.categories[viewport.offset].id
+        );
+    }
+
+    #[test]
+    fn config_category_border_click_does_not_change_selection() {
+        let mut state = new_state();
+        state.mode = UiMode::Config;
+        state.config_ui.selected_category = state.config_ui.categories.len().saturating_sub(1);
+        let layout = compute_layout(Rect::new(0, 0, 120, 24));
+        let (category_rect, _) = config_panel_regions(layout);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: category_rect.x,
+            row: category_rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        config_select_by_mouse(layout, mouse, &mut state);
+
+        assert_eq!(
+            state.config_ui.selected_category,
+            state.config_ui.categories.len() - 1
+        );
+    }
+
+    #[test]
+    fn config_mouse_click_uses_visible_field_offset() {
+        let mut state = new_state();
+        state.mode = UiMode::Config;
+        state.config_ui.selected_category = state
+            .config_ui
+            .categories
+            .iter()
+            .position(|item| item.id == "ai")
+            .expect("ai category should exist");
+        let visible = config_visible_field_indices(&state);
+        let layout = compute_layout(Rect::new(0, 0, 120, 24));
+        let (_, fields_rect) = config_panel_regions(layout);
+        let viewport_rows = config_field_viewport_rows(fields_rect);
+        assert!(visible.len() > viewport_rows);
+        state.config_ui.selected_field_row = visible.len().saturating_sub(1);
+        let viewport = list_viewport(
+            visible.len(),
+            state.config_ui.selected_field_row,
+            viewport_rows,
+        );
+        let fields_inner = fields_rect.inner(ratatui::layout::Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: fields_inner.x,
+            row: fields_inner.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        };
+
+        config_select_by_mouse(layout, mouse, &mut state);
+
+        assert_eq!(state.config_ui.selected_field_row, viewport.offset);
+        assert_eq!(
+            state.config_ui.fields[config_selected_field_index(&state).expect("selected field")]
+                .key,
+            state.config_ui.fields[visible[viewport.offset]].key
+        );
+    }
+
+    #[test]
     fn parse_config_enum_rejects_unknown_value() {
         let field = ConfigField {
             key: "ai.chat.model-price-check-mode".to_string(),
@@ -20189,7 +21170,9 @@ model = "test-model"
     #[test]
     fn user_cancelled_ai_error_detection_matches_i18n_texts() {
         assert!(is_user_cancelled_ai_error(i18n::chat_ai_cancel_requested()));
-        assert!(is_user_cancelled_ai_error(i18n::chat_ai_cancelled_by_shortcut()));
+        assert!(is_user_cancelled_ai_error(
+            i18n::chat_ai_cancelled_by_shortcut()
+        ));
         assert!(is_user_cancelled_ai_error(
             format!("  {}  ", i18n::chat_ai_cancel_requested()).as_str()
         ));

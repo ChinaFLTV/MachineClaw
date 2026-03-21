@@ -38,6 +38,7 @@ use crate::{
     i18n, logging,
     mask::mask_sensitive,
     mcp::{self, McpManager},
+    memory::UserMemoryManager,
     platform::OsType,
     render::{self, ActionRenderData},
     shell::{CommandMode, CommandResult, CommandSpec, ShellExecutor, note_interactive_input_wait},
@@ -47,6 +48,7 @@ use crate::{
 pub struct ActionServices<'a> {
     pub cfg: &'a AppConfig,
     pub config_path: &'a Path,
+    pub executable_dir: &'a Path,
     pub assets_dir: &'a Path,
     pub shell: &'a ShellExecutor,
     pub ai: &'a AiClient,
@@ -54,6 +56,7 @@ pub struct ActionServices<'a> {
     pub os_type: OsType,
     pub os_name: &'a str,
     pub skills: &'a [String],
+    pub memory: &'a mut UserMemoryManager,
     pub mcp_summary: String,
     pub mcp: &'a mut McpManager,
 }
@@ -310,12 +313,12 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
     reset_queued_async_chat_notices();
 
     let base_system_prompt = render::load_prompt_template(services.assets_dir, "chat_system.md")?;
-    let system_prompt = build_chat_system_prompt(
+    let startup_system_prompt = build_chat_system_prompt(
         services,
         &base_system_prompt,
         services.cfg.ai.chat.mode.as_str(),
     );
-    maybe_ensure_chat_environment_profile(services, &system_prompt)?;
+    maybe_ensure_chat_environment_profile(services, &startup_system_prompt)?;
     let chat_input_waiting = Arc::new(AtomicBool::new(false));
     maybe_prepare_chat_model_price(services, chat_input_waiting.clone());
     let mut async_mcp_connect_rx =
@@ -486,7 +489,15 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
                             pending_message = None;
                             last_assistant_reply.clear();
                             autosave_worker.submit_from_session(services.session);
-                            maybe_ensure_chat_environment_profile(services, &system_prompt)?;
+                            let switched_system_prompt = build_chat_system_prompt(
+                                services,
+                                &base_system_prompt,
+                                services.cfg.ai.chat.mode.as_str(),
+                            );
+                            maybe_ensure_chat_environment_profile(
+                                services,
+                                &switched_system_prompt,
+                            )?;
                             autosave_worker.submit_from_session(services.session);
                             println!(
                                 "{}",
@@ -540,7 +551,12 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
                     pending_message = None;
                     last_assistant_reply.clear();
                     autosave_worker.submit_from_session(services.session);
-                    maybe_ensure_chat_environment_profile(services, &system_prompt)?;
+                    let new_session_system_prompt = build_chat_system_prompt(
+                        services,
+                        &base_system_prompt,
+                        services.cfg.ai.chat.mode.as_str(),
+                    );
+                    maybe_ensure_chat_environment_profile(services, &new_session_system_prompt)?;
                     autosave_worker.submit_from_session(services.session);
                     println!(
                         "{}",
@@ -597,6 +613,11 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
 
         let group_id = Uuid::new_v4().to_string();
         chat_turns += 1;
+        let system_prompt = build_chat_system_prompt(
+            services,
+            &base_system_prompt,
+            services.cfg.ai.chat.mode.as_str(),
+        );
         services
             .session
             .add_user_message(message.clone(), Some(group_id.clone()));
@@ -643,7 +664,7 @@ fn run_chat_legacy(services: &mut ActionServices<'_>) -> Result<ActionOutcome, A
             chat_input_waiting.as_ref(),
         );
         logging::info("AI chat start");
-        let history = services.session.build_chat_history();
+        let history = services.session.build_chat_message_history();
         let mut external_tools: Vec<ExternalToolDefinition> =
             builtin_tools::external_tool_definitions(&services.cfg.ai.tools.builtin);
         if services.cfg.ai.tools.mcp.enabled {
@@ -3460,6 +3481,16 @@ pub(crate) fn build_chat_system_prompt(
     } else {
         prompt.push_str("\n[Interaction Mode]\n- mode=chat\n- Keep direct conversational workflow. Use tools only when they improve correctness or are explicitly required.\n");
     }
+    prompt.push('\n');
+    prompt.push_str(&services.memory.render_prompt_section());
+    prompt.push('\n');
+    prompt.push_str("[Recent Conversations Summary]\n");
+    if let Some(summary) = services.session.recent_conversations_summary_for_prompt() {
+        prompt.push_str(summary.as_str());
+        prompt.push('\n');
+    } else {
+        prompt.push_str("- none\n");
+    }
     prompt
 }
 
@@ -4563,14 +4594,13 @@ fn read_cmd(label: &str, command: &str) -> CommandSpec {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatAutosaveSnapshot, display_width, flush_chat_autosave_snapshot,
-        count_task_plan_steps_in_group,
-        format_chat_mcps_markdown, format_chat_session_list_markdown, format_chat_skills_markdown,
-        format_fixed_table_with_options, is_cancel_shortcut_csi_sequence,
-        is_cancel_shortcut_escape_sequence, is_chat_cancel_shortcut_bytes,
-        normalize_builtin_command_alias, normalize_history_content, parse_builtin_command,
-        parse_chat_history_limit, render_async_chat_notice_output, resolve_chat_mode,
-        strip_ansi_escape_sequences,
+        ChatAutosaveSnapshot, count_task_plan_steps_in_group, display_width,
+        flush_chat_autosave_snapshot, format_chat_mcps_markdown, format_chat_session_list_markdown,
+        format_chat_skills_markdown, format_fixed_table_with_options,
+        is_cancel_shortcut_csi_sequence, is_cancel_shortcut_escape_sequence,
+        is_chat_cancel_shortcut_bytes, normalize_builtin_command_alias, normalize_history_content,
+        parse_builtin_command, parse_chat_history_limit, render_async_chat_notice_output,
+        resolve_chat_mode, strip_ansi_escape_sequences,
     };
     use crate::ai::ToolUsePolicy;
     use crate::context::{MessageKind, SessionMessage};
@@ -4670,7 +4700,10 @@ mod tests {
                 tool_meta: None,
             },
         ];
-        assert_eq!(count_task_plan_steps_in_group(messages.as_slice(), group_id), 2);
+        assert_eq!(
+            count_task_plan_steps_in_group(messages.as_slice(), group_id),
+            2
+        );
     }
 
     #[test]

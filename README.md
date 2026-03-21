@@ -171,6 +171,7 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 - `[app]`：语言、主题、环境模式（`prod/test/dev`）
 - `[ai]`：协议类型（`type`）、API 地址、Token、模型、重试
 - `[ai.chat]`：chat 行为、交互模式（`chat/task`）、工具显示、压缩、超时、轮次上限
+- `[ai.memory]`：用户记忆开关与持久化文件位置
 - `[ai.tools.builtin]`：Claude 风格内置工具（View/LS/GlobTool/GrepTool/WebSearch/Think/Task/Architect）及写入型工具开关
 - `[ai.tools.bash]`：Bash 工具的命令超时、写命令确认、allow/deny 规则
 - `[ai.tools.skills]`：Skills 目录与开关
@@ -214,6 +215,35 @@ mode = "chat" # chat | task，默认 chat
 - TUI 输入区底部可临时切换 Chat/Task；该切换仅对当前运行有效，不会写回配置文件。
 - TUI 输入区底部提供“消息跟踪”与“下滑至底部”按钮：关闭跟踪后不会因新消息自动拉到底部，可随时一键回到底部；开启跟踪后会持续跟随最新消息。
 - TUI 会话区会显示 Task List（状态、进度）并在会话元数据弹窗展示任务目录/统计/最近任务。
+
+### 用户记忆配置建议
+
+```toml
+[ai.memory]
+enabled = true # optional, default true
+user-memory-file = ".machineclaw/memory/user-memory.json" # optional, default executable_dir/.machineclaw/memory/user-memory.json
+```
+
+- `enabled = false` 时，不会将用户记忆注入聊天上下文，但仍可继续管理记忆文件。
+- `user-memory-file` 支持相对路径；相对路径会以“当前程序所在目录”作为基准进行解析。
+- 用户记忆会在系统提示词中以 `[User Memory]` 段注入，位置位于 `[System Instructions]` 之后、`[Recent Conversations Summary]` 之前。
+- 记忆文件是一个 JSON 数组；每条记录包含 `id`、`created_at`、`type`、`content`、`tags`。
+- `type` 当前固定为 `user`；`id` 由程序自动生成 UUID；`tags` 支持一条记忆挂多个标签。
+- 程序会对用户记忆做有序组织，并仅在与当前请求相关时使用；若当前请求与旧记忆冲突，应以当前请求为准。
+
+示例：
+
+```json
+[
+  {
+    "id": "9c395fa4-91f0-48b4-9df0-4c36c1f4ec9a",
+    "created_at": "2026-03-22T01:14:11Z",
+    "type": "user",
+    "content": "用户偏好简洁回复，涉及 Rust 代码时优先给出可直接落地的修改。",
+    "tags": ["style", "rust"]
+  }
+]
+```
 
 ### App 主题配置建议
 
@@ -319,6 +349,17 @@ MachineClaw [OPTIONS] <COMMAND>
   - `D`：删除当前服务
   - `Enter`：编辑/应用当前字段
   - `Ctrl+S`：保存到 MCP JSON 配置文件并刷新运行态 MCP 服务
+
+## TUI 用户记忆管理
+
+- 在 TUI 左侧导航中选择 `Memory`，可进入用户记忆页。
+- 在 TUI 配置页中，也可以直接编辑 `ai.memory.enabled` 与 `ai.memory.user-memory-file`。
+- 常用操作：
+  - `A`：新增一条用户记忆
+  - `Enter` / `E`：编辑当前记忆
+  - `D`：删除当前记忆
+  - `R`：从持久化 JSON 文件重载
+- 编辑时会调用外部编辑器，编辑内容为 JSON 载荷：`{"content":"...","tags":["..."]}`。
 
 ## 退出码
 

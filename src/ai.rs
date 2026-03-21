@@ -901,16 +901,13 @@ impl AiClient {
                             if let Some(cached) = tool_result_cache.get(&signature) {
                                 if tool_result_timed_out(cached) {
                                     timeout_total += 1;
-                                    let timeout_count = timeout_tool_counter
-                                        .entry(signature.clone())
-                                        .or_insert(0);
+                                    let timeout_count =
+                                        timeout_tool_counter.entry(signature.clone()).or_insert(0);
                                     *timeout_count += 1;
                                     if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
-                                        finalize_reason =
-                                            Some(ChatStopReason::RepeatedToolTimeout);
+                                        finalize_reason = Some(ChatStopReason::RepeatedToolTimeout);
                                     } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
-                                        finalize_reason =
-                                            Some(ChatStopReason::TooManyToolTimeouts);
+                                        finalize_reason = Some(ChatStopReason::TooManyToolTimeouts);
                                     }
                                 }
                                 cached.clone()
@@ -918,16 +915,13 @@ impl AiClient {
                                 let result = execute_tool(&request);
                                 if tool_result_timed_out(&result) {
                                     timeout_total += 1;
-                                    let timeout_count = timeout_tool_counter
-                                        .entry(signature.clone())
-                                        .or_insert(0);
+                                    let timeout_count =
+                                        timeout_tool_counter.entry(signature.clone()).or_insert(0);
                                     *timeout_count += 1;
                                     if *timeout_count > MAX_TIMEOUT_SAME_TOOL_CALL {
-                                        finalize_reason =
-                                            Some(ChatStopReason::RepeatedToolTimeout);
+                                        finalize_reason = Some(ChatStopReason::RepeatedToolTimeout);
                                     } else if timeout_total > MAX_TIMEOUT_TOOL_CALLS_TOTAL {
-                                        finalize_reason =
-                                            Some(ChatStopReason::TooManyToolTimeouts);
+                                        finalize_reason = Some(ChatStopReason::TooManyToolTimeouts);
                                     }
                                 }
                                 tool_result_cache.insert(signature.clone(), result.clone());
@@ -962,7 +956,8 @@ impl AiClient {
                             }
                         } else {
                             task_decomposition_guard_counter.remove(&signature);
-                            let count_entry = same_tool_counter.entry(signature.clone()).or_insert(0);
+                            let count_entry =
+                                same_tool_counter.entry(signature.clone()).or_insert(0);
                             *count_entry += 1;
                             if *count_entry > MAX_REPEAT_SAME_TOOL {
                                 finalize_reason = Some(ChatStopReason::RepeatedSameToolCall);
@@ -2321,9 +2316,8 @@ static DSML_PARAMETER_RE: Lazy<Regex> = Lazy::new(|| {
     )
     .expect("valid dsml parameter regex")
 });
-static ANSI_ESCAPE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("valid ansi escape regex")
-});
+static ANSI_ESCAPE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("valid ansi escape regex"));
 static AI_REQUEST_TRACE_FILE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Debug)]
@@ -3159,7 +3153,10 @@ fn tool_result_requires_task_decomposition(payload: &str) -> bool {
     value
         .get("error")
         .and_then(|item| item.as_str())
-        .is_some_and(|item| item.to_ascii_lowercase().contains("task decomposition is required"))
+        .is_some_and(|item| {
+            item.to_ascii_lowercase()
+                .contains("task decomposition is required")
+        })
 }
 
 fn build_base_messages(
@@ -3656,9 +3653,7 @@ fn sanitize_assistant_content(raw: &str) -> String {
     let no_ansi = strip_ansi_escape_sequences(raw);
     let normalized = normalize_dsml_markup(no_ansi.as_str());
     let cleaned = DSML_FUNCTION_CALLS_BLOCK_RE.replace_all(normalized.as_str(), "");
-    cleaned
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
+    cleaned.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn parse_dsml_tool_calls(raw: &str, round: usize) -> Vec<ToolCallRequest> {
@@ -3668,7 +3663,10 @@ fn parse_dsml_tool_calls(raw: &str, round: usize) -> Vec<ToolCallRequest> {
         return Vec::new();
     }
     let mut output = Vec::new();
-    for (idx, invoke_caps) in DSML_INVOKE_RE.captures_iter(normalized.as_str()).enumerate() {
+    for (idx, invoke_caps) in DSML_INVOKE_RE
+        .captures_iter(normalized.as_str())
+        .enumerate()
+    {
         let function_name_raw = invoke_caps
             .get(1)
             .map(|m| m.as_str().trim())
@@ -4753,11 +4751,12 @@ mod tests {
         model_prefers_non_streaming_tool_rounds, normalize_stepfun_chat_request,
         parse_claude_response_text, parse_dsml_tool_calls, parse_gemini_response_text,
         parse_model_price_catalog_response, parse_model_price_probe_response,
-        parse_rate_limit_retry_delay, price_probe_candidate_models, provider_protocol_from_config_type,
-        provider_requires_reasoning_content_omission, request_contains_reasoning_content,
-        resolve_effective_model_prices, should_fallback_to_non_streaming,
+        parse_rate_limit_retry_delay, price_probe_candidate_models,
+        provider_protocol_from_config_type, provider_requires_reasoning_content_omission,
+        request_contains_reasoning_content, resolve_effective_model_prices,
+        sanitize_assistant_content, should_fallback_to_non_streaming,
         should_refresh_http_client_after_reqwest_error, should_retry_without_reasoning_content,
-        should_write_direct_stdout, sanitize_assistant_content, strip_reasoning_content_from_request,
+        should_write_direct_stdout, strip_reasoning_content_from_request,
         tool_result_requires_task_decomposition, with_cost,
     };
     use crate::{ai::ToolCallRequest, error::AppError, tls::ensure_rustls_crypto_provider};

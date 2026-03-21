@@ -10,6 +10,7 @@ mod i18n;
 mod logging;
 mod mask;
 mod mcp;
+mod memory;
 mod platform;
 mod render;
 mod shell;
@@ -50,6 +51,7 @@ use crate::{
     error::{AppError, ExitCode},
     i18n::{language_code, localize_error, parse_language, resolve_language, set_language},
     mcp::{mcp_summary, validate_mcp_config},
+    memory::UserMemoryManager,
     platform::{current_os, os_name, require_elevated_permissions},
     shell::ShellExecutor,
     skills::detect_skills,
@@ -289,6 +291,7 @@ fn run() -> Result<ExitCode, AppError> {
     ));
 
     let shell = ShellExecutor::new(&cfg.ai.tools.bash);
+    let mut memory_manager = UserMemoryManager::load(&cfg.ai.memory, &executable_dir)?;
     let use_async_mcp_availability_check = matches!(&command, Commands::Chat)
         && cfg.ai.tools.mcp.enabled
         && normalize_mcp_availability_check_mode(
@@ -315,6 +318,7 @@ fn run() -> Result<ExitCode, AppError> {
     let mut services = ActionServices {
         cfg: &cfg,
         config_path: &config_path,
+        executable_dir: &executable_dir,
         assets_dir: &assets_dir,
         shell: &shell,
         ai: &ai_client,
@@ -322,6 +326,7 @@ fn run() -> Result<ExitCode, AppError> {
         os_type,
         os_name,
         skills: &skill_list,
+        memory: &mut memory_manager,
         mcp_summary: mcp_desc,
         mcp: &mut mcp_manager,
     };

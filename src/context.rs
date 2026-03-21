@@ -255,15 +255,45 @@ impl SessionStore {
     }
 
     pub fn build_chat_history(&self) -> Vec<ChatMessage> {
+        self.build_chat_history_with_context_sections(true)
+    }
+
+    pub fn build_chat_message_history(&self) -> Vec<ChatMessage> {
+        self.build_chat_history_with_context_sections(false)
+    }
+
+    pub fn recent_conversations_summary_for_prompt(&self) -> Option<String> {
+        let mut lines = Vec::<String>::new();
+        if !self.state.summary.trim().is_empty() {
+            lines.push(format!(
+                "Conversation summary: {}",
+                self.state.summary.trim()
+            ));
+        }
+        let compass = self.compass_snapshot();
+        if !compass.is_empty() {
+            lines.push(format!("Conversation compass: {compass}"));
+        }
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
+    }
+
+    fn build_chat_history_with_context_sections(
+        &self,
+        include_context_sections: bool,
+    ) -> Vec<ChatMessage> {
         let mut history = Vec::new();
-        if !self.state.summary.is_empty() {
+        if include_context_sections && !self.state.summary.is_empty() {
             history.push(ChatMessage {
                 role: "system".to_string(),
                 content: format!("Conversation summary: {}", self.state.summary),
             });
         }
         let compass = self.compass_snapshot();
-        if !compass.is_empty() {
+        if include_context_sections && !compass.is_empty() {
             history.push(ChatMessage {
                 role: "system".to_string(),
                 content: format!("Conversation compass: {compass}"),

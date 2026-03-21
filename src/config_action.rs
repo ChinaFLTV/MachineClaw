@@ -349,6 +349,8 @@ pub(crate) fn default_config_value_literal(key: &str) -> Option<&'static str> {
         "ai.chat.compression.max-chars-count" => Some("80000"),
         "ai.input-price-per-million" => Some("0"),
         "ai.output-price-per-million" => Some("0"),
+        "ai.memory.enabled" => Some("true"),
+        "ai.memory.user-memory-file" => Some("\".machineclaw/memory/user-memory.json\""),
         "ai.tools.bash.write-cmd-run-confirm" => Some("true"),
         "ai.tools.bash.command-timeout-seconds" => Some("30"),
         "ai.tools.bash.command-timeout-kill-after-seconds" => Some("5"),
@@ -418,6 +420,8 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
         "ai.chat.compression.max-chars-count",
         "ai.input-price-per-million",
         "ai.output-price-per-million",
+        "ai.memory.enabled",
+        "ai.memory.user-memory-file",
         "ai.tools.bash.write-cmd-run-confirm",
         "ai.tools.bash.command-timeout-seconds",
         "ai.tools.bash.command-timeout-kill-after-seconds",
@@ -619,6 +623,8 @@ mod tests {
         ));
         assert!(is_known_config_key("ai.tools.mcp.enabled"));
         assert!(is_known_config_key("ai.tools.mcp.dir"));
+        assert!(is_known_config_key("ai.memory.enabled"));
+        assert!(is_known_config_key("ai.memory.user-memory-file"));
         assert!(is_known_config_key("ai.chat.mode"));
         assert!(is_known_config_key("app.theme"));
     }

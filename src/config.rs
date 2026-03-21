@@ -25,6 +25,8 @@ const DEFAULT_AI_DEBUG: bool = false;
 const DEFAULT_AI_TYPE: &str = "openai";
 const DEFAULT_AI_INPUT_PRICE_PER_MILLION: f64 = 0.0;
 const DEFAULT_AI_OUTPUT_PRICE_PER_MILLION: f64 = 0.0;
+const DEFAULT_AI_MEMORY_ENABLED: bool = true;
+const DEFAULT_AI_USER_MEMORY_FILE: &str = ".machineclaw/memory/user-memory.json";
 const DEFAULT_CHAT_SHOW_TOOL: bool = false;
 const DEFAULT_CHAT_SHOW_TOOL_OK: bool = false;
 const DEFAULT_CHAT_SHOW_TOOL_ERR: bool = false;
@@ -118,6 +120,8 @@ pub struct AiConfig {
     #[serde(default)]
     pub chat: AiChatConfig,
     #[serde(default)]
+    pub memory: AiMemoryConfig,
+    #[serde(default)]
     pub tools: AiToolsConfig,
     #[serde(
         rename = "input-price-per-million",
@@ -129,6 +133,23 @@ pub struct AiConfig {
         default = "default_ai_output_price_per_million"
     )]
     pub output_price_per_million: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AiMemoryConfig {
+    #[serde(default = "default_ai_memory_enabled")]
+    pub enabled: bool,
+    #[serde(rename = "user-memory-file", default = "default_ai_user_memory_file")]
+    pub user_memory_file: String,
+}
+
+impl Default for AiMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ai_memory_enabled(),
+            user_memory_file: default_ai_user_memory_file(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -641,6 +662,10 @@ max-total-tool-calls = 40 # optional, default 40
 max-history-messages = 40 # optional, default 40
 max-chars-count = 80000 # optional, default 80000
 
+[ai.memory]
+enabled = true # optional, default true; when false memory is not injected into chat context, but the memory file can still be managed
+user-memory-file = ".machineclaw/memory/user-memory.json" # optional, default executable_dir/.machineclaw/memory/user-memory.json
+
 [ai.tools]
 
 [ai.tools.builtin]
@@ -779,6 +804,11 @@ pub fn validate_config(cfg: &AppConfig) -> Result<(), AppError> {
     if cfg.ai.input_price_per_million < 0.0 || cfg.ai.output_price_per_million < 0.0 {
         return Err(AppError::Config(
             "ai input/output price cannot be negative".to_string(),
+        ));
+    }
+    if cfg.ai.memory.user_memory_file.trim().is_empty() {
+        return Err(AppError::Config(
+            "ai.memory.user-memory-file must not be empty".to_string(),
         ));
     }
     if cfg.ai.chat.context_warn_percent == 0
@@ -1140,6 +1170,14 @@ fn default_ai_output_price_per_million() -> f64 {
     DEFAULT_AI_OUTPUT_PRICE_PER_MILLION
 }
 
+fn default_ai_memory_enabled() -> bool {
+    DEFAULT_AI_MEMORY_ENABLED
+}
+
+fn default_ai_user_memory_file() -> String {
+    DEFAULT_AI_USER_MEMORY_FILE.to_string()
+}
+
 fn default_chat_show_tool() -> bool {
     DEFAULT_CHAT_SHOW_TOOL
 }
@@ -1312,9 +1350,9 @@ fn has_file_extension(file_name: &str) -> bool {
 mod tests {
     use super::{
         McpServerConfig, normalize_ai_provider_type, normalize_app_theme,
-        normalize_chat_interaction_mode,
-        normalize_chat_model_price_check_mode, normalize_mcp_availability_check_mode,
-        parse_config_text, resolve_app_theme, resolve_config_path,
+        normalize_chat_interaction_mode, normalize_chat_model_price_check_mode,
+        normalize_mcp_availability_check_mode, parse_config_text, resolve_app_theme,
+        resolve_config_path,
     };
 
     #[test]
